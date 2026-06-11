@@ -1,0 +1,28 @@
+{
+  "name": "event-signal-monitor",
+  "version": "0.6.0",
+  "description": "Local paper-alert crypto event and quantitative signal monitor.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "npm run dashboard",
+    "signal:monitor": "node ./scripts/event-signal-monitor.mjs --layer=all",
+    "signal:fast": "node ./scripts/event-signal-monitor.mjs --layer=fast",
+    "signal:slow": "node ./scripts/event-signal-monitor.mjs --layer=slow",
+    "signal:test:costs": "node ./scripts/event-signal-monitor.mjs --self-test-costs",
+    "signal:test:models": "node ./scripts/event-signal-monitor.mjs --self-test-models",
+    "signal:test:profiles": "node ./scripts/event-signal-monitor.mjs --self-test-profiles",
+    "signal:fast:loop": "powershell -ExecutionPolicy ByPass -File ./scripts/start-fast-loop.ps1 -IntervalSeconds 60",
+    "signal:fast:stop": "powershell -ExecutionPolicy ByPass -File ./scripts/stop-fast-loop.ps1",
+    "signal:slow:loop": "powershell -ExecutionPolicy ByPass -File ./scripts/start-slow-loop.ps1 -IntervalSeconds 300 -InitialDelaySeconds 30",
+    "signal:slow:stop": "powershell -ExecutionPolicy ByPass -File ./scripts/stop-slow-loop.ps1",
+    "dashboard": "node ./scripts/serve-dashboard.mjs",
+    "check": "node --check ./scripts/event-signal-monitor.mjs && node --check ./scripts/serve-dashboard.mjs && node --check ./public/app.js && npm run signal:test:costs && npm run signal:test:models && npm run signal:test:profiles"
+  },
+  "dependencies": {
+    "echarts": "^6.1.0"
+  }
+}

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>事件信号监控引擎</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">ES</div>
+        <div>
+          <span class="eyebrow">QUANT OPERATIONS</span>
+          <h1>事件信号监控引擎</h1>
+          <p id="subtitle">paper-alert-only</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button id="refreshButton" type="button">刷新</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="summary-grid" aria-label="状态摘要">
+        <div class="metric">
+          <span>分析模式</span>
+          <strong id="layerValue">-</strong>
+        </div>
+        <div class="metric">
+          <span>开仓候选</span>
+          <strong id="actionableValue">0</strong>
+        </div>
+        <div class="metric">
+          <span>观察列表</span>
+          <strong id="watchValue">0</strong>
+        </div>
+        <div class="metric">
+          <span>消息面</span>
+          <strong id="messageValue">0</strong>
+        </div>
+        <div class="metric">
+          <span>市场计算</span>
+          <strong id="modelValue">0</strong>
+        </div>
+        <div class="metric">
+          <span>监控循环</span>
+          <strong id="loopValue">-</strong>
+        </div>
+      </section>
+
+      <section class="panel account-panel">
+        <div class="section-title">
+          <h2>模拟账户</h2>
+          <span id="accountUpdatedAt">-</span>
+        </div>
+        <div class="account-layout">
+          <form id="accountForm" class="account-form">
+            <label>
+              <span>本金</span>
+              <input id="accountCapital" name="initialCapital" type="number" min="100" step="100" />
+            </label>
+            <label>
+              <span>市场类型</span>
+              <select id="accountMarketType" name="marketType">
+                <option value="futures">合约</option>
+                <option value="spot">现货</option>
+              </select>
+            </label>
+            <label>
+              <span>杠杆硬上限</span>
+              <input id="accountMaxLeverage" name="maxLeverage" type="number" min="1" max="125" step="1" />
+            </label>
+            <label>
+              <span>策略风格</span>
+              <select id="accountRiskProfile" name="riskProfile">
+                <option value="conservative">保守型</option>
+                <option value="aggressive">激进型</option>
+              </select>
+            </label>
+            <div class="account-actions">
+              <button id="startAccountButton" class="primary-action" type="button">启动模拟</button>
+              <button id="saveAccountButton" type="submit">保存并重置</button>
+              <button id="resetAccountButton" type="button">重置账户</button>
+              <button id="summaryButton" type="button">查看总结</button>
+            </div>
+          </form>
+          <div class="account-metrics" id="accountMetrics"></div>
+        </div>
+        <div class="position-toolbar">
+          <strong>模拟持仓记录</strong>
+          <div class="segmented position-tabs" role="tablist" aria-label="持仓状态">
+            <button class="active" data-position-view="open" type="button">
+              未平仓 <span id="openPositionCount">0</span>
+            </button>
+            <button data-position-view="closed" type="button">
+              已平仓 <span id="closedPositionCount">0</span>
+            </button>
+          </div>
+        </div>
+        <div id="accountPositions" class="position-list"></div>
+        <div id="accountSummary" class="account-summary"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">
+          <h2>开仓与复盘</h2>
+          <span id="reportTime">-</span>
+        </div>
+        <div id="signals"></div>
+      </section>
+
+      <section class="grid-two">
+        <section class="panel">
+          <div class="section-title">
+            <h2>消息面</h2>
+            <span id="sourceCounts">-</span>
+          </div>
+          <form id="whaleAlertForm" class="whale-alert-form" autocomplete="off">
+            <div class="whale-alert-field">
+              <label for="whaleAlertApiKey">Whale Alert API Key</label>
+              <input
+                id="whaleAlertApiKey"
+                name="apiKey"
+                type="password"
+                inputmode="text"
+                spellcheck="false"
+                autocomplete="new-password"
+                placeholder="输入 API Key"
+              />
+            </div>
+            <button id="whaleAlertConnectButton" type="submit">确认连接</button>
+            <div id="whaleAlertStatus" class="whale-alert-status" aria-live="polite">未配置</div>
+          </form>
+          <div id="messages" class="list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="section-title">
+            <h2>告警</h2>
+            <span id="warningCount">0</span>
+          </div>
+          <div id="warnings" class="list compact"></div>
+        </section>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">
+          <h2>数学模型计算过程</h2>
+          <span>胜率, EV, 风险收益</span>
+        </div>
+        <div id="models" class="model-list"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">
+          <h2>运行日志</h2>
+          <span>fast-loop.log</span>
+        </div>
+        <pre id="logView"></pre>
+      </section>
+    </main>
+
+    <script src="/vendor/echarts.min.js"></script>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
