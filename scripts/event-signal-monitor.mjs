@@ -16,7 +16,7 @@ const WHALE_STATUS_PATH = path.resolve(RUNTIME_DIR, "whale-alert-status.json");
 const execFileAsync = promisify(execFile);
 loadDotEnv(path.resolve(".env"));
 
-const MONITOR_VERSION = "0.6.0";
+const MONITOR_VERSION = "0.7.0";
 const RUN_LAYER = normalizeLayer(process.env.SIGNAL_MONITOR_LAYER || readCliOption("layer", "all"));
 const LAYER_REPORT_PATH =
   RUN_LAYER === "all" ? REPORT_PATH : path.resolve(RUNTIME_DIR, `latest-${RUN_LAYER}-report.json`);
@@ -89,7 +89,9 @@ const BASE_MODEL_WEIGHTS = {
   gbm: 0.1,
   garch: 0.08,
   hiddenMarkov: 0.1,
-  markowitz: 0.07
+  markowitz: 0.07,
+  poisson: 0.04,
+  bayesian: 0.08
 };
 const DIRECTION_MODEL_WEIGHTS = {
   trend: 0.24,
@@ -103,6 +105,7 @@ const DIRECTION_MODEL_WEIGHTS = {
 };
 const GARCH_CONFIDENCE_WEIGHT = 0.35;
 const MARKOWITZ_SIZING_WEIGHT = 0.4;
+const BAYESIAN_POSTERIOR_WEIGHT = 0.3;
 
 const FETCH_IMPL = (process.env.SIGNAL_MONITOR_FETCH_IMPL || (process.platform === "win32" ? "powershell" : "auto"))
   .trim()
@@ -667,6 +670,106 @@ function analyzeHiddenMarkovRegime(returns) {
   };
 }
 
+function poissonProbability(k, lambda) {
+  const count = Math.max(0, Math.floor(safeNumber(k)));
+  const rate = Math.max(1e-9, safeNumber(lambda, 1e-9));
+  let probability = Math.exp(-rate);
+  for (let index = 1; index <= count; index += 1) {
+    probability *= rate / index;
+  }
+  return probability;
+}
+
+function poissonCdf(k, lambda) {
+  const count = Math.max(0, Math.floor(safeNumber(k)));
+  let total = 0;
+  for (let index = 0; index <= count; index += 1) {
+    total += poissonProbability(index, lambda);
+  }
+  return clamp(total, 0, 1);
+}
+
+function poissonTailProbability(k, lambda) {
+  const count = Math.max(0, Math.floor(safeNumber(k)));
+  if (count <= 0) return 1;
+  return clamp(1 - poissonCdf(count - 1, lambda), 0, 1);
+}
+
+function analyzePoissonEventArrival(eventAggregate, eventScoreNorm, highImpactEvent) {
+  const observedEvents = Math.max(
+    0,
+    Math.floor(safeNumber(eventAggregate.eventCount, eventAggregate.events?.length || 0))
+  );
+  const baselineLambda = clamp(
+    0.25 + eventScoreNorm * 1.65 + (highImpactEvent ? 0.35 : 0),
+    0.05,
+    4
+  );
+  const tailProbability = observedEvents > 0 ? poissonTailProbability(observedEvents, baselineLambda) : 1;
+  const eventClusterScore =
+    observedEvents > 0
+      ? clamp((observedEvents - baselineLambda) / Math.sqrt(baselineLambda + 1e-9), -3, 3)
+      : 0;
+  const burstSurprise = observedEvents > 0 ? clamp(1 - tailProbability, 0, 1) : 0;
+  const directionalIntensity = burstSurprise * Math.abs(safeNumber(eventAggregate.direction));
+  return {
+    observedEvents,
+    baselineLambda,
+    tailProbability,
+    burstSurprise,
+    eventClusterScore,
+    directionalIntensity,
+    formula:
+      "Poisson: P(N>=k)=1-CDF(k-1;lambda). k=observed relevant events, lambda=baseline event arrival rate. Low tail probability means event clustering is unusual."
+  };
+}
+
+function bayesianWinRateUpdate({
+  priorWinRate,
+  combinedDirection,
+  eventScoreNorm,
+  alignment,
+  volatilityRegimeScore,
+  advancedModelQualityBoost,
+  poisson,
+  roundTripExecutionCostPct,
+  riskPct
+}) {
+  const prior = clamp(priorWinRate, 0.35, 0.86);
+  const eventAgreement =
+    alignment > 0
+      ? eventScoreNorm * (0.55 + poisson.burstSurprise * 0.45)
+      : alignment < 0
+        ? -eventScoreNorm * (0.65 + poisson.burstSurprise * 0.35)
+        : 0;
+  const costToRisk = riskPct > 0 ? roundTripExecutionCostPct / riskPct : 0;
+  const winEvidence =
+    Math.abs(combinedDirection) * 0.75 +
+    Math.max(0, eventAgreement) * 0.5 +
+    Math.max(0, advancedModelQualityBoost) * 7 +
+    Math.max(0, volatilityRegimeScore) * 0.35;
+  const lossEvidence =
+    Math.max(0, -eventAgreement) * 0.6 +
+    Math.max(0, -volatilityRegimeScore) * 0.4 +
+    clamp(costToRisk, 0, 2) * 0.28;
+  const likelihoodWin = clamp(Math.exp(winEvidence), 0.35, 2.8);
+  const likelihoodLoss = clamp(Math.exp(lossEvidence), 0.35, 2.8);
+  const numerator = prior * likelihoodWin;
+  const denominator = numerator + (1 - prior) * likelihoodLoss;
+  const posteriorWinRate = denominator > 0 ? numerator / denominator : prior;
+  return {
+    priorWinRate: prior,
+    eventAgreement,
+    costToRisk,
+    likelihoodWin,
+    likelihoodLoss,
+    posteriorWinRate: clamp(posteriorWinRate, 0.35, 0.86),
+    adjustment: clamp(posteriorWinRate - prior, -0.08, 0.08),
+    formula:
+      "Bayes: P(win|evidence)=P(win)*L(evidence|win)/(P(win)*L(evidence|win)+(1-P(win))*L(evidence|loss)). Evidence includes direction strength, event agreement, Poisson event burst, volatility regime and execution cost."
+  };
+}
+
 function parseBinanceKline(row) {
   return {
     time: safeNumber(row[0]),
@@ -1200,7 +1303,7 @@ function escapeRegExp(value) {
 
 function aggregateEventsBySymbol(classifiedEvents) {
   const result = Object.fromEntries(
-    SYMBOLS.map((symbol) => [symbol, { score: 0, directionScore: 0, events: [] }])
+    SYMBOLS.map((symbol) => [symbol, { score: 0, directionScore: 0, eventCount: 0, events: [] }])
   );
 
   for (const event of classifiedEvents) {
@@ -1214,12 +1317,14 @@ function aggregateEventsBySymbol(classifiedEvents) {
       const relevance = event.matchedSymbols.includes(symbol) ? 1 : 0.45;
       result[symbol].score += event.impactScore * relevance;
       result[symbol].directionScore += event.direction * event.impactScore * relevance;
+      result[symbol].eventCount += relevance;
       result[symbol].events.push(event);
     }
   }
 
   for (const value of Object.values(result)) {
     value.score = clamp(value.score, 0, 100);
+    value.eventCount = roundNumber(value.eventCount, 3);
     value.direction = value.score > 0 ? clamp(value.directionScore / Math.max(value.score, 1), -1, 1) : 0;
     value.events = value.events
       .sort((a, b) => b.impactScore - a.impactScore)
@@ -1406,7 +1511,9 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
     gbm: Math.abs(market.gbm.signal),
     garch: market.garch.stabilityScore,
     hiddenMarkov: Math.abs(market.hiddenMarkov.signal) * market.hiddenMarkov.confidence,
-    markowitz: 0.5
+    markowitz: 0.5,
+    poisson: 0.5,
+    bayesian: 0.5
   };
   const modelCalibrationBoost = estimateCalibrationBoost(modelWeights, factors);
   const advancedModelQualityBoost = clamp(
@@ -1416,7 +1523,7 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
     -0.02,
     0.035
   );
-  const winRate = clamp(
+  const baseWinRate = clamp(
     0.5 +
       Math.abs(combinedDirection) * 0.18 +
       eventScoreNorm * 0.08 +
@@ -1438,6 +1545,26 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
   const rewardPct = riskPct * rewardRiskRatio;
   const roundTripExecutionCostPct =
     2 * (normalizedAccountConfig.takerFeeRate + normalizedAccountConfig.slippageRate);
+  const poisson = analyzePoissonEventArrival(eventAggregate, eventScoreNorm, highImpactEvent);
+  const bayesian = bayesianWinRateUpdate({
+    priorWinRate: baseWinRate,
+    combinedDirection,
+    eventScoreNorm,
+    alignment,
+    volatilityRegimeScore: market.volatilityRegimeScore,
+    advancedModelQualityBoost,
+    poisson,
+    roundTripExecutionCostPct,
+    riskPct
+  });
+  const winRate = clamp(
+    baseWinRate * (1 - BAYESIAN_POSTERIOR_WEIGHT) +
+      bayesian.posteriorWinRate * BAYESIAN_POSTERIOR_WEIGHT,
+    0.35,
+    0.86
+  );
+  factors.poisson = poisson.directionalIntensity;
+  factors.bayesian = Math.abs(bayesian.adjustment) / 0.08;
   const expectancyPct = winRate * rewardPct - (1 - winRate) * riskPct - roundTripExecutionCostPct;
   const expectancyR = riskPct > 0 ? expectancyPct / riskPct : 0;
   const gateResult = evaluateCandidateGate({
@@ -1506,15 +1633,19 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
       },
       winRate: {
         formula:
-          "P(win) = clamp(0.50 + abs(combinedDirection)*0.18 + eventScoreNorm*0.08 + alignment*0.04 + volatilityRegimeScore*0.05 + mathOnlyPenalty + advancedModelQualityBoost + calibrationBoost, 0.35, 0.86)",
+          "baseP = clamp(0.50 + abs(combinedDirection)*0.18 + eventScoreNorm*0.08 + alignment*0.04 + volatilityRegimeScore*0.05 + mathOnlyPenalty + advancedModelQualityBoost + calibrationBoost, 0.35, 0.86); P(win)=0.70*baseP + 0.30*BayesianPosterior",
         eventScoreNorm,
         alignment,
         volatilityRegimeScore: market.volatilityRegimeScore,
         mathOnlyPenalty: candidateMode === "math_only" ? -0.02 : 0,
         advancedModelQualityBoost,
         calibrationBoost: modelCalibrationBoost,
+        baseWinRate,
+        bayesianPosteriorWeight: BAYESIAN_POSTERIOR_WEIGHT,
         result: winRate
       },
+      poisson,
+      bayesian,
       riskReward: {
         formula:
           "riskPct = clamp(max(ATR%*eventMultiplier, GARCH_forecastVol*sqrt(4)*1.25, 0.006), 0.006, 0.09); rewardPct = riskPct*rewardRiskRatio",
@@ -1559,14 +1690,17 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
       },
       advancedModels: {
         formula:
-          "GBM and HMM contribute to direction; GARCH scales confidence and supplies a volatility-based stop floor; Markowitz is applied after all candidates are formed.",
+          "GBM and HMM contribute to direction; GARCH scales confidence and supplies a volatility-based stop floor; Poisson measures event clustering; Bayesian update calibrates win probability; Markowitz is applied after all candidates are formed.",
         gbm: market.gbm,
         garch: market.garch,
         hiddenMarkov: market.hiddenMarkov,
+        poisson,
+        bayesian,
         weights: {
           ...DIRECTION_MODEL_WEIGHTS,
           garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
-          markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT
+          markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT,
+          bayesianPosteriorWeight: BAYESIAN_POSTERIOR_WEIGHT
         }
       }
     },
@@ -1580,6 +1714,8 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
       `GBM=${market.gbm.signal.toFixed(2)}`,
       `HMM=${market.hiddenMarkov.regime}:${market.hiddenMarkov.confidence.toFixed(2)}`,
       `GARCHvolRatio=${market.garch.volatilityRatio.toFixed(2)}`,
+      `PoissonTail=${poisson.tailProbability.toFixed(2)}`,
+      `BayesP=${(bayesian.posteriorWinRate * 100).toFixed(1)}%`,
       `eventImpact=${Math.round(eventAggregate.score)}`,
       `regime=${market.regime}`,
       `EV=${(expectancyPct * 100).toFixed(2)}%`
@@ -2363,6 +2499,7 @@ function buildModelCalculations(marketAnalyses, eventsBySymbol, candidates) {
         eventDirection: roundNumber(eventAggregate.direction || 0),
         analysisMode: eventAggregate.score > 0 ? "event_math" : "math_only",
         candidateStatus: candidate?.status || "no_candidate",
+        eventCount: roundNumber(eventAggregate.eventCount || 0, 3),
         candidateMode: candidate?.candidateMode || (eventAggregate.score > 0 ? "event_math" : "math_only"),
         noCandidateReason: candidate
           ? null
@@ -2387,6 +2524,14 @@ function buildModelCalculations(marketAnalyses, eventsBySymbol, candidates) {
           gbm: market.gbm,
           garch: market.garch,
           hiddenMarkov: market.hiddenMarkov,
+          poisson:
+            candidate?.calculation?.poisson ||
+            analyzePoissonEventArrival(
+              eventAggregate,
+              clamp((eventAggregate.score || 0) / 100, 0, 1),
+              eventAggregate.score >= 70 && Math.abs(eventAggregate.direction || 0) >= 0.2
+            ),
+          bayesian: candidate?.calculation?.bayesian || null,
           markowitz: candidate?.markowitz || null
         },
         relatedEvents: eventAggregate.events || []
@@ -2585,12 +2730,15 @@ async function main() {
         "GBM",
         "GARCH(1,1)",
         "三状态 HMM",
+        "泊松事件到达分布",
+        "贝叶斯后验胜率校准",
         "Markowitz 均值-方差配置"
       ],
       advancedModelWeights: {
         direction: DIRECTION_MODEL_WEIGHTS,
         garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
-        markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT
+        markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT,
+        bayesianPosteriorWeight: BAYESIAN_POSTERIOR_WEIGHT
       },
       mathOnlyGate:
         "纯数学模式仍必须满足方向强度、胜率、EV 和风险收益硬门槛；未过线只进入观察或模型展示，不发开仓候选。",
@@ -2725,6 +2873,22 @@ function runAdvancedModelsSelfTest() {
   const gbm = analyzeGeometricBrownianMotion(returns);
   const garch = estimateGarch11(returns);
   const hiddenMarkov = analyzeHiddenMarkovRegime(returns);
+  const poisson = analyzePoissonEventArrival(
+    { score: 72, direction: 0.8, eventCount: 4, events: [{}, {}, {}, {}] },
+    0.72,
+    true
+  );
+  const bayesian = bayesianWinRateUpdate({
+    priorWinRate: 0.58,
+    combinedDirection: 0.55,
+    eventScoreNorm: 0.72,
+    alignment: 1,
+    volatilityRegimeScore: 0.1,
+    advancedModelQualityBoost: 0.02,
+    poisson,
+    roundTripExecutionCostPct: 0.0016,
+    riskPct: 0.02
+  });
   if (!(gbm.probabilityUp > 0.5) || !Number.isFinite(gbm.expectedReturn)) {
     throw new Error("GBM self-test failed");
   }
@@ -2745,6 +2909,18 @@ function runAdvancedModelsSelfTest() {
     ) > 1e-9
   ) {
     throw new Error("HMM self-test failed");
+  }
+  if (
+    !(poisson.tailProbability >= 0 && poisson.tailProbability <= 1) ||
+    !(poisson.burstSurprise >= 0 && poisson.burstSurprise <= 1)
+  ) {
+    throw new Error("Poisson self-test failed");
+  }
+  if (
+    !(bayesian.posteriorWinRate > bayesian.priorWinRate) ||
+    !(bayesian.likelihoodWin > bayesian.likelihoodLoss)
+  ) {
+    throw new Error("Bayesian self-test failed");
   }
 
   const config = normalizeAccountConfig({
@@ -2801,6 +2977,14 @@ function runAdvancedModelsSelfTest() {
       hiddenMarkov: {
         regime: hiddenMarkov.regime,
         bullProbability: hiddenMarkov.bullProbability
+      },
+      poisson: {
+        observedEvents: poisson.observedEvents,
+        tailProbability: poisson.tailProbability
+      },
+      bayesian: {
+        priorWinRate: bayesian.priorWinRate,
+        posteriorWinRate: bayesian.posteriorWinRate
       },
       markowitz: markowitz.portfolio
     })

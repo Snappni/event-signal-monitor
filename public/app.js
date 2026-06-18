@@ -1145,6 +1145,8 @@ function modelRow(item) {
   const garch = advanced.garch || math.models?.garch || {};
   const hiddenMarkov = advanced.hiddenMarkov || math.models?.hiddenMarkov || {};
   const markowitz = advanced.markowitz || signal.markowitz || {};
+  const poisson = advanced.poisson || signal.calculation?.poisson || {};
+  const bayesian = advanced.bayesian || signal.calculation?.bayesian || {};
   const mode = item.candidateMode === "math_only" ? "\u7eaf\u6570\u5b66\u6a21\u578b" : item.candidateMode || item.analysisMode || "-";
   return `
     <div class="model-item">
@@ -1172,6 +1174,10 @@ function modelRow(item) {
         ${calcCell("GARCH波动比", fmtNumber(garch.volatilityRatio, 3))}
         ${calcCell("HMM状态", localizeHmmRegime(hiddenMarkov.regime))}
         ${calcCell("HMM 多/空概率", `${fmtPct(hiddenMarkov.bullProbability, 1)} / ${fmtPct(hiddenMarkov.bearProbability, 1)}`)}
+        ${calcCell("Poisson事件数", fmtNumber(poisson.observedEvents, 0))}
+        ${calcCell("Poisson尾部概率", fmtPct(poisson.tailProbability, 1))}
+        ${calcCell("Bayes后验胜率", fmtPct(bayesian.posteriorWinRate, 1))}
+        ${calcCell("Bayes调整", fmtPct(bayesian.adjustment, 2))}
         ${calcCell("Markowitz权重", fmtPct(markowitz.weight, 1))}
         ${calcCell(text.winRate, fmtPct(signal.winRate, 1))}
         ${calcCell("EV", fmtPct(signal.expectancyPct, 2))}
@@ -1196,6 +1202,8 @@ function buildFormulaText(item) {
   }
   if (calc.direction) lines.push(calc.direction.formula);
   if (calc.winRate) lines.push(calc.winRate.formula);
+  if (calc.poisson) lines.push(calc.poisson.formula);
+  if (calc.bayesian) lines.push(calc.bayesian.formula);
   if (calc.riskReward) lines.push(calc.riskReward.formula);
   if (calc.expectancy) lines.push(calc.expectancy.formula);
   if (calc.gate) lines.push(calc.gate.formula);
