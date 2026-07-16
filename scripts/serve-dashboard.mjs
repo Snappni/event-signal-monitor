@@ -4,6 +4,11 @@ import http from "node:http";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import {
+  normalizeMessageAggregatorConfig,
+  parseNewsNowPayload,
+  parseRssXml
+} from "./message-aggregator.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -15,6 +20,8 @@ const ACCOUNT_LOCK_PATH = path.join(RUNTIME_DIR, "account.lock");
 const TRANSLATION_CACHE_PATH = path.join(RUNTIME_DIR, "translation-cache.json");
 const WHALE_CREDENTIALS_PATH = path.join(RUNTIME_DIR, "whale-alert-credentials.json");
 const WHALE_STATUS_PATH = path.join(RUNTIME_DIR, "whale-alert-status.json");
+const MESSAGE_AGGREGATOR_CONFIG_PATH = path.join(RUNTIME_DIR, "message-aggregator-config.json");
+const MESSAGE_AGGREGATOR_STATUS_PATH = path.join(RUNTIME_DIR, "message-aggregator-status.json");
 const ENV_PATH = path.join(ROOT_DIR, ".env");
 const PORT = Number(process.env.SIGNAL_DASHBOARD_PORT || 8788);
 const DEFAULT_FUTURES_TAKER_FEE_RATE = 0.0005;
@@ -186,6 +193,122 @@ function publicWhaleAlertStatus() {
     errorCode: savedStatus?.errorCode || null,
     error: savedStatus?.error || null
   };
+}
+
+function readMessageAggregatorConfig() {
+  const saved = readJson(MESSAGE_AGGREGATOR_CONFIG_PATH, null);
+  const environmentConfig = {
+    enabled: process.env.MESSAGE_AGGREGATOR_ENABLED || readDotEnvValue("MESSAGE_AGGREGATOR_ENABLED"),
+    filterKeywords: process.env.MESSAGE_FILTER_KEYWORDS || readDotEnvValue("MESSAGE_FILTER_KEYWORDS"),
+    maxItemsPerSource:
+      process.env.MESSAGE_MAX_ITEMS_PER_SOURCE || readDotEnvValue("MESSAGE_MAX_ITEMS_PER_SOURCE")
+  };
+  return normalizeMessageAggregatorConfig(saved || environmentConfig);
+}
+
+function publicMessageAggregatorStatus() {
+  const config = readMessageAggregatorConfig();
+  const savedStatus = readJson(MESSAGE_AGGREGATOR_STATUS_PATH, null);
+  const configured = config.rssFeeds.length + config.trendSources.length > 0;
+  return {
+    configured,
+    enabled: config.enabled,
+    connected: Boolean(config.enabled && savedStatus?.connected),
+    degraded: Boolean(savedStatus?.degraded),
+    messageCount: safeNumber(savedStatus?.messageCount),
+    checkedAt: savedStatus?.checkedAt || null,
+    errorCode: savedStatus?.errorCode || null,
+    error: savedStatus?.error || null,
+    sources: Array.isArray(savedStatus?.sources) ? savedStatus.sources : [],
+    config: {
+      enabled: config.enabled,
+      filterKeywords: config.filterKeywords,
+      maxItemsPerSource: config.maxItemsPerSource,
+      builtInSources: [...config.rssFeeds, ...config.trendSources],
+      rssFeeds: config.rssFeeds,
+      trendSources: config.trendSources
+    }
+  };
+}
+
+async function validateMessageAggregatorConfig(input) {
+  const config = normalizeMessageAggregatorConfig(input);
+  const jobs = [
+    ...config.rssFeeds.map((feed) => ({
+      type: "rss",
+      name: feed.name,
+      url: feed.url,
+      run: async () => {
+        const response = await fetch(feed.url, {
+          headers: {
+            "User-Agent": "event-signal-monitor/0.8",
+            Accept: "application/rss+xml,application/atom+xml,text/xml,text/plain,*/*"
+          },
+          signal: AbortSignal.timeout(15_000)
+        });
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        return parseRssXml(await response.text(), feed, config);
+      }
+    })),
+    ...config.trendSources.map((source) => ({
+      type: "trend",
+      name: source.name,
+      url: source.url,
+      run: async () => {
+        const response = await fetch(source.url, {
+          headers: {
+            Accept: "application/json, text/plain, */*",
+            Referer: "https://newsnow.busiyi.world/",
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+          },
+          signal: AbortSignal.timeout(10_000)
+        });
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        return parseNewsNowPayload(await response.json(), source, config);
+      }
+    }))
+  ];
+  if (!jobs.length) {
+    const error = new Error("内置消息来源清单为空。");
+    error.code = "not_configured";
+    throw error;
+  }
+  const settled = await Promise.allSettled(jobs.map((job) => job.run()));
+  const sources = settled.map((result, index) => ({
+    type: jobs[index].type,
+    name: jobs[index].name,
+    url: jobs[index].url,
+    connected: result.status === "fulfilled",
+    messageCount: result.status === "fulfilled" ? result.value.length : 0,
+    error:
+      result.status === "rejected"
+        ? String(result.reason instanceof Error ? result.reason.message : result.reason).slice(0, 240)
+        : null
+  }));
+  const connectedCount = sources.filter((source) => source.connected).length;
+  const status = {
+    configured: true,
+    enabled: config.enabled,
+    connected: connectedCount > 0,
+    degraded: connectedCount > 0 && connectedCount < sources.length,
+    messageCount: sources.reduce((sum, source) => sum + source.messageCount, 0),
+    checkedAt: new Date().toISOString(),
+    sources,
+    errorCode: connectedCount ? null : "all_sources_failed",
+    error: connectedCount ? null : "所有已配置聚合源均连接失败。"
+  };
+  return { config, status };
+}
+
+function saveMessageAggregatorConfig(config, status) {
+  writeJson(MESSAGE_AGGREGATOR_CONFIG_PATH, {
+    enabled: config.enabled,
+    filterKeywords: config.filterKeywords,
+    maxItemsPerSource: config.maxItemsPerSource,
+    updatedAt: new Date().toISOString()
+  });
+  writeJson(MESSAGE_AGGREGATOR_STATUS_PATH, status);
 }
 
 function safeNumber(value, fallback = 0) {
@@ -542,6 +665,68 @@ const server = http.createServer(async (request, response) => {
       sendJson(response, result);
     } catch (error) {
       sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+    return;
+  }
+  if (url.pathname === "/api/message-aggregator/status" && request.method === "GET") {
+    try {
+      sendJson(response, publicMessageAggregatorStatus());
+    } catch (error) {
+      sendJson(
+        response,
+        {
+          configured: false,
+          enabled: false,
+          connected: false,
+          degraded: false,
+          messageCount: 0,
+          checkedAt: null,
+          sources: [],
+          config: null,
+          errorCode: "invalid_configuration",
+          error: error instanceof Error ? error.message : String(error)
+        },
+        500
+      );
+    }
+    return;
+  }
+  if (url.pathname === "/api/message-aggregator/config" && request.method === "POST") {
+    try {
+      const body = await readRequestJson(request);
+      const { config, status } = await validateMessageAggregatorConfig(body);
+      if (!status.connected) {
+        sendJson(response, { ...status, config }, 400);
+        return;
+      }
+      saveMessageAggregatorConfig(config, status);
+      sendJson(response, {
+        ...status,
+        config: {
+          enabled: config.enabled,
+          filterKeywords: config.filterKeywords,
+          maxItemsPerSource: config.maxItemsPerSource,
+          builtInSources: [...config.rssFeeds, ...config.trendSources],
+          rssFeeds: config.rssFeeds,
+          trendSources: config.trendSources
+        }
+      });
+    } catch (error) {
+      sendJson(
+        response,
+        {
+          configured: false,
+          enabled: false,
+          connected: false,
+          degraded: false,
+          messageCount: 0,
+          checkedAt: new Date().toISOString(),
+          sources: [],
+          errorCode: error?.code || "invalid_configuration",
+          error: error instanceof Error ? error.message : String(error)
+        },
+        400
+      );
     }
     return;
   }

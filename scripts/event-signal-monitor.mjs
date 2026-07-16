@@ -4,6 +4,22 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
+import {
+  normalizeMessageAggregatorConfig,
+  parseNewsNowPayload,
+  parseRssXml
+} from "./message-aggregator.mjs";
+import {
+  clusterMessageItems,
+  inferSourceTier,
+  sourceWeightForTier,
+  updateTrendHistory
+} from "./news-intelligence.mjs";
+import {
+  buildPolymarketPriceSentiment,
+  isCryptoPolymarketMarket,
+  isRoutineExchangeProductAnnouncement
+} from "./event-source-rules.mjs";
 
 const RUNTIME_DIR = path.resolve(".runtime", "event-signal-monitor");
 const STATE_PATH = path.resolve(RUNTIME_DIR, "state.json");
@@ -13,10 +29,12 @@ const ACCOUNT_CONFIG_PATH = path.resolve(RUNTIME_DIR, "account.json");
 const ACCOUNT_STATE_PATH = path.resolve(RUNTIME_DIR, "paper-account.json");
 const WHALE_CREDENTIALS_PATH = path.resolve(RUNTIME_DIR, "whale-alert-credentials.json");
 const WHALE_STATUS_PATH = path.resolve(RUNTIME_DIR, "whale-alert-status.json");
+const MESSAGE_AGGREGATOR_CONFIG_PATH = path.resolve(RUNTIME_DIR, "message-aggregator-config.json");
+const MESSAGE_AGGREGATOR_STATUS_PATH = path.resolve(RUNTIME_DIR, "message-aggregator-status.json");
 const execFileAsync = promisify(execFile);
 loadDotEnv(path.resolve(".env"));
 
-const MONITOR_VERSION = "0.7.0";
+const MONITOR_VERSION = "0.10.0";
 const RUN_LAYER = normalizeLayer(process.env.SIGNAL_MONITOR_LAYER || readCliOption("layer", "all"));
 const LAYER_REPORT_PATH =
   RUN_LAYER === "all" ? REPORT_PATH : path.resolve(RUNTIME_DIR, `latest-${RUN_LAYER}-report.json`);
@@ -107,7 +125,7 @@ const GARCH_CONFIDENCE_WEIGHT = 0.35;
 const MARKOWITZ_SIZING_WEIGHT = 0.4;
 const BAYESIAN_POSTERIOR_WEIGHT = 0.3;
 
-const FETCH_IMPL = (process.env.SIGNAL_MONITOR_FETCH_IMPL || (process.platform === "win32" ? "powershell" : "auto"))
+const FETCH_IMPL = (process.env.SIGNAL_MONITOR_FETCH_IMPL || "auto")
   .trim()
   .toLowerCase();
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.SIGNAL_MONITOR_TIMEOUT_MS, 8_000);
@@ -285,6 +303,7 @@ function createInitialState() {
     modelWeights: { ...BASE_MODEL_WEIGHTS },
     openInterest: {},
     polymarket: {},
+    newsTrends: {},
     activeSignals: {},
     closedSignals: [],
     calibration: {
@@ -812,6 +831,78 @@ async function fetchJson(url, options = {}) {
   }
 }
 
+async function fetchText(url, options = {}) {
+  if (FETCH_IMPL === "powershell") {
+    return fetchTextWithPowerShell(url, options);
+  }
+  if (FETCH_IMPL === "node") {
+    return fetchTextWithNode(url, options);
+  }
+  try {
+    return await fetchTextWithNode(url, options);
+  } catch (nodeError) {
+    try {
+      return await fetchTextWithPowerShell(url, options);
+    } catch (powerShellError) {
+      const nodeMessage = nodeError instanceof Error ? nodeError.message : String(nodeError);
+      const powerShellMessage = powerShellError instanceof Error ? powerShellError.message : String(powerShellError);
+      throw new Error(`Node fetch failed: ${nodeMessage}; PowerShell fetch failed: ${powerShellMessage}`);
+    }
+  }
+}
+
+async function fetchTextWithNode(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 event-signal-monitor/0.8",
+        Accept: options.accept || "application/rss+xml,application/atom+xml,text/xml,text/plain,*/*",
+        ...(options.headers || {})
+      }
+    });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    return await response.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchTextWithPowerShell(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const timeoutSec = Math.max(2, Math.ceil(timeoutMs / 1000));
+  const command = [
+    "$ProgressPreference='SilentlyContinue';",
+    "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);",
+    "$url=$env:SIGNAL_MONITOR_REQUEST_URL;",
+    "$timeoutSec=[int]$env:SIGNAL_MONITOR_REQUEST_TIMEOUT_SEC;",
+    "$accept=$env:SIGNAL_MONITOR_REQUEST_ACCEPT;",
+    "$headers=@{'User-Agent'='Mozilla/5.0 event-signal-monitor/0.8';'Accept'=$accept};",
+    "$response=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec $timeoutSec -Headers $headers;",
+    "[Console]::Write($response.Content)"
+  ].join(" ");
+  const { stdout } = await execFileAsync(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+    {
+      timeout: timeoutMs + 6_000,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        SIGNAL_MONITOR_REQUEST_URL: url,
+        SIGNAL_MONITOR_REQUEST_TIMEOUT_SEC: String(timeoutSec),
+        SIGNAL_MONITOR_REQUEST_ACCEPT:
+          options.accept || "application/rss+xml,application/atom+xml,text/xml,text/plain,*/*"
+      },
+      maxBuffer: 8 * 1024 * 1024
+    }
+  );
+  return stdout;
+}
+
 async function fetchJsonWithNode(url, options = {}) {
   const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
   const controller = new AbortController();
@@ -886,6 +977,7 @@ function localizeSourceLabel(label) {
     "Binance announcements": "Binance 公告",
     "OKX announcements": "OKX 公告",
     GDELT: "GDELT 新闻",
+    "Message aggregator": "消息聚合器",
     Polymarket: "Polymarket 盘口",
     WhaleAlert: "WhaleAlert 巨鲸监控"
   };
@@ -916,6 +1008,31 @@ function readWhaleAlertApiKey() {
 function writeWhaleAlertStatus(value) {
   writeJson(WHALE_STATUS_PATH, {
     provider: "Whale Alert",
+    ...value,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function readMessageAggregatorConfig() {
+  const saved = readJsonIfExists(MESSAGE_AGGREGATOR_CONFIG_PATH, null);
+  const environmentConfig = {
+    enabled: process.env.MESSAGE_AGGREGATOR_ENABLED,
+    filterKeywords: process.env.MESSAGE_FILTER_KEYWORDS,
+    maxItemsPerSource: process.env.MESSAGE_MAX_ITEMS_PER_SOURCE
+  };
+  try {
+    return normalizeMessageAggregatorConfig(saved || environmentConfig);
+  } catch (error) {
+    return {
+      ...normalizeMessageAggregatorConfig({ enabled: false }),
+      configurationError: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function writeMessageAggregatorStatus(value) {
+  writeJson(MESSAGE_AGGREGATOR_STATUS_PATH, {
+    provider: "Message Aggregator",
     ...value,
     updatedAt: new Date().toISOString()
   });
@@ -1044,12 +1161,7 @@ async function fetchPolymarketMarkets(state) {
   const data = await fetchJson(url);
   const rows = Array.isArray(data) ? data : [];
   return rows
-    .filter((market) => {
-      const text = normalizeText([market.question, market.title, market.slug, market.description].join(" ")).toUpperCase();
-      return /BTC|BITCOIN|ETH|ETHEREUM|CRYPTO|CRYPTOCURRENCY|SOLANA|SOL\b|XRP|DOGE|BINANCE|STABLECOIN|TETHER|USDT|USDC/.test(
-        text
-      );
-    })
+    .filter(isCryptoPolymarketMarket)
     .slice(0, 30)
     .map((market) => {
       const marketId = String(market.id || market.conditionId || market.slug || market.question);
@@ -1059,8 +1171,11 @@ async function fetchPolymarketMarkets(state) {
       const previousYesPrice = previous.yesPrice ?? null;
       const priceDelta =
         typeof yesPrice === "number" && typeof previousYesPrice === "number" ? yesPrice - previousYesPrice : 0;
+      const sentiment = buildPolymarketPriceSentiment(market, previous);
       return {
         source: "Polymarket",
+        type: "prediction",
+        provider: "Polymarket",
         id: marketId,
         title: normalizeText(market.question || market.title || market.slug),
         text: normalizeText(
@@ -1071,12 +1186,39 @@ async function fetchPolymarketMarkets(state) {
             `volume=${market.volume || market.volume24hr || ""}`,
             `liquidity=${market.liquidity || ""}`,
             `yes=${yesPrice ?? ""}`,
-            `delta=${priceDelta.toFixed(4)}`
+            `delta=${priceDelta.toFixed(4)}`,
+            sentiment ? `bull=${sentiment.bullProbability.toFixed(4)}` : "",
+            sentiment ? `bear=${sentiment.bearProbability.toFixed(4)}` : "",
+            Number.isFinite(sentiment?.bullBearRatio) ? `bullBearRatio=${sentiment.bullBearRatio.toFixed(4)}` : "",
+            sentiment ? `bullDelta=${sentiment.bullProbabilityDelta.toFixed(4)}` : ""
           ].join(" ")
         ),
         url: market.slug ? `https://polymarket.com/market/${market.slug}` : "",
         yesPrice,
         priceDelta,
+        symbol: sentiment?.symbol || null,
+        isPricePrediction: Boolean(sentiment),
+        yesProbability: sentiment?.yesProbability ?? null,
+        noProbability: sentiment?.noProbability ?? null,
+        bullProbability: sentiment?.bullProbability ?? null,
+        bearProbability: sentiment?.bearProbability ?? null,
+        bullBearRatio: sentiment?.bullBearRatio ?? null,
+        bullProbabilityDelta: sentiment?.bullProbabilityDelta ?? null,
+        sentimentDirection: sentiment?.direction ?? null,
+        sentimentImpact: sentiment?.sentimentImpact ?? null,
+        metrics: sentiment
+          ? {
+              symbol: sentiment.symbol,
+              orientation: sentiment.orientation,
+              yesProbability: roundNumber(sentiment.yesProbability),
+              noProbability: roundNumber(sentiment.noProbability),
+              bullProbability: roundNumber(sentiment.bullProbability),
+              bearProbability: roundNumber(sentiment.bearProbability),
+              bullBearRatio: roundNumber(sentiment.bullBearRatio),
+              bullProbabilityDelta: roundNumber(sentiment.bullProbabilityDelta),
+              volume: roundNumber(sentiment.volume)
+            }
+          : {},
         raw: market
       };
     });
@@ -1108,7 +1250,7 @@ async function fetchBinanceAnnouncements() {
       // Try next endpoint.
     }
   }
-  return items.slice(0, 30);
+  return items.filter((item) => !isRoutineExchangeProductAnnouncement(item)).slice(0, 30);
 }
 
 async function fetchOkxAnnouncements() {
@@ -1126,7 +1268,118 @@ async function fetchOkxAnnouncements() {
       // Try next endpoint.
     }
   }
-  return items.slice(0, 30);
+  return items.filter((item) => !isRoutineExchangeProductAnnouncement(item)).slice(0, 30);
+}
+
+function deduplicateMessageItems(items) {
+  const seenUrls = new Set();
+  const seenTitles = new Set();
+  return items.filter((item) => {
+    const sourceKey = normalizeText(item.source || item.provider).toLocaleLowerCase();
+    const url = normalizeText(item.url).toLocaleLowerCase();
+    const title = normalizeText(item.title).toLocaleLowerCase();
+    const urlKey = url ? `${sourceKey}:${url}` : "";
+    const titleKey = title ? `${sourceKey}:${title}` : "";
+    if ((!urlKey && !titleKey) || (urlKey && seenUrls.has(urlKey)) || (titleKey && seenTitles.has(titleKey))) return false;
+    if (urlKey) seenUrls.add(urlKey);
+    if (titleKey) seenTitles.add(titleKey);
+    return true;
+  });
+}
+
+async function fetchMessageAggregator() {
+  const config = readMessageAggregatorConfig();
+  const configured = config.rssFeeds.length + config.trendSources.length > 0;
+  if (!config.enabled || !configured || config.configurationError) {
+    const error = config.configurationError || null;
+    writeMessageAggregatorStatus({
+      configured,
+      enabled: config.enabled,
+      connected: false,
+      degraded: false,
+      messageCount: 0,
+      checkedAt: new Date().toISOString(),
+      sources: [],
+      errorCode: error ? "invalid_configuration" : null,
+      error
+    });
+    return { items: [], sourceFailures: error ? [`消息聚合器：${error}`] : [] };
+  }
+
+  const jobs = [
+    ...config.rssFeeds.map((feed) => ({
+      type: "rss",
+      name: feed.name,
+      url: feed.url,
+      run: async () => parseRssXml(await fetchText(feed.url), feed, config)
+    })),
+    ...config.trendSources.map((source) => ({
+      type: "trend",
+      name: source.name,
+      url: source.url,
+      run: async () => {
+        const payload = await fetchJson(source.url, {
+          timeoutMs: 8_000,
+          headers: {
+            Referer: "https://newsnow.busiyi.world/",
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+          }
+        });
+        return parseNewsNowPayload(payload, source, config);
+      }
+    }))
+  ];
+  const settled = await Promise.allSettled(
+    jobs.map(async (job) => {
+      const startedAt = Date.now();
+      const rows = await job.run();
+      const fetchLatencyMs = Date.now() - startedAt;
+      return {
+        fetchLatencyMs,
+        rows: rows.map((item) => ({
+          ...item,
+          metrics: { ...(item.metrics || {}), fetchLatencyMs }
+        }))
+      };
+    })
+  );
+  const items = [];
+  const sources = [];
+  const sourceFailures = [];
+  settled.forEach((result, index) => {
+    const job = jobs[index];
+    if (result.status === "fulfilled") {
+      items.push(...result.value.rows);
+      sources.push({
+        type: job.type,
+        name: job.name,
+        url: job.url,
+        connected: true,
+        messageCount: result.value.rows.length,
+        latencyMs: result.value.fetchLatencyMs,
+        error: null
+      });
+      return;
+    }
+    const error = localizeErrorMessage(result.reason instanceof Error ? result.reason.message : String(result.reason));
+    sources.push({ type: job.type, name: job.name, url: job.url, connected: false, messageCount: 0, latencyMs: null, error });
+    sourceFailures.push(`消息聚合器 ${job.name}：${error}`);
+  });
+  const deduplicatedItems = deduplicateMessageItems(items);
+  const connectedCount = sources.filter((source) => source.connected).length;
+  writeMessageAggregatorStatus({
+    configured: true,
+    enabled: true,
+    connected: connectedCount > 0,
+    degraded: connectedCount > 0 && connectedCount < sources.length,
+    messageCount: deduplicatedItems.length,
+    checkedAt: new Date().toISOString(),
+    sources,
+    errorCode: connectedCount ? null : "all_sources_failed",
+    error: connectedCount ? null : "所有已配置聚合源均连接失败。"
+  });
+  return { items: deduplicatedItems, sourceFailures };
 }
 
 async function fetchWhaleAlertIfConfigured() {
@@ -1141,8 +1394,7 @@ async function fetchWhaleAlertIfConfigured() {
     });
     return {
       items: [],
-      warning:
-        "未配置 WHALE_ALERT_API_KEY：真实巨鲸转账监控未启用，当前仅使用 OI 和资金费率作为资金流代理。"
+      warning: null
     };
   }
   try {
@@ -1205,7 +1457,17 @@ function classifyEvent(item) {
     "RESERVE",
     "PARTNERSHIP",
     "LAUNCH",
-    "REOPEN"
+    "REOPEN",
+    "批准",
+    "通过",
+    "流入",
+    "上线",
+    "降息",
+    "采用",
+    "增持",
+    "储备",
+    "合作",
+    "推出"
   ];
   const bearTerms = [
     "HACK",
@@ -1224,7 +1486,21 @@ function classifyEvent(item) {
     "FREEZE",
     "OUTAGE",
     "SELL",
-    "SEC CHARG"
+    "SEC CHARG",
+    "黑客",
+    "攻击",
+    "漏洞",
+    "诉讼",
+    "禁止",
+    "拒绝",
+    "下架",
+    "流出",
+    "加息",
+    "脱锚",
+    "破产",
+    "冻结",
+    "宕机",
+    "制裁"
   ];
   const highImpactTerms = [
     "ETF",
@@ -1246,20 +1522,43 @@ function classifyEvent(item) {
     "APPROVAL",
     "REJECTION",
     "POLYMARKET",
-    "LIQUIDATION"
+    "LIQUIDATION",
+    "比特币",
+    "以太坊",
+    "加密货币",
+    "稳定币",
+    "美联储",
+    "央行",
+    "利率",
+    "降息",
+    "加息",
+    "通胀",
+    "关税",
+    "制裁",
+    "战争",
+    "冲突",
+    "监管",
+    "黑客",
+    "攻击",
+    "下架",
+    "批准",
+    "拒绝"
   ];
 
   const bull = bullTerms.filter((term) => text.includes(term)).length;
   const bear = bearTerms.filter((term) => text.includes(term)).length;
   const highImpact = highImpactTerms.filter((term) => text.includes(term)).length;
+  const sourceTier = Number(item.sourceTier) || inferSourceTier(item);
   const sourceWeight =
-    item.source === "Binance" || item.source === "OKX"
-      ? 1.2
-      : item.source === "Polymarket"
-        ? 1.05
-        : item.source === "WhaleAlert"
-          ? 1.1
-          : 0.9;
+    Number(item.sourceQualityWeight) ||
+    (item.source === "Polymarket"
+      ? 1.05
+      : item.source === "WhaleAlert"
+        ? 1.1
+        : sourceWeightForTier(sourceTier));
+  const corroborationCount = Math.max(1, safeNumber(item.corroborationCount, 1));
+  const corroborationMultiplier = Math.min(1.24, 1 + (corroborationCount - 1) * 0.08);
+  const trendScore = clamp(safeNumber(item.trendScore), 0, 1);
 
   const matchedSymbols = SYMBOLS.filter((symbol) => {
     const aliases = SYMBOL_ALIASES[symbol] || [symbol.replace("USDT", "")];
@@ -1267,12 +1566,25 @@ function classifyEvent(item) {
   });
 
   const marketWide =
-    /CRYPTO|CRYPTOCURRENCY|BITCOIN|BTC|ETHEREUM|ETH|BINANCE|OKX|STABLECOIN|USDT|USDC|ETF|FED|FOMC|CPI|PCE/.test(
+    /CRYPTO|CRYPTOCURRENCY|BITCOIN|BTC|ETHEREUM|ETH|BINANCE|OKX|STABLECOIN|USDT|USDC|ETF|FED|FOMC|CPI|PCE|比特币|以太坊|加密货币|数字货币|虚拟货币|稳定币|美联储|央行|利率|降息|加息|通胀|关税|制裁|战争|冲突/.test(
       text
     );
   const directionRaw = bull - bear;
-  const direction = directionRaw > 0 ? 1 : directionRaw < 0 ? -1 : inferPolymarketDirection(item);
-  const impactScore = clamp((18 + highImpact * 12 + Math.abs(directionRaw) * 10) * sourceWeight, 0, 100);
+  const direction =
+    item.source === "Polymarket" && Number.isFinite(item.sentimentDirection)
+      ? item.sentimentDirection
+      : directionRaw > 0
+        ? 1
+        : directionRaw < 0
+          ? -1
+          : inferPolymarketDirection(item);
+  const termImpactScore = clamp(
+    (18 + highImpact * 12 + Math.abs(directionRaw) * 10) * sourceWeight * corroborationMultiplier +
+      trendScore * 10,
+    0,
+    100
+  );
+  const impactScore = Math.max(termImpactScore, safeNumber(item.sentimentImpact));
 
   return {
     ...item,
@@ -1280,12 +1592,23 @@ function classifyEvent(item) {
     marketWide,
     direction,
     impactScore,
-    reasons: { bullTerms: bull, bearTerms: bear, highImpactTerms: highImpact, sourceWeight }
+    reasons: {
+      bullTerms: bull,
+      bearTerms: bear,
+      highImpactTerms: highImpact,
+      sourceTier,
+      sourceWeight,
+      corroborationCount,
+      corroborationMultiplier,
+      trendScore,
+      predictionSentiment: Boolean(item.isPricePrediction)
+    }
   };
 }
 
 function inferPolymarketDirection(item) {
   if (item.source !== "Polymarket") return 0;
+  if (Number.isFinite(item.sentimentDirection)) return item.sentimentDirection;
   const text = `${item.title || ""} ${item.text || ""}`.toUpperCase();
   const yesDelta = safeNumber(item.priceDelta);
   if (/HIT|REACH|ABOVE|OVER/.test(text) && Math.abs(yesDelta) > 0.01) {
@@ -2460,15 +2783,32 @@ function roundNumber(value, digits = 6) {
 
 function compactEvent(event) {
   return {
+    id: event.id || null,
+    type: event.type || "news",
+    provider: event.provider || event.source,
     source: event.source,
+    sourceName: event.sourceName || null,
+    storyId: event.storyId || null,
+    sourceTier: event.sourceTier || null,
+    corroborationCount: event.corroborationCount || 1,
+    duplicateCount: event.duplicateCount || 0,
+    corroboratingSources: event.corroboratingSources || [event.source],
+    trendScore: roundNumber(event.trendScore),
     title: event.title,
     url: event.url,
+    occurredAt: event.occurredAt || null,
+    receivedAt: event.receivedAt || null,
     direction: event.direction,
     impactScore: Math.round(safeNumber(event.impactScore)),
     matchedSymbols: event.matchedSymbols || [],
     marketWide: Boolean(event.marketWide),
     yesPrice: roundNumber(event.yesPrice),
     priceDelta: roundNumber(event.priceDelta),
+    bullProbability: roundNumber(event.bullProbability),
+    bearProbability: roundNumber(event.bearProbability),
+    bullBearRatio: roundNumber(event.bullBearRatio),
+    bullProbabilityDelta: roundNumber(event.bullProbabilityDelta),
+    metrics: event.metrics || {},
     reasons: event.reasons || null,
     text: event.text
   };
@@ -2551,7 +2891,7 @@ function renderConsoleReport(report) {
   lines.push(`Event signal monitor ${report.generatedAt}`);
   lines.push(`Mode: ${report.mode}. Layer: ${report.layer}. This is not live trading.`);
   lines.push(
-    `Sources: GDELT=${report.sourceCounts.gdelt} Polymarket=${report.sourceCounts.polymarket} Binance=${report.sourceCounts.binanceAnnouncements} OKX=${report.sourceCounts.okxAnnouncements} Whale=${report.sourceCounts.whale} Markets=${report.sourceCounts.marketAnalyses}`
+    `Sources: RSS=${report.sourceCounts.rss} Trend=${report.sourceCounts.trend} GDELT=${report.sourceCounts.gdelt} Polymarket=${report.sourceCounts.polymarket} Binance=${report.sourceCounts.binanceAnnouncements} OKX=${report.sourceCounts.okxAnnouncements} Whale=${report.sourceCounts.whale} UniqueStories=${report.sourceCounts.uniqueStories} Suppressed=${report.sourceCounts.suppressedDuplicates} Markets=${report.sourceCounts.marketAnalyses}`
   );
   if (report.warnings.length) {
     lines.push(`告警：${report.warnings.slice(0, 6).join(" | ")}`);
@@ -2593,6 +2933,7 @@ async function main() {
   state.modelWeights = { ...BASE_MODEL_WEIGHTS, ...(state.modelWeights || {}) };
   state.polymarket = state.polymarket || {};
   state.openInterest = state.openInterest || {};
+  state.newsTrends = state.newsTrends || {};
   const releaseInitialAccountLock = await acquireAccountLock();
   let accountConfig;
   let accountSessionId;
@@ -2610,8 +2951,9 @@ async function main() {
     "仅模拟告警：脚本不会发送实盘订单。",
     "无证据表明新闻聚合、大模型推理或 Polymarket 赔率本身能稳定盈利。"
   ];
-  const [gdeltNewsResult, polymarketResult, binanceAnnouncementsResult, okxAnnouncementsResult, whaleResult] =
+  const [aggregatorResult, gdeltNewsResult, polymarketResult, binanceAnnouncementsResult, okxAnnouncementsResult, whaleResult] =
     await Promise.all([
+      isSlowLayer ? fetchMessageAggregator() : { items: [], sourceFailures: [] },
       isSlowLayer ? fetchWithFallback("GDELT", fetchGdeltNews, []) : [],
       isFastLayer ? fetchWithFallback("Polymarket", () => fetchPolymarketMarkets(state), []) : [],
       isFastLayer ? fetchWithFallback("Binance announcements", fetchBinanceAnnouncements, []) : [],
@@ -2619,24 +2961,31 @@ async function main() {
       isFastLayer ? fetchWithFallback("WhaleAlert", fetchWhaleAlertIfConfigured, { items: [], warning: null }) : { items: [], warning: null }
     ]);
 
+  const rawAggregatedItems = Array.isArray(aggregatorResult?.items) ? aggregatorResult.items : [];
+  const trendUpdate = updateTrendHistory(rawAggregatedItems, state.newsTrends);
+  const aggregatedItems = trendUpdate.items;
+  state.newsTrends = trendUpdate.history;
   const gdeltNews = Array.isArray(gdeltNewsResult) ? gdeltNewsResult : [];
   const polymarketMarkets = Array.isArray(polymarketResult) ? polymarketResult : [];
   const binanceAnnouncements = Array.isArray(binanceAnnouncementsResult) ? binanceAnnouncementsResult : [];
   const okxAnnouncements = Array.isArray(okxAnnouncementsResult) ? okxAnnouncementsResult : [];
   const whaleItems = Array.isArray(whaleResult?.items) ? whaleResult.items : [];
   if (whaleResult?.warning) warnings.push(whaleResult.warning);
+  if (aggregatorResult?.sourceFailures?.length) warnings.push(...aggregatorResult.sourceFailures);
   for (const result of [gdeltNewsResult, polymarketResult, binanceAnnouncementsResult, okxAnnouncementsResult, whaleResult]) {
     if (result?.sourceFailure) warnings.push(result.sourceFailure);
   }
 
   const allEvents = [
+    ...aggregatedItems,
     ...gdeltNews,
     ...polymarketMarkets,
     ...binanceAnnouncements,
     ...okxAnnouncements,
     ...whaleItems
   ];
-  const scoredEvents = allEvents.map(classifyEvent);
+  const storyClustering = clusterMessageItems(allEvents);
+  const scoredEvents = storyClustering.items.map(classifyEvent);
   const classifiedEvents = scoredEvents.filter((event) => event.impactScore >= 18);
   const eventsBySymbol = aggregateEventsBySymbol(classifiedEvents);
 
@@ -2660,6 +3009,9 @@ async function main() {
     if (market.id) {
       state.polymarket[market.id] = {
         yesPrice: typeof market.yesPrice === "number" ? market.yesPrice : null,
+        bullProbability: typeof market.bullProbability === "number" ? market.bullProbability : null,
+        bearProbability: typeof market.bearProbability === "number" ? market.bearProbability : null,
+        bullBearRatio: typeof market.bullBearRatio === "number" ? market.bullBearRatio : null,
         updatedAt: new Date().toISOString()
       };
     }
@@ -2714,7 +3066,7 @@ async function main() {
           : [],
       slow:
         RUN_LAYER === "slow" || RUN_LAYER === "all"
-          ? ["GDELT global news", "event review", "model weight calibration", "TP/SL/expiry review"]
+          ? ["built-in RSS aggregation", "NewsNow trend ranking", "GDELT global news", "story clustering", "event review", "model weight calibration", "TP/SL/expiry review"]
           : []
     },
     analysisPolicy: {
@@ -2756,14 +3108,21 @@ async function main() {
     },
     portfolioOptimization: markowitzResult.portfolio,
     sourceCounts: {
+      aggregated: aggregatedItems.length,
+      rss: aggregatedItems.filter((item) => item.provider === "Built-in RSS").length,
+      trend: aggregatedItems.filter((item) => item.provider === "NewsNow").length,
       gdelt: gdeltNews.length,
       polymarket: polymarketMarkets.length,
       binanceAnnouncements: binanceAnnouncements.length,
       okxAnnouncements: okxAnnouncements.length,
       whale: whaleItems.length,
+      rawEvents: storyClustering.stats.inputCount,
+      uniqueStories: storyClustering.stats.outputCount,
+      suppressedDuplicates: storyClustering.stats.suppressedDuplicates,
       classifiedEvents: classifiedEvents.length,
       marketAnalyses: marketAnalyses.length
     },
+    storyClustering: storyClustering.stats,
     warnings: [...new Set(warnings)].slice(0, 80),
     messageFeed,
     modelCalculations,

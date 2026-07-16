@@ -240,9 +240,9 @@ main {
   max-height: 360px;
 }
 
-.whale-alert-form {
+.message-aggregator-form {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
   gap: 8px 10px;
   align-items: end;
   padding: 10px 12px;
@@ -250,14 +250,22 @@ main {
   background: #0b1118;
 }
 
-.whale-alert-field label {
+.message-aggregator-field label {
   display: block;
   margin-bottom: 4px;
   color: var(--muted);
   font-size: 11px;
 }
 
-.whale-alert-field input {
+.built-in-source-note {
+  display: block;
+  margin-top: 5px;
+  color: #728196;
+  font-size: 11px;
+}
+
+.message-aggregator-field input,
+.message-aggregator-field textarea {
   width: 100%;
   min-height: 36px;
   border: 1px solid var(--line);
@@ -268,35 +276,51 @@ main {
   font: inherit;
 }
 
-.whale-alert-field input:focus {
+.message-aggregator-field textarea {
+  min-height: 72px;
+  resize: vertical;
+  padding-top: 8px;
+}
+
+.message-aggregator-field.wide-field {
+  grid-column: 1 / -1;
+}
+
+.message-aggregator-field input:focus,
+.message-aggregator-field textarea:focus {
   border-color: #44d3a5;
   outline: 1px solid rgba(68, 211, 165, 0.28);
 }
 
-#whaleAlertConnectButton.connected {
+#messageAggregatorConnectButton.connected {
   border-color: #28463d;
   background: #111d19;
   color: #6f8f84;
   opacity: 1;
 }
 
-.whale-alert-status {
+.message-aggregator-toggle {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.message-aggregator-status {
   grid-column: 1 / -1;
   min-height: 18px;
   color: var(--muted);
   font-size: 11px;
 }
 
-.whale-alert-status.connected {
+.message-aggregator-status.connected {
   color: var(--accent);
 }
 
-.whale-alert-status.error {
+.message-aggregator-status.error {
   color: var(--danger);
 }
 
-.whale-alert-status.checking,
-.whale-alert-status.editing {
+.message-aggregator-status.checking,
+.message-aggregator-status.editing {
   color: var(--warn);
 }
 
@@ -729,6 +753,23 @@ main {
   font-size: 13px;
 }
 
+.account-summary-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.summary-collapse-button {
+  min-height: 28px;
+  padding: 2px 9px;
+  border-color: #405166;
+  background: #121b25;
+  color: #c1ccd8;
+  font-size: 12px;
+}
+
 .summary-status {
   display: inline-flex;
   align-items: center;
@@ -1006,11 +1047,12 @@ a:hover {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .whale-alert-form {
+  .message-aggregator-form {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .whale-alert-status {
+  .message-aggregator-field.wide-field,
+  .message-aggregator-status {
     grid-column: 1;
   }
 
