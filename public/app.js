@@ -1157,34 +1157,39 @@ function modelRow(item) {
         </div>
         <div>${item.candidateStatus === "passed" ? badge(text.passed, "ok") : item.candidateStatus === "watch" ? badge(text.watch, "warn") : badge(text.none)}</div>
       </div>
-      <div class="calc-grid">
+      <div class="calc-grid model-summary-grid">
         ${calcCell(text.latestPrice, fmtPrice(item.latest))}
-        ${calcCell("Math Signal", fmtNumber(item.mathSignal, 4))}
         ${calcCell(text.eventImpact, fmtNumber(item.eventImpactScore, 0))}
-        ${calcCell("ATR%", fmtPct(inputs.atrPct, 2))}
-        ${calcCell("RSI", fmtNumber(inputs.rsi14, 2))}
-        ${calcCell(text.oiChange, fmtPct(inputs.oiChange, 2))}
-        ${calcCell(text.trendTerm, fmtNumber(components.trendSignal, 4))}
-        ${calcCell(text.htfTrendTerm, fmtNumber(components.htfTrendSignal, 4))}
-        ${calcCell(text.momentumTerm, fmtNumber(components.momentumSignal, 4))}
-        ${calcCell(text.fundingTerm, fmtNumber(components.fundingSignal, 4))}
-        ${calcCell("GBM 上涨概率", fmtPct(gbm.probabilityUp, 1))}
-        ${calcCell("GBM 1h期望", fmtPct(gbm.expectedReturn, 3))}
-        ${calcCell("GARCH预测波动", fmtPct(garch.forecastVolatility, 3))}
-        ${calcCell("GARCH波动比", fmtNumber(garch.volatilityRatio, 3))}
-        ${calcCell("HMM状态", localizeHmmRegime(hiddenMarkov.regime))}
         ${calcCell("HMM 多/空概率", `${fmtPct(hiddenMarkov.bullProbability, 1)} / ${fmtPct(hiddenMarkov.bearProbability, 1)}`)}
-        ${calcCell("Poisson事件数", fmtNumber(poisson.observedEvents, 0))}
-        ${calcCell("Poisson尾部概率", fmtPct(poisson.tailProbability, 1))}
-        ${calcCell("Bayes后验胜率", fmtPct(bayesian.posteriorWinRate, 1))}
-        ${calcCell("Bayes调整", fmtPct(bayesian.adjustment, 2))}
-        ${calcCell("Markowitz权重", fmtPct(markowitz.weight, 1))}
         ${calcCell(text.winRate, fmtPct(signal.winRate, 1))}
         ${calcCell("EV", fmtPct(signal.expectancyPct, 2))}
         ${calcCell(text.modelLeverage, accountControl.modelSuggestedLeverage ? `${fmtNumber(accountControl.modelSuggestedLeverage, 2)}x` : "-")}
-        ${calcCell(text.leverage, accountControl.appliedLeverage ? `${fmtNumber(accountControl.appliedLeverage, 2)}x` : "-")}
       </div>
-      <div class="formula">${escapeHtml(buildFormulaText(item))}</div>
+      <details class="model-details">
+        <summary>展开完整计算</summary>
+        <div class="calc-grid calc-grid-detail">
+          ${calcCell("Math Signal", fmtNumber(item.mathSignal, 4))}
+          ${calcCell("ATR%", fmtPct(inputs.atrPct, 2))}
+          ${calcCell("RSI", fmtNumber(inputs.rsi14, 2))}
+          ${calcCell(text.oiChange, fmtPct(inputs.oiChange, 2))}
+          ${calcCell(text.trendTerm, fmtNumber(components.trendSignal, 4))}
+          ${calcCell(text.htfTrendTerm, fmtNumber(components.htfTrendSignal, 4))}
+          ${calcCell(text.momentumTerm, fmtNumber(components.momentumSignal, 4))}
+          ${calcCell(text.fundingTerm, fmtNumber(components.fundingSignal, 4))}
+          ${calcCell("GBM 上涨概率", fmtPct(gbm.probabilityUp, 1))}
+          ${calcCell("GBM 1h期望", fmtPct(gbm.expectedReturn, 3))}
+          ${calcCell("GARCH预测波动", fmtPct(garch.forecastVolatility, 3))}
+          ${calcCell("GARCH波动比", fmtNumber(garch.volatilityRatio, 3))}
+          ${calcCell("HMM状态", localizeHmmRegime(hiddenMarkov.regime))}
+          ${calcCell("Poisson事件数", fmtNumber(poisson.observedEvents, 0))}
+          ${calcCell("Poisson尾部概率", fmtPct(poisson.tailProbability, 1))}
+          ${calcCell("Bayes后验胜率", fmtPct(bayesian.posteriorWinRate, 1))}
+          ${calcCell("Bayes调整", fmtPct(bayesian.adjustment, 2))}
+          ${calcCell("Markowitz权重", fmtPct(markowitz.weight, 1))}
+          ${calcCell(text.leverage, accountControl.appliedLeverage ? `${fmtNumber(accountControl.appliedLeverage, 2)}x` : "-")}
+        </div>
+        <div class="formula">${escapeHtml(buildFormulaText(item))}</div>
+      </details>
     </div>
   `;
 }
