@@ -428,6 +428,64 @@ main {
   gap: 8px;
 }
 
+.model-summary-grid {
+  align-items: stretch;
+}
+
+.model-details {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(38, 51, 66, 0.8);
+}
+
+.model-details summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #0b1118;
+  color: var(--accent);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.model-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.model-details summary::before {
+  content: "+";
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border: 1px solid #2aa77f;
+  border-radius: 5px;
+  color: var(--accent);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.model-details[open] summary::before {
+  content: "-";
+}
+
+.model-details summary:hover {
+  border-color: #2aa77f;
+  background: #10261f;
+}
+
+.calc-grid-detail {
+  padding-top: 0;
+}
+
 .account-layout {
   display: grid;
   grid-template-columns: minmax(280px, 0.7fr) minmax(0, 1.3fr);
