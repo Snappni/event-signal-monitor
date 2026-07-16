@@ -22,7 +22,9 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
 const PUBLIC_DIR = path.resolve(ROOT_DIR, "public");
-const RUNTIME_DIR = path.resolve(ROOT_DIR, ".runtime", "event-signal-monitor");
+const RUNTIME_DIR = path.resolve(
+  process.env.SIGNAL_RUNTIME_DIR || path.resolve(ROOT_DIR, ".runtime", "event-signal-monitor")
+);
 const ACCOUNT_CONFIG_PATH = path.join(RUNTIME_DIR, "account.json");
 const ACCOUNT_STATE_PATH = path.join(RUNTIME_DIR, "paper-account.json");
 const ACCOUNT_LOCK_PATH = path.join(RUNTIME_DIR, "account.lock");
@@ -440,6 +442,28 @@ function normalizeAccountConfig(value) {
     ),
     updatedAt: raw.updatedAt || new Date().toISOString()
   };
+}
+
+function sameAccountConfig(left, right) {
+  const a = normalizeAccountConfig(left);
+  const b = normalizeAccountConfig(right);
+  return (
+    a.initialCapital === b.initialCapital &&
+    a.quoteCurrency === b.quoteCurrency &&
+    a.marketType === b.marketType &&
+    a.maxLeverage === b.maxLeverage &&
+    a.riskProfile === b.riskProfile &&
+    a.takerFeeRate === b.takerFeeRate &&
+    a.slippageRate === b.slippageRate &&
+    a.fundingIntervalHours === b.fundingIntervalHours
+  );
+}
+
+function hasAccountConfigInput(value) {
+  if (!value || typeof value !== "object") return false;
+  return ["initialCapital", "quoteCurrency", "marketType", "maxLeverage", "riskProfile"].some(
+    (key) => Object.hasOwn(value, key)
+  );
 }
 
 function createPaperAccount(config, now = new Date().toISOString()) {
@@ -908,10 +932,21 @@ const server = http.createServer(async (request, response) => {
   }
   if (url.pathname === "/api/account/start" && request.method === "POST") {
     try {
+      const body = await readRequestJson(request);
       const { config, account } = await withAccountLock(() => {
-        const { config, account } = readAccountBundle();
+        const current = readAccountBundle();
+        const now = new Date().toISOString();
+        const requestedConfig = hasAccountConfigInput(body)
+          ? normalizeAccountConfig({ ...current.config, ...body, updatedAt: now })
+          : current.config;
+        const configChanged = !sameAccountConfig(current.config, requestedConfig);
+        const config = configChanged ? requestedConfig : current.config;
+        const account = configChanged ? createPaperAccount(config, now) : current.account;
+
+        if (configChanged) {
+          writeJson(ACCOUNT_CONFIG_PATH, config);
+        }
         if (!account.isActive) {
-          const now = new Date().toISOString();
           account.sessionId = randomUUID();
           account.isActive = true;
           account.startedAt = now;
@@ -943,8 +978,9 @@ const server = http.createServer(async (request, response) => {
             openedPositions: [],
             closedPositions: []
           };
-          writeJson(ACCOUNT_STATE_PATH, account);
         }
+        account.configSnapshot = config;
+        writeJson(ACCOUNT_STATE_PATH, account);
         return { config, account };
       });
       sendJson(response, { config, account });
