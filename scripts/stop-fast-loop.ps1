@@ -17,7 +17,7 @@ function Stop-ProcessTree {
 }
 
 if (!(Test-Path -LiteralPath $PidPath)) {
-  Write-Output "No fast-loop.pid file found."
+  Write-Output "No unified-loop pid file found."
   exit 0
 }
 
@@ -33,4 +33,4 @@ if ($null -eq $Process) {
 
 Stop-ProcessTree -ProcessId $LoopPid
 Remove-Item -LiteralPath $PidPath -Force
-Write-Output "Stopped fast loop pid=$LoopPid."
+Write-Output "Stopped unified high-frequency loop pid=$LoopPid."

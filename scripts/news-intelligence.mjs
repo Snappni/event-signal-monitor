@@ -102,6 +102,78 @@ export function sourceWeightForTier(tier) {
   return SOURCE_WEIGHTS[tier] || SOURCE_WEIGHTS[4];
 }
 
+function parsedTimestamp(value) {
+  if (value == null || value === "") return null;
+  const parsed = typeof value === "number" ? value : Date.parse(String(value));
+  if (!Number.isFinite(parsed)) return null;
+  const milliseconds = parsed > 0 && parsed < 10_000_000_000 ? parsed * 1_000 : parsed;
+  return Number.isFinite(milliseconds) ? milliseconds : null;
+}
+
+function freshnessProfile(item) {
+  const source = `${item?.source || ""} ${item?.provider || ""}`.toUpperCase();
+  if (item?.type === "prediction" || source.includes("POLYMARKET")) {
+    return { halfLifeHours: 0.5, graceHours: 5 / 60 };
+  }
+  if (source.includes("WHALEALERT")) return { halfLifeHours: 2, graceHours: 10 / 60 };
+  if (source.includes("NEWSNOW")) return { halfLifeHours: 4, graceHours: 0.25 };
+  if (/BINANCE|OKX/.test(source)) return { halfLifeHours: 12, graceHours: 0.5 };
+  if (inferSourceTier(item) === 1) return { halfLifeHours: 72, graceHours: 1 };
+  return { halfLifeHours: 24, graceHours: 0.5 };
+}
+
+function freshnessLevel(ageMinutes) {
+  if (ageMinutes <= 5) return "live";
+  if (ageMinutes <= 30) return "fresh";
+  if (ageMinutes <= 120) return "recent";
+  if (ageMinutes <= 1_440) return "today";
+  if (ageMinutes <= 4_320) return "aging";
+  return "stale";
+}
+
+export function analyzeEventFreshness(item, now = Date.now()) {
+  const receivedAtMs = parsedTimestamp(item?.receivedAt);
+  const occurredAtCandidate = parsedTimestamp(item?.occurredAt);
+  const futureToleranceMs = 5 * 60 * 1_000;
+  const occurredAtMs = occurredAtCandidate != null && occurredAtCandidate <= now + futureToleranceMs
+    ? occurredAtCandidate
+    : null;
+  const usableReceivedAtMs = receivedAtMs != null && receivedAtMs <= now + futureToleranceMs ? receivedAtMs : null;
+  const effectiveAtMs = occurredAtMs ?? usableReceivedAtMs;
+  const hasClockSkew = occurredAtCandidate != null && occurredAtMs == null;
+
+  if (effectiveAtMs == null) {
+    return {
+      effectiveAt: null,
+      timestampBasis: "unknown",
+      ageMinutes: null,
+      level: "unknown",
+      freshnessWeight: 0.55,
+      halfLifeHours: null,
+      timestampConfidence: 0.4,
+      hasClockSkew
+    };
+  }
+
+  const { halfLifeHours, graceHours } = freshnessProfile(item);
+  const ageHours = Math.max(0, now - effectiveAtMs) / (60 * 60 * 1_000);
+  const decayingAgeHours = Math.max(0, ageHours - graceHours);
+  const freshnessWeight = Math.max(0.15, Math.min(1, Math.exp((-Math.LN2 * decayingAgeHours) / halfLifeHours)));
+  const ageMinutes = ageHours * 60;
+  const timestampBasis = occurredAtMs != null ? "occurredAt" : "receivedAt";
+
+  return {
+    effectiveAt: new Date(effectiveAtMs).toISOString(),
+    timestampBasis,
+    ageMinutes: Number(ageMinutes.toFixed(1)),
+    level: freshnessLevel(ageMinutes),
+    freshnessWeight: Number(freshnessWeight.toFixed(4)),
+    halfLifeHours,
+    timestampConfidence: timestampBasis === "occurredAt" ? 1 : 0.8,
+    hasClockSkew
+  };
+}
+
 export function updateTrendHistory(items, history = {}, now = Date.now()) {
   const nextHistory = { ...(history && typeof history === "object" ? history : {}) };
   const enrichedItems = items.map((item) => {

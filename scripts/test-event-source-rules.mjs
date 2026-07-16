@@ -2,8 +2,10 @@
 import assert from "node:assert/strict";
 import {
   buildPolymarketPriceSentiment,
+  extractBinaryMarketProbabilities,
   isCryptoPolymarketMarket,
-  isRoutineExchangeProductAnnouncement
+  isRoutineExchangeProductAnnouncement,
+  updatePredictionMarketTracking
 } from "./event-source-rules.mjs";
 
 assert.equal(
@@ -13,6 +15,49 @@ assert.equal(
   }),
   true
 );
+
+const genericBinary = extractBinaryMarketProbabilities({
+  outcomes: ["Yes", "No"],
+  outcomePrices: ["0.63", "0.37"]
+});
+assert.deepEqual(genericBinary.labels, ["Yes", "No"]);
+assert.deepEqual(genericBinary.probabilities, [0.63, 0.37]);
+assert.ok(Math.abs(genericBinary.ratio - 0.63 / 0.37) < 1e-12);
+
+const trackedOpen = updatePredictionMarketTracking(
+  {},
+  {
+    id: "market-1",
+    title: "Will Bitcoin be above $100,000?",
+    active: true,
+    closed: false,
+    yesProbability: 0.63,
+    noProbability: 0.37,
+    volume: 1000,
+    liquidity: 500
+  },
+  "2026-07-16T10:00:00Z"
+);
+const trackedClosed = updatePredictionMarketTracking(
+  trackedOpen,
+  {
+    id: "market-1",
+    closed: true,
+    yesProbability: 1,
+    noProbability: 0,
+    volume: 1500,
+    liquidity: 0
+  },
+  "2026-07-16T11:00:00Z"
+);
+assert.equal(trackedOpen.status, "tracking");
+assert.equal(trackedOpen.observations, 1);
+assert.equal(trackedClosed.status, "closed");
+assert.equal(trackedClosed.observations, 2);
+assert.equal(trackedClosed.history.length, 2);
+assert.equal(trackedClosed.hourlyHistory.length, 2);
+assert.equal(trackedClosed.dailyHistory.length, 1);
+assert.equal(trackedClosed.closedAt, "2026-07-16T11:00:00.000Z");
 assert.equal(
   isRoutineExchangeProductAnnouncement({
     source: "Binance",

@@ -1,6 +1,6 @@
 {
   "name": "event-signal-monitor",
-  "version": "0.10.0",
+  "version": "0.14.0",
   "description": "Local paper-alert crypto event and quantitative signal monitor.",
   "private": true,
   "type": "module",
@@ -9,21 +9,22 @@
   },
   "scripts": {
     "start": "npm run dashboard",
-    "signal:monitor": "node ./scripts/event-signal-monitor.mjs --layer=all",
-    "signal:fast": "node ./scripts/event-signal-monitor.mjs --layer=fast",
-    "signal:slow": "node ./scripts/event-signal-monitor.mjs --layer=slow",
+    "signal:monitor": "node ./scripts/event-signal-monitor.mjs",
+    "signal:fast": "node ./scripts/event-signal-monitor.mjs",
     "signal:test:costs": "node ./scripts/event-signal-monitor.mjs --self-test-costs",
     "signal:test:models": "node ./scripts/event-signal-monitor.mjs --self-test-models",
     "signal:test:profiles": "node ./scripts/event-signal-monitor.mjs --self-test-profiles",
     "signal:test:aggregator": "node ./scripts/test-message-aggregator.mjs",
     "signal:test:news": "node ./scripts/test-news-intelligence.mjs",
     "signal:test:sources": "node ./scripts/test-event-source-rules.mjs",
+    "signal:test:reviews": "node ./scripts/test-post-trade-review.mjs",
+    "signal:test:gates": "node ./scripts/test-adaptive-entry-gate.mjs",
     "signal:fast:loop": "powershell -ExecutionPolicy ByPass -File ./scripts/start-fast-loop.ps1 -IntervalSeconds 60",
     "signal:fast:stop": "powershell -ExecutionPolicy ByPass -File ./scripts/stop-fast-loop.ps1",
-    "signal:slow:loop": "powershell -ExecutionPolicy ByPass -File ./scripts/start-slow-loop.ps1 -IntervalSeconds 300 -InitialDelaySeconds 30",
-    "signal:slow:stop": "powershell -ExecutionPolicy ByPass -File ./scripts/stop-slow-loop.ps1",
+    "signal:loop": "powershell -ExecutionPolicy ByPass -File ./scripts/start-fast-loop.ps1 -IntervalSeconds 60",
+    "signal:stop": "powershell -ExecutionPolicy ByPass -File ./scripts/stop-fast-loop.ps1",
     "dashboard": "node ./scripts/serve-dashboard.mjs",
-    "check": "node --check ./scripts/event-signal-monitor.mjs && node --check ./scripts/message-aggregator.mjs && node --check ./scripts/news-intelligence.mjs && node --check ./scripts/event-source-rules.mjs && node --check ./scripts/serve-dashboard.mjs && node --check ./public/app.js && npm run signal:test:aggregator && npm run signal:test:news && npm run signal:test:sources && npm run signal:test:costs && npm run signal:test:models && npm run signal:test:profiles"
+    "check": "node --check ./scripts/event-signal-monitor.mjs && node --check ./scripts/message-aggregator.mjs && node --check ./scripts/news-intelligence.mjs && node --check ./scripts/event-source-rules.mjs && node --check ./scripts/post-trade-review.mjs && node --check ./scripts/adaptive-entry-gate.mjs && node --check ./scripts/serve-dashboard.mjs && node --check ./public/app.js && npm run signal:test:aggregator && npm run signal:test:news && npm run signal:test:sources && npm run signal:test:reviews && npm run signal:test:gates && npm run signal:test:costs && npm run signal:test:models && npm run signal:test:profiles"
   },
   "dependencies": {
     "echarts": "^6.1.0",
