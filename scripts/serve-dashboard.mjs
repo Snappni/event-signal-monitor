@@ -33,6 +33,11 @@ const MESSAGE_AGGREGATOR_CONFIG_PATH = path.join(RUNTIME_DIR, "message-aggregato
 const MESSAGE_AGGREGATOR_STATUS_PATH = path.join(RUNTIME_DIR, "message-aggregator-status.json");
 const ENV_PATH = path.join(ROOT_DIR, ".env");
 const PORT = Number(process.env.SIGNAL_DASHBOARD_PORT || 8788);
+const LOOP_INTERVAL_SECONDS = 60;
+const LOOP_STALE_SECONDS = Math.max(
+  LOOP_INTERVAL_SECONDS * 2,
+  Number(process.env.SIGNAL_LOOP_STALE_SECONDS || 150)
+);
 const DEFAULT_FUTURES_TAKER_FEE_RATE = 0.0005;
 const DEFAULT_SPOT_TAKER_FEE_RATE = 0.001;
 const DEFAULT_SLIPPAGE_RATE = 0.0003;
@@ -963,12 +968,22 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname === "/api/status") {
     const fastPidPath = path.join(RUNTIME_DIR, "fast-loop.pid");
     const fastPid = Number(fs.existsSync(fastPidPath) ? fs.readFileSync(fastPidPath, "utf8").trim() : 0);
+    const pidRunning = isProcessRunning(fastPid);
+    const latestReport = readJson(path.join(RUNTIME_DIR, "latest-report.json"), null);
+    const reportGeneratedAt = latestReport?.generatedAt || null;
+    const reportTimestamp = Date.parse(reportGeneratedAt || "");
+    const reportAgeMs = Number.isFinite(reportTimestamp) ? Math.max(0, Date.now() - reportTimestamp) : null;
+    const reportFresh = reportAgeMs !== null && reportAgeMs <= LOOP_STALE_SECONDS * 1000;
     sendJson(response, {
       generatedAt: new Date().toISOString(),
       loopMode: "unified-high-frequency",
       loopPid: fastPid || null,
-      loopRunning: isProcessRunning(fastPid),
-      loopIntervalSeconds: 60,
+      loopRunning: pidRunning || reportFresh,
+      loopBackend: pidRunning ? "process-pid" : reportFresh ? "report-heartbeat" : "none",
+      loopIntervalSeconds: LOOP_INTERVAL_SECONDS,
+      loopLastReportAt: reportGeneratedAt,
+      loopReportAgeSeconds: reportAgeMs === null ? null : Math.round(reportAgeMs / 1000),
+      loopStaleAfterSeconds: LOOP_STALE_SECONDS,
       runtimeDir: RUNTIME_DIR
     });
     return;
