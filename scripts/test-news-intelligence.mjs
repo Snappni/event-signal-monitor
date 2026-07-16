@@ -1,9 +1,39 @@
 import assert from "node:assert/strict";
 import {
+  analyzeEventFreshness,
   clusterMessageItems,
   inferSourceTier,
   updateTrendHistory
 } from "./news-intelligence.mjs";
+
+const livePrediction = analyzeEventFreshness(
+  {
+    type: "prediction",
+    source: "Polymarket",
+    receivedAt: "2026-07-16T10:00:00Z"
+  },
+  Date.parse("2026-07-16T10:04:00Z")
+);
+assert.equal(livePrediction.level, "live");
+assert.equal(livePrediction.freshnessWeight, 1);
+assert.equal(livePrediction.timestampBasis, "receivedAt");
+
+const agingNews = analyzeEventFreshness(
+  {
+    type: "news",
+    source: "RSS:CNBC Markets",
+    occurredAt: "2026-07-15T22:00:00Z",
+    receivedAt: "2026-07-16T10:00:00Z"
+  },
+  Date.parse("2026-07-16T10:00:00Z")
+);
+assert.equal(agingNews.level, "today");
+assert.ok(agingNews.freshnessWeight > 0.7 && agingNews.freshnessWeight < 0.75);
+assert.equal(agingNews.timestampBasis, "occurredAt");
+
+const unknownTime = analyzeEventFreshness({ type: "news", source: "unknown" }, Date.parse("2026-07-16T10:00:00Z"));
+assert.equal(unknownTime.level, "unknown");
+assert.equal(unknownTime.freshnessWeight, 0.55);
 
 const firstRun = updateTrendHistory(
   [

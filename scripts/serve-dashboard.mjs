@@ -9,6 +9,15 @@ import {
   parseNewsNowPayload,
   parseRssXml
 } from "./message-aggregator.mjs";
+import {
+  applyLatestReviewCandidate,
+  createPostTradeReviewState,
+  DEFAULT_DIRECTION_MODEL_WEIGHTS,
+  maybeRunPostTradeReview,
+  normalizePostTradeReviewConfig,
+  normalizePostTradeReviewState,
+  rollbackPostTradeReviewWeights
+} from "./post-trade-review.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -449,6 +458,8 @@ function createPaperAccount(config, now = new Date().toISOString()) {
     availableEquity: normalized.initialCapital,
     positions: {},
     tradeHistory: [],
+    postTradeReviewConfig: normalizePostTradeReviewConfig(),
+    postTradeReview: createPostTradeReviewState(DEFAULT_DIRECTION_MODEL_WEIGHTS, null),
     equityCurve: [
       { time: now, equity: normalized.initialCapital, returnPct: 0, realizedPnl: 0, unrealizedPnl: 0 }
     ],
@@ -477,6 +488,7 @@ function createPaperAccount(config, now = new Date().toISOString()) {
         "净权益=本金+已实现现金流(含手续费与资金费)+按不利滑点和平仓手续费估算的未实现盈亏；收益率=净权益/本金-1。"
     }
   };
+  account.postTradeReview.sessionId = account.sessionId;
   return account;
 }
 
@@ -506,6 +518,12 @@ function readAccountBundle() {
         position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
     }
     account.tradeHistory = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+    account.postTradeReviewConfig = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
+    account.postTradeReview = normalizePostTradeReviewState(
+      account.postTradeReview,
+      DEFAULT_DIRECTION_MODEL_WEIGHTS,
+      account.sessionId
+    );
     for (const position of account.tradeHistory) {
       position.riskProfile =
         position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
@@ -594,8 +612,6 @@ async function withAccountLock(callback) {
 }
 
 function reportPath(layer) {
-  if (layer === "fast") return path.join(RUNTIME_DIR, "latest-fast-report.json");
-  if (layer === "slow") return path.join(RUNTIME_DIR, "latest-slow-report.json");
   return path.join(RUNTIME_DIR, "latest-report.json");
 }
 
@@ -792,6 +808,69 @@ const server = http.createServer(async (request, response) => {
     sendJson(response, readAccountBundle());
     return;
   }
+  if (url.pathname === "/api/post-trade-review" && request.method === "GET") {
+    const { account } = readAccountBundle();
+    sendJson(response, {
+      config: account.postTradeReviewConfig,
+      review: account.postTradeReview,
+      closedTrades: Array.isArray(account.tradeHistory) ? account.tradeHistory.length : 0
+    });
+    return;
+  }
+  if (url.pathname === "/api/post-trade-review/config" && request.method === "POST") {
+    try {
+      const body = await readRequestJson(request);
+      const result = await withAccountLock(() => {
+        const { config, account } = readAccountBundle();
+        account.postTradeReviewConfig = normalizePostTradeReviewConfig({
+          ...account.postTradeReviewConfig,
+          ...body
+        });
+        const reviewResult = maybeRunPostTradeReview(account, DEFAULT_DIRECTION_MODEL_WEIGHTS);
+        account.updatedAt = new Date().toISOString();
+        writeJson(ACCOUNT_STATE_PATH, account);
+        return {
+          config,
+          account,
+          triggeredReview: reviewResult.review
+        };
+      });
+      sendJson(response, result);
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+    return;
+  }
+  if (url.pathname === "/api/post-trade-review/apply" && request.method === "POST") {
+    try {
+      const result = await withAccountLock(() => {
+        const { config, account } = readAccountBundle();
+        applyLatestReviewCandidate(account, DEFAULT_DIRECTION_MODEL_WEIGHTS);
+        account.updatedAt = new Date().toISOString();
+        writeJson(ACCOUNT_STATE_PATH, account);
+        return { config, account };
+      });
+      sendJson(response, result);
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+    return;
+  }
+  if (url.pathname === "/api/post-trade-review/rollback" && request.method === "POST") {
+    try {
+      const result = await withAccountLock(() => {
+        const { config, account } = readAccountBundle();
+        rollbackPostTradeReviewWeights(account, DEFAULT_DIRECTION_MODEL_WEIGHTS);
+        account.updatedAt = new Date().toISOString();
+        writeJson(ACCOUNT_STATE_PATH, account);
+        return { config, account };
+      });
+      sendJson(response, result);
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+    return;
+  }
   if (url.pathname === "/api/account" && request.method === "POST") {
     try {
       const body = await readRequestJson(request);
@@ -883,17 +962,13 @@ const server = http.createServer(async (request, response) => {
   }
   if (url.pathname === "/api/status") {
     const fastPidPath = path.join(RUNTIME_DIR, "fast-loop.pid");
-    const slowPidPath = path.join(RUNTIME_DIR, "slow-loop.pid");
     const fastPid = Number(fs.existsSync(fastPidPath) ? fs.readFileSync(fastPidPath, "utf8").trim() : 0);
-    const slowPid = Number(fs.existsSync(slowPidPath) ? fs.readFileSync(slowPidPath, "utf8").trim() : 0);
     sendJson(response, {
       generatedAt: new Date().toISOString(),
-      fastLoopPid: fastPid || null,
-      fastLoopRunning: isProcessRunning(fastPid),
-      fastLoopIntervalSeconds: 60,
-      slowLoopPid: slowPid || null,
-      slowLoopRunning: isProcessRunning(slowPid),
-      slowLoopIntervalSeconds: 300,
+      loopMode: "unified-high-frequency",
+      loopPid: fastPid || null,
+      loopRunning: isProcessRunning(fastPid),
+      loopIntervalSeconds: 60,
       runtimeDir: RUNTIME_DIR
     });
     return;

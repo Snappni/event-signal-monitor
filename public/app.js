@@ -11,7 +11,8 @@ const state = {
   translationRequestKey: "",
   messageAggregator: null,
   messageAggregatorEditing: false,
-  messageAggregatorSubmitting: false
+  messageAggregatorSubmitting: false,
+  postTradeReviewSubmitting: false
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -149,6 +150,29 @@ function fmtPrice(value) {
   return value.toPrecision(6);
 }
 
+function fmtTimestamp(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(date);
+}
+
+function fmtAgeMinutes(value) {
+  if (!Number.isFinite(value)) return "时间未知";
+  if (value < 1) return "不足 1 分钟";
+  if (value < 60) return `${Math.floor(value)} 分钟`;
+  if (value < 1_440) return `${Math.floor(value / 60)} 小时 ${Math.floor(value % 60)} 分钟`;
+  return `${Math.floor(value / 1_440)} 天 ${Math.floor((value % 1_440) / 60)} 小时`;
+}
+
 function safeNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -231,59 +255,14 @@ async function postJson(url, body = {}) {
   return data;
 }
 
-function mergeLayerReports(fastReport, slowReport) {
-  const fast = fastReport && typeof fastReport === "object" ? fastReport : {};
-  const slow = slowReport && typeof slowReport === "object" ? slowReport : {};
-  const messageMap = new Map();
-  for (const item of [...asArray(fast.messageFeed), ...asArray(slow.messageFeed)]) {
-    const key = item.storyId || item.url || `${item.source || ""}:${item.title || ""}`;
-    if (!messageMap.has(key)) messageMap.set(key, item);
-  }
-  const messageFeed = [...messageMap.values()]
-    .sort((left, right) => Number(right.impactScore || 0) - Number(left.impactScore || 0))
-    .slice(0, 80);
-  const fastCounts = fast.sourceCounts || {};
-  const slowCounts = slow.sourceCounts || {};
-  return {
-    ...slow,
-    ...fast,
-    layer: "auto",
-    layerReports: {
-      fastGeneratedAt: fast.generatedAt || null,
-      slowGeneratedAt: slow.generatedAt || null
-    },
-    messageFeed,
-    warnings: [...new Set([...asArray(fast.warnings), ...asArray(slow.warnings)])],
-    sourceCounts: {
-      aggregated: slowCounts.aggregated || 0,
-      rss: slowCounts.rss || 0,
-      trend: slowCounts.trend || 0,
-      gdelt: slowCounts.gdelt || 0,
-      polymarket: fastCounts.polymarket || 0,
-      binanceAnnouncements: fastCounts.binanceAnnouncements || 0,
-      okxAnnouncements: fastCounts.okxAnnouncements || 0,
-      whale: fastCounts.whale || 0,
-      rawEvents: Number(fastCounts.rawEvents || 0) + Number(slowCounts.rawEvents || 0),
-      uniqueStories: messageFeed.length,
-      suppressedDuplicates:
-        Number(fastCounts.suppressedDuplicates || 0) + Number(slowCounts.suppressedDuplicates || 0),
-      classifiedEvents:
-        Number(fastCounts.classifiedEvents || 0) + Number(slowCounts.classifiedEvents || 0),
-      marketAnalyses: fastCounts.marketAnalyses || slowCounts.marketAnalyses || 0
-    }
-  };
-}
-
 async function loadData() {
-  const [fastReport, slowReport, status, log, account, messageAggregator] = await Promise.all([
-    getJson("/api/report?layer=fast"),
-    getJson("/api/report?layer=slow"),
+  const [report, status, log, account, messageAggregator] = await Promise.all([
+    getJson("/api/report"),
     getJson("/api/status"),
     getJson("/api/log?bytes=80000"),
     getJson("/api/account"),
     getJson("/api/message-aggregator/status")
   ]);
-  const report = mergeLayerReports(fastReport, slowReport);
   state.report = report;
   state.status = status;
   state.log = log.text || "";
@@ -335,14 +314,15 @@ function renderSummary() {
   const messages = asArray(report.messageFeed);
   const models = asArray(report.modelCalculations);
   $("#subtitle").textContent = `${report.mode || "paper-alert-only"} | ${report.generatedAt || "-"}`;
-  $("#layerValue").textContent = "自动";
+  $("#layerValue").textContent = "统一高频";
   $("#actionableValue").textContent = actionable.length;
   $("#watchValue").textContent = watchlist.length;
   $("#messageValue").textContent = messages.length;
   $("#modelValue").textContent = models.length;
-  const fastStatus = state.status?.fastLoopRunning ? `\u9ad8\u9891 1m ${text.running}` : `\u9ad8\u9891 ${text.stopped}`;
-  const slowStatus = state.status?.slowLoopRunning ? `\u4f4e\u9891 5m ${text.running}` : `\u4f4e\u9891 ${text.stopped}`;
-  $("#loopValue").textContent = `${fastStatus} | ${slowStatus}`;
+  const loopStatus = state.status?.loopRunning
+    ? `统一高频 1m ${text.running}`
+    : `统一高频 ${text.stopped}`;
+  $("#loopValue").textContent = loopStatus;
   $("#reportTime").textContent = report.generatedAt || "-";
   $("#sourceCounts").textContent = `内置 RSS ${sourceCounts.rss || 0} | 热榜 ${sourceCounts.trend || 0} | GDELT ${sourceCounts.gdelt || 0} | Polymarket ${sourceCounts.polymarket || 0} | 交易所公告 ${(sourceCounts.binanceAnnouncements || 0) + (sourceCounts.okxAnnouncements || 0)} | 合并重复 ${sourceCounts.suppressedDuplicates || 0} | 市场计算 ${sourceCounts.marketAnalyses || 0}`;
   $("#warningCount").textContent = asArray(report.warnings).length;
@@ -365,6 +345,9 @@ function signalRow(signal, label, badgeType) {
     accountControl.appliedLeverage > 0
       ? `${fmtNumber(accountControl.appliedLeverage, 2)}x / ${fmtNumber(accountControl.maxLeverage, 0)}x`
       : accountControl.blockReason || "-";
+  const adaptiveGateText = Number.isFinite(Number(signal.adaptiveWinRateThreshold))
+    ? `${fmtPct(signal.adaptiveWinRateThreshold, 1)} / 保本 ${fmtPct(signal.breakEvenWinRate, 1)}`
+    : "旧信号未记录";
   return `
     <div class="signal-grid">
       <div class="signal-cell"><span>${text.status}</span><strong>${badge(`${label} / ${mode}`, badgeType)}</strong></div>
@@ -373,6 +356,7 @@ function signalRow(signal, label, badgeType) {
       <div class="signal-cell"><span>${text.takeProfit}</span><strong>${fmtPrice(signal.takeProfit)}</strong></div>
       <div class="signal-cell"><span>${text.stopLoss}</span><strong>${fmtPrice(signal.stopLoss)}</strong></div>
       <div class="signal-cell"><span>${text.winRate}</span><strong>${fmtPct(signal.winRate, 1)}</strong></div>
+      <div class="signal-cell"><span>自适应胜率门槛 / 保本</span><strong>${escapeHtml(adaptiveGateText)}</strong></div>
       <div class="signal-cell"><span>EV / EV-R</span><strong>${fmtPct(signal.expectancyPct, 2)} / ${fmtNumber(signal.expectancyR, 2)}</strong></div>
       <div class="signal-cell"><span>${text.leverage}</span><strong>${escapeHtml(leverageText)}${accountControl.leverageCapped ? " cap" : ""}</strong></div>
       <div class="signal-cell"><span>${text.notional}</span><strong>${fmtMoney(accountControl.notional, accountControl.quoteCurrency || "USDT")}</strong></div>
@@ -423,7 +407,7 @@ function renderAccount() {
     metricCell(text.riskProfile, riskProfile === "aggressive" ? text.aggressive : text.conservative),
     metricCell(
       text.entryGate,
-      riskProfile === "aggressive" ? "\u9ad8\u671f\u671b 50% / \u4e00\u822c 60% + EV>0" : "\u9ad8\u671f\u671b 50% / \u4e00\u822c 70% + EV>0"
+      "自适应：成本保本胜率 + 校准/波动/行情状态裕量"
     ),
     metricCell(
       text.leverageRule,
@@ -451,7 +435,173 @@ function renderAccount() {
   ].join("");
 
   renderAccountPositions(account, currency);
+  renderPostTradeReview(account, currency);
   renderAccountSummary(account.summary, currency, account);
+}
+
+const reviewFactorLabels = {
+  eventImpact: "事件影响",
+  trend: "15分钟趋势",
+  higherTimeframeTrend: "1小时趋势",
+  momentum: "动量",
+  rsi: "RSI反转",
+  funding: "资金费率",
+  openInterest: "未平仓量",
+  geometricBrownianMotion: "GBM方向",
+  hiddenMarkovModel: "HMM状态",
+  volatilityRegime: "波动状态",
+  liquidity: "流动性",
+  gbm: "GBM质量",
+  garch: "GARCH稳定性",
+  hiddenMarkov: "HMM置信度",
+  markowitz: "Markowitz仓位",
+  poisson: "事件到达强度",
+  bayesian: "贝叶斯校准"
+};
+
+function renderPostTradeReview(account, currency) {
+  const config = account.postTradeReviewConfig || {};
+  const reviewState = account.postTradeReview || {};
+  const latest = reviewState.latestReview || null;
+  const closedTrades = asArray(account.tradeHistory).length;
+  const reviewedTrades = Number(reviewState.reviewedTradeCount || 0);
+  const newTrades = Math.max(0, closedTrades - reviewedTrades);
+  const interval = Number(config.reviewEveryTrades || 20);
+  const remaining = Math.max(0, interval - newTrades);
+  const everyInput = $("#reviewEveryTrades");
+  const autoInput = $("#reviewAutoApply");
+  if (everyInput) setInputValueIfUnfocused(everyInput, interval);
+  if (autoInput && document.activeElement !== autoInput) autoInput.checked = config.autoApplyValidatedWeights === true;
+
+  const status = $("#postTradeReviewStatus");
+  if (status) {
+    status.className = "review-status";
+    if (config.enabled === false) {
+      status.textContent = "复盘已停用";
+    } else if (latest?.status === "promoted") {
+      status.textContent = `权重版本 v${reviewState.weightVersion || 1} 已晋升`;
+      status.classList.add("ready");
+    } else if (latest?.promotionEligible) {
+      status.textContent = "候选权重已通过验证";
+      status.classList.add("ready");
+    } else if (latest) {
+      status.textContent = latest.status === "insufficient_data" ? "样本不足，仅生成诊断" : "候选权重影子观察中";
+      status.classList.add("warn");
+    } else {
+      status.textContent = remaining ? `再完成 ${remaining} 笔触发复盘` : "等待下一轮监控触发";
+    }
+  }
+
+  const applyButton = $("#applyReviewCandidateButton");
+  const rollbackButton = $("#rollbackReviewWeightsButton");
+  if (applyButton) applyButton.disabled = state.postTradeReviewSubmitting || !latest?.promotionEligible || latest?.applied;
+  if (rollbackButton) rollbackButton.disabled = state.postTradeReviewSubmitting || !reviewState.previousDirectionWeights;
+
+  const target = $("#postTradeReview");
+  if (!target) return;
+  if (!latest) {
+    target.innerHTML = `
+      <div class="empty">当前已平仓 ${closedTrades} 笔；从上次复盘后新增 ${newTrades} 笔。达到 ${interval} 笔后自动生成第一份链路复盘。</div>
+      <p class="review-note">只有新开仓时已经保存因子快照的交易才能用于归因。历史旧交易不会被伪造补全。</p>
+    `;
+    return;
+  }
+
+  const validation = latest.validation || null;
+  const factorRows = asArray(latest.factorStatistics)
+    .map((item) => {
+      const delta = Number(item.normalizedChangePct || 0);
+      const deltaClass = delta > 0 ? "up" : delta < 0 ? "down" : "";
+      return `
+        <div class="review-factor-row">
+          <div class="review-factor-name"><strong>${escapeHtml(reviewFactorLabels[item.factor] || item.factor)}</strong><span>${fmtNumber(item.activeSamples || 0, 0)}/${fmtNumber(item.samples || 0, 0)} 笔有效</span></div>
+          <div><span class="row-meta">当前权重</span>${fmtPct(item.currentWeight || 0, 2)}</div>
+          <div><span class="row-meta">候选权重</span>${item.candidateWeight == null ? "-" : fmtPct(item.candidateWeight, 2)}</div>
+          <div class="review-factor-delta ${deltaClass}"><span class="row-meta">建议变化</span>${item.candidateWeight == null ? "-" : fmtPct(delta, 2)}</div>
+          <div><span class="row-meta">方向关联</span>${fmtNumber(item.directionAssociation || 0, 3)}</div>
+        </div>
+      `;
+    })
+    .join("");
+  const tradeRows = asArray(latest.trades)
+    .slice(-10)
+    .reverse()
+    .map((trade) => {
+      const contributionText = asArray(trade.factorContributions)
+        .slice(0, 3)
+        .map((item) => `${reviewFactorLabels[item.factor] || item.factor} ${fmtNumber(item.contribution, 3)}`)
+        .join(" · ");
+      const allContributions = asArray(trade.factorContributions)
+        .map((item) => `${reviewFactorLabels[item.factor] || item.factor}: 信号 ${fmtNumber(item.signal, 3)} × 权重 ${fmtPct(item.weight, 1)} = ${fmtNumber(item.contribution, 3)}`)
+        .join("<br>");
+      const relatedEvents = asArray(trade.relatedEvents)
+        .map((event) => event.title || event.text || "")
+        .filter(Boolean)
+        .join(" | ");
+      const classificationLabels = {
+        profitable: "盈利",
+        cost_drag: "交易成本侵蚀",
+        stop_loss: "止损退出",
+        direction_or_timing_error: "方向或时机错误"
+      };
+      return `
+        <div class="review-trade-row">
+          <div><strong>${escapeHtml(trade.symbol || "-")} ${escapeHtml(String(trade.side || "").toUpperCase())}</strong><div class="row-meta">${escapeHtml(trade.openedAt || "-")} → ${escapeHtml(trade.closedAt || "-")}</div></div>
+          <div><strong>${fmtMoney(trade.realizedPnl || 0, currency)} / ${fmtNumber(trade.netR || 0, 2)}R</strong><div class="row-meta">${escapeHtml(classificationLabels[trade.classification] || trade.classification || "-")}</div></div>
+          <div>
+            <div>${escapeHtml(contributionText || "无可用贡献数据")}</div>
+            <div class="row-meta">状态 ${escapeHtml(trade.regime || "unknown")} · 模型 ${escapeHtml(trade.modelVersion || "-")}</div>
+            <details class="review-trade-details">
+              <summary>查看完整交易链路</summary>
+              <div>入场 ${fmtPrice(trade.entry)} · 出场 ${fmtPrice(trade.exitPrice)} · TP ${fmtPrice(trade.takeProfit)} · SL ${fmtPrice(trade.stopLoss)}</div>
+              <div>预测胜率 ${fmtPct(trade.decision?.predictedWinRate || 0, 1)} · 自适应门槛 ${fmtPct(trade.decision?.adaptiveWinRateThreshold || 0, 1)} · 保本胜率 ${fmtPct(trade.decision?.breakEvenWinRate || 0, 1)}</div>
+              <div>预测EV ${fmtPct(trade.decision?.predictedExpectancyPct || 0, 2)} · 事件影响 ${fmtNumber(trade.decision?.eventImpactScore || 0, 0)}</div>
+              <div>事件方向 ${fmtNumber(trade.decision?.eventDirection || 0, 3)} × ${fmtPct(trade.decision?.eventWeight || 0, 1)}；数学方向 ${fmtNumber(trade.decision?.mathDirection || 0, 3)} × ${fmtPct(trade.decision?.mathWeight || 0, 1)}</div>
+              <div>MFE ${fmtPct(trade.maxFavorableExcursionPct || 0, 2)} · MAE ${fmtPct(trade.maxAdverseExcursionPct || 0, 2)} · 持仓采样 ${fmtNumber(trade.holdingObservationCount || 0, 0)} 次</div>
+              <div class="review-detail-factors">${allContributions || "无因子贡献数据"}</div>
+              ${relatedEvents ? `<div>关联事件：${escapeHtml(relatedEvents)}</div>` : ""}
+            </details>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+  const qualityRows = asArray(latest.qualityFactorStatistics)
+    .map((item) => `
+      <div class="review-factor-row">
+        <div class="review-factor-name"><strong>${escapeHtml(reviewFactorLabels[item.factor] || item.factor)}</strong><span>${fmtNumber(item.samples || 0, 0)} 笔</span></div>
+        <div><span class="row-meta">平均强度</span>${fmtNumber(item.meanStrength || 0, 3)}</div>
+        <div><span class="row-meta">盈利交易</span>${fmtNumber(item.meanStrengthOnWins || 0, 3)}</div>
+        <div><span class="row-meta">亏损交易</span>${fmtNumber(item.meanStrengthOnLosses || 0, 3)}</div>
+        <div><span class="row-meta">净R相关</span>${fmtNumber(item.netRCorrelation || 0, 3)}</div>
+      </div>
+    `)
+    .join("");
+
+  target.innerHTML = `
+    <div class="review-overview">
+      <div class="review-card"><span>累计已平仓</span><strong>${fmtNumber(latest.totalClosedTrades || 0, 0)}</strong></div>
+      <div class="review-card"><span>可归因样本</span><strong>${fmtNumber(latest.eligibleTrades || 0, 0)}</strong></div>
+      <div class="review-card"><span>排除旧数据</span><strong>${fmtNumber(latest.excludedTrades || 0, 0)}</strong></div>
+      <div class="review-card"><span>当前权重版本</span><strong>v${fmtNumber(reviewState.weightVersion || 1, 0)}</strong></div>
+    </div>
+    ${validation ? `
+      <div class="review-subtitle">按时间顺序的训练 / 验证结果</div>
+      <div class="review-validation">
+        <div class="review-card"><span>训练样本</span><strong>${fmtNumber(validation.trainingSamples || 0, 0)}</strong></div>
+        <div class="review-card"><span>验证样本</span><strong>${fmtNumber(validation.validationSamples || 0, 0)}</strong></div>
+        <div class="review-card"><span>原权重准确率</span><strong>${fmtPct(validation.champion?.accuracy || 0, 1)}</strong></div>
+        <div class="review-card"><span>候选权重准确率</span><strong>${fmtPct(validation.challenger?.accuracy || 0, 1)}</strong></div>
+      </div>
+    ` : `<p class="review-note">目前只有 ${fmtNumber(latest.eligibleTrades || 0, 0)} 笔可归因交易；至少需要 ${fmtNumber(config.minimumProposalTrades || 20, 0)} 笔才生成候选权重。</p>`}
+    <div class="review-subtitle">因子归因与候选权重</div>
+    <div>${factorRows || `<div class="empty">暂无因子统计</div>`}</div>
+    <div class="review-subtitle">事件、风险与仓位因子诊断（只诊断，不混入方向权重）</div>
+    <div>${qualityRows || `<div class="empty">暂无质量因子统计</div>`}</div>
+    <div class="review-subtitle">最近交易完整链路摘要</div>
+    <div>${tradeRows || `<div class="empty">暂无具备开仓快照的交易</div>`}</div>
+    <p class="review-note">这里衡量的是因子与结果的预测关联，不是因果证明。候选权重每轮变化受限，并且必须先在后段时间样本上胜过当前权重；无证据表明权重变化一定提高未来盈利。</p>
+  `;
 }
 
 function renderAccountPositions(account, currency) {
@@ -1090,7 +1240,7 @@ function renderMessageAggregatorConnection() {
     status.textContent = connection.error;
   } else {
     status.className = "message-aggregator-status";
-    status.textContent = connection.configured ? "已保存，等待低频监控轮次采集" : "等待内置来源首次验证";
+    status.textContent = connection.configured ? "已保存，等待下一次统一高频轮次采集" : "等待内置来源首次验证";
   }
 }
 
@@ -1105,10 +1255,56 @@ function messageRow(item) {
     ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(translatedTitle)}</a>`
     : escapeHtml(translatedTitle);
   const metrics = item.metrics || {};
+  const freshness = item.freshness || {};
+  const freshnessLabels = {
+    live: "实时",
+    fresh: "最新",
+    recent: "近期",
+    today: "当日",
+    aging: "较旧",
+    stale: "过时",
+    unknown: "时间未知"
+  };
+  const freshnessLevel = Object.hasOwn(freshnessLabels, freshness.level) ? freshness.level : "unknown";
+  const freshnessLabel = freshnessLabels[freshnessLevel];
+  const freshnessBadgeType = ["live", "fresh"].includes(freshnessLevel)
+    ? "ok"
+    : freshnessLevel === "stale"
+      ? "danger"
+      : ["aging", "unknown"].includes(freshnessLevel)
+        ? "warn"
+        : "";
+  const effectiveTimestamp = freshness.effectiveAt || item.occurredAt || item.receivedAt;
+  const liveAgeMinutes = effectiveTimestamp
+    ? Math.max(0, (Date.now() - new Date(effectiveTimestamp).getTime()) / 60_000)
+    : Number(freshness.ageMinutes);
+  const timestampMeta = [
+    item.occurredAt ? `事件时间 ${fmtTimestamp(item.occurredAt)}` : "",
+    item.receivedAt ? `采集时间 ${fmtTimestamp(item.receivedAt)}` : ""
+  ]
+    .filter(Boolean)
+    .join(" | ");
+  const freshnessImpact = Number.isFinite(item.rawImpactScore) && Math.abs(item.rawImpactScore - item.impactScore) >= 1
+    ? ` | 影响分 ${fmtNumber(item.rawImpactScore, 0)}→${fmtNumber(item.impactScore, 0)}`
+    : "";
+  const freshnessMeta = `时效分析 ${freshnessLabel} · 已过去 ${fmtAgeMinutes(liveAgeMinutes)} · 时效权重 ${fmtPct(freshness.freshnessWeight, 0)}${freshnessImpact}`;
   const predictionMeta =
     Number.isFinite(metrics.bullProbability) && Number.isFinite(metrics.bearProbability)
       ? `多方隐含概率 ${fmtPct(metrics.bullProbability, 1)} / 空方隐含概率 ${fmtPct(metrics.bearProbability, 1)} | 多空比 ${fmtNumber(metrics.bullBearRatio, 2)} | 较上轮 ${metrics.bullProbabilityDelta >= 0 ? "+" : ""}${fmtPct(metrics.bullProbabilityDelta, 1)}`
-      : "";
+      : Array.isArray(metrics.outcomeProbabilities) && metrics.outcomeProbabilities.length === 2
+        ? `${metrics.outcomeLabels?.[0] || "结果 A"}隐含概率 ${fmtPct(metrics.outcomeProbabilities[0], 1)} / ${metrics.outcomeLabels?.[1] || "结果 B"}隐含概率 ${fmtPct(metrics.outcomeProbabilities[1], 1)} | 盘口概率比 ${fmtNumber(metrics.outcomeRatio, 2)}`
+        : "";
+  const monitoringMeta = item.source === "Polymarket"
+    ? [
+        item.monitoringStatus === "closed" ? "预测已关闭，停止跟踪" : "持续监控中",
+        item.monitoringObservations ? `第 ${item.monitoringObservations} 次观测` : "",
+        item.monitoringStartedAt ? `始于 ${fmtTimestamp(item.monitoringStartedAt)}` : "",
+        item.marketEndDate ? `预计结束 ${fmtTimestamp(item.marketEndDate)}` : ""
+      ].filter(Boolean).join(" · ")
+    : "";
+  const marketDepthMeta = item.source === "Polymarket"
+    ? `累计成交量 ${fmtNumber(item.volume, 2)}${item.volumeDelta ? `（本轮 ${item.volumeDelta > 0 ? "+" : ""}${fmtNumber(item.volumeDelta, 2)}）` : ""} | 流动性 ${fmtNumber(item.liquidity, 2)}${item.liquidityDelta ? `（本轮 ${item.liquidityDelta > 0 ? "+" : ""}${fmtNumber(item.liquidityDelta, 2)}）` : ""}`
+    : "";
   const storyMeta = [
     item.sourceTier ? `来源等级 T${item.sourceTier}` : "",
     item.corroborationCount > 1 ? `${item.corroborationCount} 个来源交叉佐证` : "",
@@ -1125,11 +1321,16 @@ function messageRow(item) {
       </div>
       <div>
         <div>${title}</div>
+        ${timestampMeta ? `<div class="row-meta message-time">${escapeHtml(timestampMeta)}</div>` : ""}
+        <div class="row-meta message-freshness freshness-${freshnessLevel}">${escapeHtml(freshnessMeta)}</div>
         ${predictionMeta ? `<div class="row-meta">${escapeHtml(predictionMeta)}</div>` : ""}
+        ${monitoringMeta ? `<div class="row-meta prediction-monitoring">${escapeHtml(monitoringMeta)}</div>` : ""}
+        ${marketDepthMeta ? `<div class="row-meta">${escapeHtml(marketDepthMeta)}</div>` : ""}
+        ${predictionMeta ? `<div class="row-meta prediction-disclaimer">盘口价格表示隐含概率，不等于双方实际下注金额占比。</div>` : ""}
         ${storyMeta ? `<div class="row-meta">${escapeHtml(storyMeta)}</div>` : ""}
         ${translatedDetail ? `<div class="row-meta">${escapeHtml(translatedDetail)}</div>` : ""}
       </div>
-      <div>${dir}</div>
+      <div class="message-badges">${badge(`时效 ${freshnessLabel}`, freshnessBadgeType)}${dir}</div>
     </div>
   `;
 }
@@ -1216,6 +1417,7 @@ function modelRow(item) {
   const markowitz = advanced.markowitz || signal.markowitz || {};
   const poisson = advanced.poisson || signal.calculation?.poisson || {};
   const bayesian = advanced.bayesian || signal.calculation?.bayesian || {};
+  const gate = item.candidateCalculation?.gate || {};
   const mode = item.candidateMode === "math_only" ? "\u7eaf\u6570\u5b66\u6a21\u578b" : item.candidateMode || item.analysisMode || "-";
   return `
     <div class="model-item">
@@ -1231,6 +1433,7 @@ function modelRow(item) {
         ${calcCell(text.eventImpact, fmtNumber(item.eventImpactScore, 0))}
         ${calcCell("HMM 多/空概率", `${fmtPct(hiddenMarkov.bullProbability, 1)} / ${fmtPct(hiddenMarkov.bearProbability, 1)}`)}
         ${calcCell(text.winRate, fmtPct(signal.winRate, 1))}
+        ${calcCell("自适应门槛", fmtPct(gate.adaptiveWinRateThreshold, 1))}
         ${calcCell("EV", fmtPct(signal.expectancyPct, 2))}
         ${calcCell(text.modelLeverage, accountControl.modelSuggestedLeverage ? `${fmtNumber(accountControl.modelSuggestedLeverage, 2)}x` : "-")}
       </div>
@@ -1254,6 +1457,8 @@ function modelRow(item) {
           ${calcCell("Poisson尾部概率", fmtPct(poisson.tailProbability, 1))}
           ${calcCell("Bayes后验胜率", fmtPct(bayesian.posteriorWinRate, 1))}
           ${calcCell("Bayes调整", fmtPct(bayesian.adjustment, 2))}
+          ${calcCell("成本保本胜率", fmtPct(gate.breakEvenWinRate, 1))}
+          ${calcCell("门槛不确定性裕量", fmtPct(gate.uncertaintyMargin, 1))}
           ${calcCell("Markowitz权重", fmtPct(markowitz.weight, 1))}
           ${calcCell(text.leverage, accountControl.appliedLeverage ? `${fmtNumber(accountControl.appliedLeverage, 2)}x` : "-")}
         </div>
@@ -1357,6 +1562,53 @@ function bindEvents() {
       $("#accountSummary").insertAdjacentHTML("afterbegin", `<div class="notice">${text.saved}</div>`);
     } catch (error) {
       showError(error);
+    }
+  });
+  $("#postTradeReviewForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.postTradeReviewSubmitting) return;
+    state.postTradeReviewSubmitting = true;
+    renderAccount();
+    try {
+      state.account = await postJson("/api/post-trade-review/config", {
+        enabled: true,
+        reviewEveryTrades: Number($("#reviewEveryTrades").value),
+        autoApplyValidatedWeights: $("#reviewAutoApply").checked
+      });
+      render();
+    } catch (error) {
+      showError(error);
+    } finally {
+      state.postTradeReviewSubmitting = false;
+      renderAccount();
+    }
+  });
+  $("#applyReviewCandidateButton").addEventListener("click", async () => {
+    if (state.postTradeReviewSubmitting) return;
+    state.postTradeReviewSubmitting = true;
+    renderAccount();
+    try {
+      state.account = await postJson("/api/post-trade-review/apply");
+      render();
+    } catch (error) {
+      showError(error);
+    } finally {
+      state.postTradeReviewSubmitting = false;
+      renderAccount();
+    }
+  });
+  $("#rollbackReviewWeightsButton").addEventListener("click", async () => {
+    if (state.postTradeReviewSubmitting) return;
+    state.postTradeReviewSubmitting = true;
+    renderAccount();
+    try {
+      state.account = await postJson("/api/post-trade-review/rollback");
+      render();
+    } catch (error) {
+      showError(error);
+    } finally {
+      state.postTradeReviewSubmitting = false;
+      renderAccount();
     }
   });
   $("#resetAccountButton").addEventListener("click", async () => {

@@ -99,6 +99,31 @@
           </div>
         </div>
         <div id="accountPositions" class="position-list"></div>
+        <section class="post-trade-review-workbench">
+          <div class="review-heading">
+            <div>
+              <strong>交易后复盘与模型迭代</strong>
+              <span>按已平仓交易批量追踪完整链路，候选权重必须先通过按时间切分的影子验证</span>
+            </div>
+            <span id="postTradeReviewStatus" class="review-status">等待交易样本</span>
+          </div>
+          <form id="postTradeReviewForm" class="review-config-form">
+            <label>
+              <span>每完成多少笔交易复盘</span>
+              <input id="reviewEveryTrades" type="number" min="5" max="500" step="1" value="20" />
+            </label>
+            <label class="review-checkbox">
+              <input id="reviewAutoApply" type="checkbox" />
+              <span>验证通过后自动应用候选权重（仅模拟账户）</span>
+            </label>
+            <div class="review-actions">
+              <button id="saveReviewConfigButton" type="submit">保存复盘设置</button>
+              <button id="applyReviewCandidateButton" type="button">应用已验证候选</button>
+              <button id="rollbackReviewWeightsButton" type="button">回滚上一版权重</button>
+            </div>
+          </form>
+          <div id="postTradeReview" class="post-trade-review"></div>
+        </section>
         <div id="accountSummary" class="account-summary"></div>
       </section>
 
@@ -118,8 +143,15 @@
           </div>
           <form id="messageAggregatorForm" class="message-aggregator-form" autocomplete="off">
             <div class="message-aggregator-field wide-field">
-              <label for="messageFilterKeywords">保留关键词（逗号分隔，留空使用内置市场词表）</label>
-              <input id="messageFilterKeywords" name="filterKeywords" type="text" spellcheck="false" placeholder="比特币,加密货币,美联储,bitcoin,crypto,fed" />
+              <label for="messageFilterKeywords">保留关键词（逗号或换行分隔，留空使用内置市场词表）</label>
+              <textarea
+                id="messageFilterKeywords"
+                name="filterKeywords"
+                rows="5"
+                wrap="soft"
+                spellcheck="false"
+                placeholder="比特币,加密货币,美联储&#10;bitcoin,crypto,fed"
+              ></textarea>
               <span class="built-in-source-note">RSS 与国内外热榜来源已内置固定，保存时会重新验证全部来源。</span>
             </div>
             <label class="message-aggregator-toggle"><input id="messageAggregatorEnabled" type="checkbox" checked /> 启用聚合采集</label>

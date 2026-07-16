@@ -17,15 +17,15 @@ function Write-LoopLog {
   Add-Content -LiteralPath $LogPath -Value $Message -Encoding UTF8
 }
 
-Write-LoopLog "[$(Get-Date -Format o)] fast loop started pid=$PID intervalSeconds=$IntervalSeconds"
+Write-LoopLog "[$(Get-Date -Format o)] unified high-frequency loop started pid=$PID intervalSeconds=$IntervalSeconds"
 
 while ($true) {
   $RunStartedAt = Get-Date
-  Write-LoopLog "[$(Get-Date -Format o)] signal:fast run started"
+  Write-LoopLog "[$(Get-Date -Format o)] signal:monitor run started"
   try {
-    npm run signal:fast 2>&1 | ForEach-Object { Write-LoopLog ([string]$_) }
+    npm run signal:monitor 2>&1 | ForEach-Object { Write-LoopLog ([string]$_) }
   } catch {
-    Write-LoopLog "[$(Get-Date -Format o)] signal:fast failed: $($_.Exception.Message)"
+    Write-LoopLog "[$(Get-Date -Format o)] signal:monitor failed: $($_.Exception.Message)"
   }
   $ElapsedSeconds = [Math]::Ceiling(((Get-Date) - $RunStartedAt).TotalSeconds)
   $SleepSeconds = [Math]::Max(1, $IntervalSeconds - $ElapsedSeconds)
