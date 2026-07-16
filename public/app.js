@@ -378,6 +378,16 @@ function setInputValueIfUnfocused(element, value) {
   element.value = value ?? "";
 }
 
+function getAccountFormPayload() {
+  const marketType = $("#accountMarketType").value === "spot" ? "spot" : "futures";
+  return {
+    initialCapital: Number($("#accountCapital").value),
+    marketType,
+    maxLeverage: marketType === "spot" ? 1 : Number($("#accountMaxLeverage").value),
+    riskProfile: $("#accountRiskProfile").value === "aggressive" ? "aggressive" : "conservative"
+  };
+}
+
 function metricCell(label, value, className = "") {
   return `<div class="account-metric ${escapeHtml(className)}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
 }
@@ -1550,14 +1560,7 @@ function bindEvents() {
   $("#accountForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     try {
-      const marketType = $("#accountMarketType").value === "spot" ? "spot" : "futures";
-      const payload = {
-        initialCapital: Number($("#accountCapital").value),
-        marketType,
-        maxLeverage: marketType === "spot" ? 1 : Number($("#accountMaxLeverage").value),
-        riskProfile: $("#accountRiskProfile").value === "aggressive" ? "aggressive" : "conservative"
-      };
-      state.account = await postJson("/api/account", payload);
+      state.account = await postJson("/api/account", getAccountFormPayload());
       render();
       $("#accountSummary").insertAdjacentHTML("afterbegin", `<div class="notice">${text.saved}</div>`);
     } catch (error) {
@@ -1624,7 +1627,7 @@ function bindEvents() {
     const button = $("#startAccountButton");
     button.disabled = true;
     try {
-      state.account = await postJson("/api/account/start");
+      state.account = await postJson("/api/account/start", getAccountFormPayload());
       render();
       $("#accountSummary").insertAdjacentHTML("afterbegin", `<div class="notice">${text.started}</div>`);
     } catch (error) {
