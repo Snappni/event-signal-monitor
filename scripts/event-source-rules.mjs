@@ -63,6 +63,78 @@ export function isCryptoPolymarketMarket(market) {
   return /\bBTC\b|\bBITCOIN\b|\bETH\b|\bETHEREUM\b|\bCRYPTO\b|\bCRYPTOCURRENCY\b|\bSOLANA\b|\bSOL\b|\bXRP\b|\bDOGE\b|\bBINANCE\b|\bSTABLECOIN\b|\bTETHER\b|\bUSDT\b|\bUSDC\b/.test(text);
 }
 
+export function extractBinaryMarketProbabilities(market) {
+  const outcomes = asArray(market?.outcomes).map((value) => normalizeText(value));
+  const prices = asArray(market?.outcomePrices).map((value) => finiteNumber(value));
+  if (prices.length !== 2 || prices.some((value) => value === null)) return null;
+  const total = prices[0] + prices[1];
+  if (!(total > 0)) return null;
+  const labels = outcomes.length === 2 && outcomes.every(Boolean) ? outcomes : ["Yes", "No"];
+  const probabilities = prices.map((value) => clamp(value / total, 0, 1));
+  return {
+    labels,
+    probabilities,
+    ratio: probabilities[1] > 0 ? probabilities[0] / probabilities[1] : null
+  };
+}
+
+function updateBucketedHistory(previous, snapshot, bucketMs, limit) {
+  const history = Array.isArray(previous) ? previous.slice(-(limit - 1)) : [];
+  const snapshotBucket = Math.floor(Date.parse(snapshot.observedAt) / bucketMs);
+  const lastBucket = history.length
+    ? Math.floor(Date.parse(history.at(-1).observedAt) / bucketMs)
+    : null;
+  if (lastBucket === snapshotBucket) history[history.length - 1] = snapshot;
+  else history.push(snapshot);
+  return history.slice(-limit);
+}
+
+export function updatePredictionMarketTracking(previous = {}, observation = {}, now = new Date().toISOString()) {
+  const observedAt = new Date(now).toISOString();
+  const snapshot = {
+    observedAt,
+    yesProbability: finiteNumber(observation.yesProbability),
+    noProbability: finiteNumber(observation.noProbability),
+    bullProbability: finiteNumber(observation.bullProbability),
+    bearProbability: finiteNumber(observation.bearProbability),
+    outcomeRatio: finiteNumber(observation.outcomeRatio),
+    bullBearRatio: finiteNumber(observation.bullBearRatio),
+    volume: finiteNumber(observation.volume),
+    liquidity: finiteNumber(observation.liquidity)
+  };
+  const history = Array.isArray(previous.history) ? previous.history.slice(-179) : [];
+  if (!history.length || history.at(-1)?.observedAt !== observedAt) history.push(snapshot);
+  const hourlyHistory = updateBucketedHistory(previous.hourlyHistory, snapshot, 60 * 60 * 1_000, 24 * 7);
+  const dailyHistory = updateBucketedHistory(previous.dailyHistory, snapshot, 24 * 60 * 60 * 1_000, 365 * 5);
+  const closed = observation.closed === true;
+
+  return {
+    id: String(observation.id || previous.id || ""),
+    slug: observation.slug || previous.slug || null,
+    title: observation.title || previous.title || null,
+    status: closed ? "closed" : "tracking",
+    active: observation.active !== false && !closed,
+    closed,
+    endDate: observation.endDate || previous.endDate || null,
+    firstSeenAt: previous.firstSeenAt || observedAt,
+    lastSeenAt: observedAt,
+    closedAt: closed ? previous.closedAt || observedAt : null,
+    observations: Math.max(0, finiteNumber(previous.observations, 0)) + 1,
+    yesPrice: finiteNumber(observation.yesPrice),
+    yesProbability: snapshot.yesProbability,
+    noProbability: snapshot.noProbability,
+    bullProbability: snapshot.bullProbability,
+    bearProbability: snapshot.bearProbability,
+    outcomeRatio: snapshot.outcomeRatio,
+    bullBearRatio: snapshot.bullBearRatio,
+    volume: snapshot.volume,
+    liquidity: snapshot.liquidity,
+    history,
+    hourlyHistory,
+    dailyHistory
+  };
+}
+
 export function buildPolymarketPriceSentiment(market, previous = {}) {
   const title = normalizeText([market?.question, market?.title, market?.slug].filter(Boolean).join(" "));
   const symbol = SYMBOL_RULES.find((rule) => rule.pattern.test(title))?.symbol || null;

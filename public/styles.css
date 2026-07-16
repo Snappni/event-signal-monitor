@@ -277,9 +277,11 @@ main {
 }
 
 .message-aggregator-field textarea {
-  min-height: 72px;
+  min-height: 112px;
   resize: vertical;
-  padding-top: 8px;
+  padding: 8px 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .message-aggregator-field.wide-field {
@@ -361,6 +363,49 @@ main {
   overflow: hidden;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.message-time,
+.message-freshness {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+
+.message-time {
+  color: #8fa0b5;
+  font-variant-numeric: tabular-nums;
+}
+
+.message-freshness.freshness-live,
+.message-freshness.freshness-fresh {
+  color: var(--ok);
+}
+
+.message-freshness.freshness-aging,
+.message-freshness.freshness-unknown {
+  color: var(--warn);
+}
+
+.message-freshness.freshness-stale {
+  color: var(--danger);
+}
+
+.prediction-monitoring {
+  color: #8fc1ff;
+}
+
+.prediction-disclaimer {
+  color: #718096;
+  font-size: 11px;
+  font-style: italic;
+}
+
+.message-badges {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
 }
 
 .badge {
@@ -555,6 +600,193 @@ main {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.post-trade-review-workbench {
+  margin: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-2) 74%, transparent);
+  overflow: hidden;
+}
+
+.review-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.review-heading strong,
+.review-heading span {
+  display: block;
+}
+
+.review-heading div > span {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.review-status {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.review-status.ready {
+  border-color: color-mix(in srgb, var(--ok) 55%, var(--line));
+  color: var(--ok);
+}
+
+.review-status.warn {
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--line));
+  color: var(--warn);
+}
+
+.review-config-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.45fr) minmax(260px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.review-config-form label > span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.review-config-form input[type="number"] {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 9px;
+}
+
+.review-checkbox {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  gap: 8px;
+}
+
+.review-checkbox > span {
+  margin: 0 !important;
+}
+
+.review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.post-trade-review {
+  padding: 12px;
+}
+
+.review-overview,
+.review-validation,
+.review-factor-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.review-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 9px;
+}
+
+.review-card span,
+.review-factor-name span {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.review-card strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 13px;
+}
+
+.review-subtitle {
+  margin: 14px 0 8px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.review-factor-row,
+.review-trade-row {
+  display: grid;
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+  padding: 8px 0;
+}
+
+.review-factor-row {
+  grid-template-columns: minmax(150px, 1fr) repeat(4, minmax(90px, 0.7fr));
+}
+
+.review-trade-row {
+  grid-template-columns: minmax(170px, 1fr) minmax(120px, 0.7fr) minmax(220px, 1.4fr);
+}
+
+.review-factor-row:first-child,
+.review-trade-row:first-child {
+  border-top: 0;
+}
+
+.review-factor-delta.up {
+  color: var(--ok);
+}
+
+.review-factor-delta.down {
+  color: var(--danger);
+}
+
+.review-note {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.review-trade-details {
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.review-trade-details summary {
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.review-trade-details > div {
+  margin-top: 6px;
+  line-height: 1.55;
+}
+
+.review-detail-factors {
+  border-left: 2px solid var(--line);
+  padding-left: 8px;
 }
 
 .account-metrics,
@@ -1049,6 +1281,19 @@ a:hover {
 
   .message-aggregator-form {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .review-config-form,
+  .review-overview,
+  .review-validation,
+  .review-factor-grid,
+  .review-factor-row,
+  .review-trade-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .review-heading {
+    flex-direction: column;
   }
 
   .message-aggregator-field.wide-field,

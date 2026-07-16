@@ -10,6 +10,7 @@ import {
   parseRssXml
 } from "./message-aggregator.mjs";
 import {
+  analyzeEventFreshness,
   clusterMessageItems,
   inferSourceTier,
   sourceWeightForTier,
@@ -17,9 +18,22 @@ import {
 } from "./news-intelligence.mjs";
 import {
   buildPolymarketPriceSentiment,
-  isCryptoPolymarketMarket,
-  isRoutineExchangeProductAnnouncement
+  extractBinaryMarketProbabilities,
+  isRoutineExchangeProductAnnouncement,
+  updatePredictionMarketTracking
 } from "./event-source-rules.mjs";
+import {
+  createPostTradeReviewState,
+  DEFAULT_DIRECTION_MODEL_WEIGHTS,
+  maybeRunPostTradeReview,
+  normalizeDirectionWeights,
+  normalizePostTradeReviewConfig,
+  normalizePostTradeReviewState
+} from "./post-trade-review.mjs";
+import {
+  ADAPTIVE_GATE_BOUNDS,
+  evaluateAdaptiveEntryGate
+} from "./adaptive-entry-gate.mjs";
 
 const RUNTIME_DIR = path.resolve(".runtime", "event-signal-monitor");
 const STATE_PATH = path.resolve(RUNTIME_DIR, "state.json");
@@ -34,12 +48,10 @@ const MESSAGE_AGGREGATOR_STATUS_PATH = path.resolve(RUNTIME_DIR, "message-aggreg
 const execFileAsync = promisify(execFile);
 loadDotEnv(path.resolve(".env"));
 
-const MONITOR_VERSION = "0.10.0";
-const RUN_LAYER = normalizeLayer(process.env.SIGNAL_MONITOR_LAYER || readCliOption("layer", "all"));
-const LAYER_REPORT_PATH =
-  RUN_LAYER === "all" ? REPORT_PATH : path.resolve(RUNTIME_DIR, `latest-${RUN_LAYER}-report.json`);
-const LAYER_HISTORY_PATH =
-  RUN_LAYER === "all" ? HISTORY_PATH : path.resolve(RUNTIME_DIR, `history-${RUN_LAYER}.jsonl`);
+const MONITOR_VERSION = "0.14.0";
+const RUN_LAYER = "unified-high-frequency";
+const LAYER_REPORT_PATH = REPORT_PATH;
+const LAYER_HISTORY_PATH = HISTORY_PATH;
 const LOCK_PATH = path.resolve(RUNTIME_DIR, "run.lock");
 const ACCOUNT_LOCK_PATH = path.resolve(RUNTIME_DIR, "account.lock");
 const DEFAULT_SYMBOLS = [
@@ -111,16 +123,7 @@ const BASE_MODEL_WEIGHTS = {
   poisson: 0.04,
   bayesian: 0.08
 };
-const DIRECTION_MODEL_WEIGHTS = {
-  trend: 0.24,
-  higherTimeframeTrend: 0.14,
-  momentum: 0.12,
-  rsi: 0.05,
-  funding: 0.05,
-  openInterest: 0.05,
-  geometricBrownianMotion: 0.15,
-  hiddenMarkovModel: 0.2
-};
+const DIRECTION_MODEL_WEIGHTS = { ...DEFAULT_DIRECTION_MODEL_WEIGHTS };
 const GARCH_CONFIDENCE_WEIGHT = 0.35;
 const MARKOWITZ_SIZING_WEIGHT = 0.4;
 const BAYESIAN_POSTERIOR_WEIGHT = 0.3;
@@ -131,9 +134,6 @@ const FETCH_IMPL = (process.env.SIGNAL_MONITOR_FETCH_IMPL || "auto")
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.SIGNAL_MONITOR_TIMEOUT_MS, 8_000);
 const MARKET_CONCURRENCY = toPositiveInt(process.env.SIGNAL_MONITOR_MARKET_CONCURRENCY, 6);
 const OPEN_SIGNAL_MAX_AGE_MS = 72 * 60 * 60 * 1000;
-const MIN_HIGH_EXPECTANCY_WIN_RATE = 0.5;
-const MIN_NORMAL_EXPECTANCY_WIN_RATE = 0.7;
-const AGGRESSIVE_MIN_NORMAL_EXPECTANCY_WIN_RATE = 0.6;
 const MIN_HIGH_EXPECTANCY_R = 0.25;
 const MIN_EV_PCT = 0;
 const DEFAULT_FUTURES_TAKER_FEE_RATE = 0.0005;
@@ -151,20 +151,6 @@ const DEFAULT_ACCOUNT_CONFIG = {
   riskProfile: "conservative",
   updatedAt: null
 };
-
-function readCliOption(name, fallback) {
-  const prefix = `--${name}=`;
-  const match = process.argv.slice(2).find((arg) => arg.startsWith(prefix));
-  return match ? match.slice(prefix.length) : fallback;
-}
-
-function normalizeLayer(value) {
-  const layer = String(value || "all").trim().toLowerCase();
-  if (["fast", "slow", "all"].includes(layer)) {
-    return layer;
-  }
-  throw new Error(`Invalid layer "${value}". Use fast, slow, or all.`);
-}
 
 function ensureRuntimeDir() {
   fs.mkdirSync(RUNTIME_DIR, { recursive: true });
@@ -365,25 +351,6 @@ function sameAccountConfig(left, right) {
   );
 }
 
-function evaluateCandidateGate({ riskProfile, expectancyPct, expectancyR, winRate }) {
-  const normalizedProfile = riskProfile === "aggressive" ? "aggressive" : "conservative";
-  const expectancyClass = expectancyR >= MIN_HIGH_EXPECTANCY_R ? "high" : "normal";
-  const normalWinRateThreshold =
-    normalizedProfile === "aggressive"
-      ? AGGRESSIVE_MIN_NORMAL_EXPECTANCY_WIN_RATE
-      : MIN_NORMAL_EXPECTANCY_WIN_RATE;
-  const passesGate =
-    expectancyPct > MIN_EV_PCT &&
-    ((expectancyClass === "high" && winRate >= MIN_HIGH_EXPECTANCY_WIN_RATE) ||
-      (expectancyClass !== "high" && winRate >= normalWinRateThreshold));
-  return {
-    riskProfile: normalizedProfile,
-    expectancyClass,
-    normalWinRateThreshold,
-    passesGate
-  };
-}
-
 function createPaperAccount(accountConfig, now = new Date().toISOString()) {
   const config = normalizeAccountConfig(accountConfig);
   const account = {
@@ -405,6 +372,8 @@ function createPaperAccount(accountConfig, now = new Date().toISOString()) {
     availableEquity: config.initialCapital,
     positions: {},
     tradeHistory: [],
+    postTradeReviewConfig: normalizePostTradeReviewConfig(),
+    postTradeReview: createPostTradeReviewState(DIRECTION_MODEL_WEIGHTS, null),
     equityCurve: [
       {
         time: now,
@@ -416,6 +385,7 @@ function createPaperAccount(accountConfig, now = new Date().toISOString()) {
     ],
     summary: null
   };
+  account.postTradeReview.sessionId = account.sessionId;
   account.summary = buildPaperAccountSummary(account);
   return account;
 }
@@ -441,6 +411,12 @@ function readPaperAccount(accountConfig) {
       position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
   }
   account.tradeHistory = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+  account.postTradeReviewConfig = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
+  account.postTradeReview = normalizePostTradeReviewState(
+    account.postTradeReview,
+    DIRECTION_MODEL_WEIGHTS,
+    account.sessionId
+  );
   for (const position of account.tradeHistory) {
     position.riskProfile =
       position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
@@ -1089,6 +1065,23 @@ function normalizeText(value) {
     .trim();
 }
 
+function normalizeSourceTimestamp(value) {
+  if (value == null || value === "") return null;
+  if (typeof value === "number" || /^\d+$/.test(String(value).trim())) {
+    const numeric = Number(value);
+    const milliseconds = numeric > 0 && numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+    const parsed = new Date(milliseconds);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+  const compact = String(value).trim().match(/^(\d{4})(\d{2})(\d{2})T?(\d{2})(\d{2})(\d{2})Z?$/i);
+  if (compact) {
+    const [, year, month, day, hour, minute, second] = compact;
+    return new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`).toISOString();
+  }
+  const parsed = new Date(String(value));
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
 function flattenArticleLikeObjects(value, source, maxItems = 30) {
   const items = [];
   const seen = new Set();
@@ -1126,6 +1119,9 @@ function flattenArticleLikeObjects(value, source, maxItems = 30) {
           title: normalizeText(maybeTitle),
           text,
           url: typeof url === "string" ? url : "",
+          occurredAt: normalizeSourceTimestamp(
+            node.publishedDate || node.publishedAt || node.createTime || node.releaseDate || node.updatedAt || node.date
+          ),
           raw: node
         });
       }
@@ -1151,19 +1147,41 @@ async function fetchGdeltNews() {
     title: normalizeText(article.title),
     text: normalizeText([article.title, article.seendate, article.domain].filter(Boolean).join(" ")),
     url: article.url || "",
+    occurredAt: normalizeSourceTimestamp(article.seendate),
     raw: article
   }));
 }
 
 async function fetchPolymarketMarkets(state) {
   const url =
-    "https://gamma-api.polymarket.com/markets?closed=false&active=true&archived=false&limit=100&order=volume24hr&ascending=false";
+    "https://gamma-api.polymarket.com/markets?closed=false&active=true&archived=false&limit=100&order=volume_24hr&ascending=false";
   const data = await fetchJson(url);
   const rows = Array.isArray(data) ? data : [];
-  return rows
-    .filter(isCryptoPolymarketMarket)
-    .slice(0, 30)
-    .map((market) => {
+  const discovered = rows.slice(0, 30);
+  const discoveredIds = new Set(
+    discovered.map((market) => String(market.id || market.conditionId || market.slug || market.question))
+  );
+  const trackedIds = Object.entries(state.polymarket || {})
+    .filter(([id, record]) => id && record?.closed !== true && record?.status !== "closed" && !discoveredIds.has(id))
+    .map(([id]) => id);
+  const trackedRows = await mapWithConcurrency(trackedIds, 6, async (id) => {
+    try {
+      const market = await fetchJson(`https://gamma-api.polymarket.com/markets/${encodeURIComponent(id)}`, {
+        timeoutMs: 8_000
+      });
+      return market && typeof market === "object" && !Array.isArray(market) ? market : null;
+    } catch {
+      return null;
+    }
+  });
+  const combined = new Map();
+  for (const market of [...discovered, ...trackedRows.filter(Boolean)]) {
+    const id = String(market.id || market.conditionId || market.slug || market.question || "");
+    if (id) combined.set(id, market);
+  }
+  const receivedAt = new Date().toISOString();
+
+  return [...combined.values()].map((market) => {
       const marketId = String(market.id || market.conditionId || market.slug || market.question);
       const previous = state.polymarket?.[marketId] || {};
       const prices = parseMaybeJsonArray(market.outcomePrices);
@@ -1172,6 +1190,11 @@ async function fetchPolymarketMarkets(state) {
       const priceDelta =
         typeof yesPrice === "number" && typeof previousYesPrice === "number" ? yesPrice - previousYesPrice : 0;
       const sentiment = buildPolymarketPriceSentiment(market, previous);
+      const binary = extractBinaryMarketProbabilities(market);
+      const volume = safeNumber(market.volume, safeNumber(market.volume24hr));
+      const liquidity = safeNumber(market.liquidity);
+      const outcomeProbabilities = binary?.probabilities || [];
+      const outcomeLabels = binary?.labels || [];
       return {
         source: "Polymarket",
         type: "prediction",
@@ -1194,8 +1217,18 @@ async function fetchPolymarketMarkets(state) {
           ].join(" ")
         ),
         url: market.slug ? `https://polymarket.com/market/${market.slug}` : "",
+        receivedAt,
         yesPrice,
         priceDelta,
+        yesProbability: sentiment?.yesProbability ?? null,
+        noProbability: sentiment?.noProbability ?? null,
+        outcomeLabels,
+        outcomeProbabilities,
+        outcomeRatio: binary?.ratio ?? null,
+        volume,
+        liquidity,
+        volumeDelta: Number.isFinite(Number(previous.volume)) ? volume - Number(previous.volume) : 0,
+        liquidityDelta: Number.isFinite(Number(previous.liquidity)) ? liquidity - Number(previous.liquidity) : 0,
         symbol: sentiment?.symbol || null,
         isPricePrediction: Boolean(sentiment),
         yesProbability: sentiment?.yesProbability ?? null,
@@ -1206,6 +1239,13 @@ async function fetchPolymarketMarkets(state) {
         bullProbabilityDelta: sentiment?.bullProbabilityDelta ?? null,
         sentimentDirection: sentiment?.direction ?? null,
         sentimentImpact: sentiment?.sentimentImpact ?? null,
+        monitoringStatus: market.closed === true ? "closed" : "tracking",
+        monitoringStartedAt: previous.firstSeenAt || receivedAt,
+        monitoringObservations: Math.max(0, safeNumber(previous.observations)) + 1,
+        marketActive: market.active !== false,
+        marketClosed: market.closed === true,
+        marketEndDate: normalizeSourceTimestamp(market.endDate),
+        marketSlug: market.slug || null,
         metrics: sentiment
           ? {
               symbol: sentiment.symbol,
@@ -1216,9 +1256,32 @@ async function fetchPolymarketMarkets(state) {
               bearProbability: roundNumber(sentiment.bearProbability),
               bullBearRatio: roundNumber(sentiment.bullBearRatio),
               bullProbabilityDelta: roundNumber(sentiment.bullProbabilityDelta),
-              volume: roundNumber(sentiment.volume)
+              volume: roundNumber(volume),
+              liquidity: roundNumber(liquidity),
+              volumeDelta: roundNumber(Number.isFinite(Number(previous.volume)) ? volume - Number(previous.volume) : 0),
+              liquidityDelta: roundNumber(
+                Number.isFinite(Number(previous.liquidity)) ? liquidity - Number(previous.liquidity) : 0
+              ),
+              monitoringStatus: market.closed === true ? "closed" : "tracking",
+              monitoringObservations: Math.max(0, safeNumber(previous.observations)) + 1,
+              monitoringStartedAt: previous.firstSeenAt || receivedAt,
+              marketEndDate: normalizeSourceTimestamp(market.endDate)
             }
-          : {},
+          : {
+              outcomeLabels,
+              outcomeProbabilities: outcomeProbabilities.map((value) => roundNumber(value)),
+              outcomeRatio: roundNumber(binary?.ratio),
+              volume: roundNumber(volume),
+              liquidity: roundNumber(liquidity),
+              volumeDelta: roundNumber(Number.isFinite(Number(previous.volume)) ? volume - Number(previous.volume) : 0),
+              liquidityDelta: roundNumber(
+                Number.isFinite(Number(previous.liquidity)) ? liquidity - Number(previous.liquidity) : 0
+              ),
+              monitoringStatus: market.closed === true ? "closed" : "tracking",
+              monitoringObservations: Math.max(0, safeNumber(previous.observations)) + 1,
+              monitoringStartedAt: previous.firstSeenAt || receivedAt,
+              marketEndDate: normalizeSourceTimestamp(market.endDate)
+            },
         raw: market
       };
     });
@@ -1424,6 +1487,7 @@ async function fetchWhaleAlertIfConfigured() {
         title: `${tx.symbol || tx.blockchain || "crypto"} whale transfer ${tx.amount_usd || ""} USD`,
         text: normalizeText(JSON.stringify(tx).slice(0, 500)),
         url: tx.transaction?.hash ? String(tx.transaction.hash) : "",
+        occurredAt: normalizeSourceTimestamp(tx.timestamp),
         raw: tx
       })),
       warning: null
@@ -1559,6 +1623,7 @@ function classifyEvent(item) {
   const corroborationCount = Math.max(1, safeNumber(item.corroborationCount, 1));
   const corroborationMultiplier = Math.min(1.24, 1 + (corroborationCount - 1) * 0.08);
   const trendScore = clamp(safeNumber(item.trendScore), 0, 1);
+  const freshness = analyzeEventFreshness(item);
 
   const matchedSymbols = SYMBOLS.filter((symbol) => {
     const aliases = SYMBOL_ALIASES[symbol] || [symbol.replace("USDT", "")];
@@ -1570,28 +1635,32 @@ function classifyEvent(item) {
       text
     );
   const directionRaw = bull - bear;
-  const direction =
-    item.source === "Polymarket" && Number.isFinite(item.sentimentDirection)
+  const direction = item.source === "Polymarket"
+    ? Number.isFinite(item.sentimentDirection)
       ? item.sentimentDirection
-      : directionRaw > 0
-        ? 1
-        : directionRaw < 0
-          ? -1
-          : inferPolymarketDirection(item);
+      : 0
+    : directionRaw > 0
+      ? 1
+      : directionRaw < 0
+        ? -1
+        : 0;
   const termImpactScore = clamp(
     (18 + highImpact * 12 + Math.abs(directionRaw) * 10) * sourceWeight * corroborationMultiplier +
       trendScore * 10,
     0,
     100
   );
-  const impactScore = Math.max(termImpactScore, safeNumber(item.sentimentImpact));
+  const rawImpactScore = Math.max(termImpactScore, safeNumber(item.sentimentImpact));
+  const impactScore = clamp(rawImpactScore * freshness.freshnessWeight, 0, 100);
 
   return {
     ...item,
     matchedSymbols,
     marketWide,
     direction,
+    rawImpactScore,
     impactScore,
+    freshness,
     reasons: {
       bullTerms: bull,
       bearTerms: bear,
@@ -1601,23 +1670,12 @@ function classifyEvent(item) {
       corroborationCount,
       corroborationMultiplier,
       trendScore,
+      freshnessLevel: freshness.level,
+      freshnessWeight: freshness.freshnessWeight,
+      ageMinutes: freshness.ageMinutes,
       predictionSentiment: Boolean(item.isPricePrediction)
     }
   };
-}
-
-function inferPolymarketDirection(item) {
-  if (item.source !== "Polymarket") return 0;
-  if (Number.isFinite(item.sentimentDirection)) return item.sentimentDirection;
-  const text = `${item.title || ""} ${item.text || ""}`.toUpperCase();
-  const yesDelta = safeNumber(item.priceDelta);
-  if (/HIT|REACH|ABOVE|OVER/.test(text) && Math.abs(yesDelta) > 0.01) {
-    return yesDelta > 0 ? 1 : -1;
-  }
-  if (/BELOW|UNDER/.test(text) && Math.abs(yesDelta) > 0.01) {
-    return yesDelta > 0 ? -1 : 1;
-  }
-  return 0;
 }
 
 function escapeRegExp(value) {
@@ -1664,7 +1722,16 @@ function aggregateEventsBySymbol(classifiedEvents) {
   return result;
 }
 
-function analyzeMarket(symbol, candles15m, candles1h, fundingRate, openInterest, previousOpenInterest) {
+function analyzeMarket(
+  symbol,
+  candles15m,
+  candles1h,
+  fundingRate,
+  openInterest,
+  previousOpenInterest,
+  directionWeightsValue = DIRECTION_MODEL_WEIGHTS
+) {
+  const directionWeights = normalizeDirectionWeights(directionWeightsValue, DIRECTION_MODEL_WEIGHTS);
   const closes15m = candles15m.map((candle) => candle.close);
   const closes1h = candles1h.map((candle) => candle.close);
   const latest = closes15m.at(-1) || closes1h.at(-1) || 0;
@@ -1698,14 +1765,14 @@ function analyzeMarket(symbol, candles15m, candles1h, fundingRate, openInterest,
   const garch = estimateGarch11(returns);
   const hiddenMarkov = analyzeHiddenMarkovRegime(returns);
   const directionalSignal = clamp(
-    trendSignal * DIRECTION_MODEL_WEIGHTS.trend +
-      htfTrendSignal * DIRECTION_MODEL_WEIGHTS.higherTimeframeTrend +
-      momentumSignal * DIRECTION_MODEL_WEIGHTS.momentum +
-      rsiSignal * DIRECTION_MODEL_WEIGHTS.rsi +
-      fundingSignal * DIRECTION_MODEL_WEIGHTS.funding +
-      oiSignal * DIRECTION_MODEL_WEIGHTS.openInterest +
-      gbm.signal * DIRECTION_MODEL_WEIGHTS.geometricBrownianMotion +
-      hiddenMarkov.signal * DIRECTION_MODEL_WEIGHTS.hiddenMarkovModel,
+    trendSignal * directionWeights.trend +
+      htfTrendSignal * directionWeights.higherTimeframeTrend +
+      momentumSignal * directionWeights.momentum +
+      rsiSignal * directionWeights.rsi +
+      fundingSignal * directionWeights.funding +
+      oiSignal * directionWeights.openInterest +
+      gbm.signal * directionWeights.geometricBrownianMotion +
+      hiddenMarkov.signal * directionWeights.hiddenMarkovModel,
     -1,
     1
   );
@@ -1747,9 +1814,9 @@ function analyzeMarket(symbol, candles15m, candles1h, fundingRate, openInterest,
     returns15m: returns.slice(-96),
     mathBreakdown: {
       formula:
-        "directionalSignal = trend*0.24 + htfTrend*0.14 + momentum*0.12 + RSI*0.05 + funding*0.05 + OI*0.05 + GBM*0.15 + HMM*0.20; mathSignal = directionalSignal*(0.65 + 0.35*GARCH_stability)",
+        "directionalSignal = sum(directionFactor*currentReviewWeight); mathSignal = directionalSignal*(0.65 + 0.35*GARCH_stability)",
       decisionWeights: {
-        ...DIRECTION_MODEL_WEIGHTS,
+        ...directionWeights,
         garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
         markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT
       },
@@ -1784,14 +1851,14 @@ function analyzeMarket(symbol, candles15m, candles1h, fundingRate, openInterest,
         directionalSignal
       },
       weightedTerms: {
-        trend: trendSignal * DIRECTION_MODEL_WEIGHTS.trend,
-        htfTrend: htfTrendSignal * DIRECTION_MODEL_WEIGHTS.higherTimeframeTrend,
-        momentum: momentumSignal * DIRECTION_MODEL_WEIGHTS.momentum,
-        rsi: rsiSignal * DIRECTION_MODEL_WEIGHTS.rsi,
-        funding: fundingSignal * DIRECTION_MODEL_WEIGHTS.funding,
-        openInterest: oiSignal * DIRECTION_MODEL_WEIGHTS.openInterest,
-        geometricBrownianMotion: gbm.signal * DIRECTION_MODEL_WEIGHTS.geometricBrownianMotion,
-        hiddenMarkovModel: hiddenMarkov.signal * DIRECTION_MODEL_WEIGHTS.hiddenMarkovModel
+        trend: trendSignal * directionWeights.trend,
+        htfTrend: htfTrendSignal * directionWeights.higherTimeframeTrend,
+        momentum: momentumSignal * directionWeights.momentum,
+        rsi: rsiSignal * directionWeights.rsi,
+        funding: fundingSignal * directionWeights.funding,
+        openInterest: oiSignal * directionWeights.openInterest,
+        geometricBrownianMotion: gbm.signal * directionWeights.geometricBrownianMotion,
+        hiddenMarkovModel: hiddenMarkov.signal * directionWeights.hiddenMarkovModel
       },
       models: { gbm, garch, hiddenMarkov },
       result: mathSignal,
@@ -1801,7 +1868,14 @@ function analyzeMarket(symbol, candles15m, candles1h, fundingRate, openInterest,
   };
 }
 
-function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
+function buildCandidate(
+  market,
+  eventAggregate,
+  modelWeights,
+  accountConfig,
+  weightVersion = 1,
+  calibration = {}
+) {
   if (!market.latest || !Number.isFinite(market.latest)) return null;
 
   const normalizedAccountConfig = normalizeAccountConfig(accountConfig);
@@ -1890,13 +1964,22 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
   factors.bayesian = Math.abs(bayesian.adjustment) / 0.08;
   const expectancyPct = winRate * rewardPct - (1 - winRate) * riskPct - roundTripExecutionCostPct;
   const expectancyR = riskPct > 0 ? expectancyPct / riskPct : 0;
-  const gateResult = evaluateCandidateGate({
+  const gateResult = evaluateAdaptiveEntryGate({
     riskProfile: normalizedAccountConfig.riskProfile,
     expectancyPct,
-    expectancyR,
-    winRate
+    winRate,
+    riskPct,
+    rewardRiskRatio,
+    roundTripExecutionCostPct,
+    regime: market.regime,
+    volatilityExpansion: Math.max(market.volatilityExpansion, market.garch.volatilityRatio),
+    alignment,
+    candidateMode,
+    combinedDirection,
+    calibration
   });
-  const { expectancyClass, passesGate } = gateResult;
+  const expectancyClass = expectancyR >= MIN_HIGH_EXPECTANCY_R ? "high" : "normal";
+  const { passesGate } = gateResult;
   const entry = market.latest;
   const stopLoss = side === "long" ? entry * (1 - riskPct) : entry * (1 + riskPct);
   const takeProfit = side === "long" ? entry * (1 + rewardPct) : entry * (1 - rewardPct);
@@ -1931,6 +2014,8 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
     expectancyPct,
     expectancyR,
     expectancyClass,
+    adaptiveWinRateThreshold: gateResult.adaptiveWinRateThreshold,
+    breakEvenWinRate: gateResult.breakEvenWinRate,
     rewardRiskRatio,
     riskPct,
     positionRiskPct,
@@ -1943,6 +2028,44 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
     eventDirection,
     regime: market.regime,
     factors,
+    factorSnapshot: {
+      capturedAt: new Date().toISOString(),
+      modelVersion: MONITOR_VERSION,
+      weightVersion,
+      regime: market.regime,
+      directionSignals: {
+        trend: market.trendSignal,
+        higherTimeframeTrend: market.htfTrendSignal,
+        momentum: market.momentumSignal,
+        rsi: market.mathBreakdown?.components?.rsiSignal || 0,
+        funding: market.fundingSignal,
+        openInterest: market.oiSignal,
+        geometricBrownianMotion: market.gbm.signal,
+        hiddenMarkovModel: market.hiddenMarkov.signal
+      },
+      directionWeights: {
+        trend: market.mathBreakdown?.decisionWeights?.trend,
+        higherTimeframeTrend: market.mathBreakdown?.decisionWeights?.higherTimeframeTrend,
+        momentum: market.mathBreakdown?.decisionWeights?.momentum,
+        rsi: market.mathBreakdown?.decisionWeights?.rsi,
+        funding: market.mathBreakdown?.decisionWeights?.funding,
+        openInterest: market.mathBreakdown?.decisionWeights?.openInterest,
+        geometricBrownianMotion: market.mathBreakdown?.decisionWeights?.geometricBrownianMotion,
+        hiddenMarkovModel: market.mathBreakdown?.decisionWeights?.hiddenMarkovModel
+      },
+      weightedTerms: { ...(market.mathBreakdown?.weightedTerms || {}) },
+      qualityFactors: { ...factors },
+      qualityWeights: { ...modelWeights },
+      eventContext: {
+        score: eventAggregate.score,
+        direction: eventDirection,
+        eventWeight,
+        mathWeight,
+        alignment,
+        eventCount: Array.isArray(eventAggregate.events) ? eventAggregate.events.length : 0
+      },
+      marketInputs: { ...(market.mathBreakdown?.inputs || {}) }
+    },
     calculation: {
       direction: {
         formula: "combinedDirection = eventDirection*eventWeight + mathSignal*mathWeight",
@@ -1993,11 +2116,16 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
       },
       gate: {
         formula:
-          "Pass if EV% > 0 and ((EV/R >= 0.25 and P(win) >= 50%) or (EV/R < 0.25 and P(win) >= profile threshold: conservative 70%, aggressive 60%))",
+          "Pass if EV% > 0 and P(win) >= clamp(breakEvenWinRate + adaptive uncertainty/risk margins, profile safety bounds)",
         riskProfile: gateResult.riskProfile,
         minCombinedDirection: MIN_COMBINED_DIRECTION,
-        minHighExpectancyWinRate: MIN_HIGH_EXPECTANCY_WIN_RATE,
-        minNormalExpectancyWinRate: gateResult.normalWinRateThreshold,
+        adaptiveWinRateThreshold: gateResult.adaptiveWinRateThreshold,
+        breakEvenWinRate: gateResult.breakEvenWinRate,
+        executionCostR: gateResult.executionCostR,
+        uncertaintyMargin: gateResult.uncertaintyMargin,
+        bounds: gateResult.bounds,
+        components: gateResult.components,
+        context: gateResult.context,
         minHighExpectancyR: MIN_HIGH_EXPECTANCY_R,
         minEvPct: MIN_EV_PCT,
         passesGate
@@ -2020,7 +2148,11 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
         poisson,
         bayesian,
         weights: {
-          ...DIRECTION_MODEL_WEIGHTS,
+          ...Object.fromEntries(
+            Object.entries(market.mathBreakdown?.decisionWeights || {}).filter(
+              ([key]) => !["garchConfidenceWeight", "markowitzSizingWeight"].includes(key)
+            )
+          ),
           garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
           markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT,
           bayesianPosteriorWeight: BAYESIAN_POSTERIOR_WEIGHT
@@ -2041,6 +2173,7 @@ function buildCandidate(market, eventAggregate, modelWeights, accountConfig) {
       `BayesP=${(bayesian.posteriorWinRate * 100).toFixed(1)}%`,
       `eventImpact=${Math.round(eventAggregate.score)}`,
       `regime=${market.regime}`,
+      `adaptiveGate=${(gateResult.adaptiveWinRateThreshold * 100).toFixed(1)}%`,
       `EV=${(expectancyPct * 100).toFixed(2)}%`
     ],
     relatedEvents: eventAggregate.events
@@ -2407,6 +2540,30 @@ function markPaperPositions(account, marketBySymbol, now = new Date().toISOStrin
       position.marginRequired > 0 ? position.netPnl / position.marginRequired : 0;
     position.priceReturnPct =
       position.side === "long" ? currentPrice / position.entry - 1 : (position.entry - currentPrice) / position.entry;
+    position.maxFavorableExcursionPct = Math.max(
+      safeNumber(position.maxFavorableExcursionPct),
+      position.priceReturnPct
+    );
+    position.maxAdverseExcursionPct = Math.min(
+      safeNumber(position.maxAdverseExcursionPct),
+      position.priceReturnPct
+    );
+    const observations = Array.isArray(position.holdingObservations) ? position.holdingObservations : [];
+    const lastObservation = observations.at(-1);
+    const observationGapMs = lastObservation
+      ? new Date(now).getTime() - new Date(lastObservation.time).getTime()
+      : Number.POSITIVE_INFINITY;
+    if (!lastObservation || observationGapMs >= 15 * 60 * 1000) {
+      observations.push({
+        time: now,
+        price: currentPrice,
+        priceReturnPct: position.priceReturnPct,
+        netPnl: position.netPnl,
+        fundingRate: safeNumber(market?.fundingRate),
+        openInterest: safeNumber(market?.openInterest)
+      });
+    }
+    position.holdingObservations = observations.slice(-288);
     marginUsed += position.marginRequired || 0;
     unrealizedPnl += pnl;
   }
@@ -2514,6 +2671,8 @@ function openPaperPosition(account, signal, now) {
     takeProfit: signal.takeProfit,
     stopLoss: signal.stopLoss,
     winRate: signal.winRate,
+    adaptiveWinRateThreshold: signal.adaptiveWinRateThreshold,
+    breakEvenWinRate: signal.breakEvenWinRate,
     expectancyPct: signal.expectancyPct,
     expectancyR: signal.expectancyR,
     eventImpactScore: signal.eventImpactScore,
@@ -2541,6 +2700,22 @@ function openPaperPosition(account, signal, now) {
         : null,
     scaledByAvailableEquity: scale < 1,
     relatedEvents: signal.relatedEvents || [],
+    factorSnapshot: signal.factorSnapshot || null,
+    decisionCalculation: signal.calculation || null,
+    decisionReasons: signal.reasons || [],
+    regime: signal.regime || "unknown",
+    maxFavorableExcursionPct: 0,
+    maxAdverseExcursionPct: 0,
+    holdingObservations: [
+      {
+        time: now,
+        price: entry,
+        priceReturnPct: 0,
+        netPnl: -entryFee,
+        fundingRate: 0,
+        openInterest: 0
+      }
+    ],
     unrealizedPnl: 0,
     unrealizedReturnPct: 0,
     priceReturnPct: 0
@@ -2637,11 +2812,13 @@ function updatePaperAccount(account, actionableSignals, marketBySymbol) {
   }
   markPaperPositions(account, marketBySymbol, now);
   appendEquityPoint(account, now);
+  const postTradeReviewResult = maybeRunPostTradeReview(account, DIRECTION_MODEL_WEIGHTS, now);
   account.summary = buildPaperAccountSummary(account);
   account.lastRun = {
     generatedAt: now,
     openedPositions,
-    closedPositions
+    closedPositions,
+    postTradeReview: postTradeReviewResult.review
   };
   return account;
 }
@@ -2685,7 +2862,6 @@ function updateOpenSignalsAndReviews(state, candidates, marketBySymbol) {
     };
     closedThisRun.push(closed);
     delete activeSignals[id];
-    updateModelWeightsFromOutcome(state, signal.factors || {}, realizedR);
     updateCalibration(state, signal.winRate, realizedR);
   }
 
@@ -2710,17 +2886,6 @@ function buildReview(outcome, realizedR) {
     return "Stop loss reached. Reduce weights for contributing factors and review event score, math direction, and cost assumptions.";
   }
   return `Signal expired with realizedR=${realizedR.toFixed(2)}. Lower confidence in similar time-window signals.`;
-}
-
-function updateModelWeightsFromOutcome(state, factors, realizedR) {
-  const learningRate = 0.015;
-  const sign = realizedR > 0 ? 1 : -1;
-  state.modelWeights = state.modelWeights || { ...BASE_MODEL_WEIGHTS };
-  for (const [name, value] of Object.entries(factors)) {
-    const current = safeNumber(state.modelWeights[name], BASE_MODEL_WEIGHTS[name] || 0.05);
-    const delta = learningRate * sign * clamp(safeNumber(value), 0, 1);
-    state.modelWeights[name] = clamp(current + delta, 0.01, 0.7);
-  }
 }
 
 function updateCalibration(state, predictedWinRate, realizedR) {
@@ -2767,7 +2932,8 @@ async function analyzeSymbol(symbol, state) {
     candles1h,
     safeNumber(fundingRate),
     safeNumber(openInterest),
-    previousOpenInterest
+    previousOpenInterest,
+    state.directionWeights || DIRECTION_MODEL_WEIGHTS
   );
   state.openInterest = state.openInterest || {};
   state.openInterest[symbol] = {
@@ -2798,16 +2964,31 @@ function compactEvent(event) {
     url: event.url,
     occurredAt: event.occurredAt || null,
     receivedAt: event.receivedAt || null,
+    freshness: event.freshness || null,
     direction: event.direction,
+    rawImpactScore: Math.round(safeNumber(event.rawImpactScore, event.impactScore)),
     impactScore: Math.round(safeNumber(event.impactScore)),
     matchedSymbols: event.matchedSymbols || [],
     marketWide: Boolean(event.marketWide),
     yesPrice: roundNumber(event.yesPrice),
+    yesProbability: roundNumber(event.yesProbability),
+    noProbability: roundNumber(event.noProbability),
+    outcomeLabels: event.outcomeLabels || [],
+    outcomeProbabilities: (event.outcomeProbabilities || []).map((value) => roundNumber(value)),
+    outcomeRatio: roundNumber(event.outcomeRatio),
     priceDelta: roundNumber(event.priceDelta),
     bullProbability: roundNumber(event.bullProbability),
     bearProbability: roundNumber(event.bearProbability),
     bullBearRatio: roundNumber(event.bullBearRatio),
     bullProbabilityDelta: roundNumber(event.bullProbabilityDelta),
+    volume: roundNumber(event.volume),
+    liquidity: roundNumber(event.liquidity),
+    volumeDelta: roundNumber(event.volumeDelta),
+    liquidityDelta: roundNumber(event.liquidityDelta),
+    monitoringStatus: event.monitoringStatus || null,
+    monitoringStartedAt: event.monitoringStartedAt || null,
+    monitoringObservations: event.monitoringObservations || null,
+    marketEndDate: event.marketEndDate || null,
     metrics: event.metrics || {},
     reasons: event.reasons || null,
     text: event.text
@@ -2914,7 +3095,9 @@ function renderConsoleReport(report) {
       lines.push(
         `- ${signal.symbol} ${signal.side.toUpperCase()} entry=${formatPrice(signal.entry)} TP=${formatPrice(
           signal.takeProfit
-        )} SL=${formatPrice(signal.stopLoss)} Pwin=${(signal.winRate * 100).toFixed(1)}% EV=${(
+        )} SL=${formatPrice(signal.stopLoss)} Pwin=${(signal.winRate * 100).toFixed(1)}% Gate=${(
+          signal.adaptiveWinRateThreshold * 100
+        ).toFixed(1)}% BE=${(signal.breakEvenWinRate * 100).toFixed(1)}% EV=${(
           signal.expectancyPct * 100
         ).toFixed(2)}% EV/R=${signal.expectancyR.toFixed(2)} risk=${(signal.positionRiskPct * 100).toFixed(
           2
@@ -2937,28 +3120,28 @@ async function main() {
   const releaseInitialAccountLock = await acquireAccountLock();
   let accountConfig;
   let accountSessionId;
+  let reviewWeightVersion = 1;
   try {
     accountConfig = readAccountConfig();
     const initialPaperAccount = readPaperAccount(accountConfig);
     accountSessionId = initialPaperAccount.sessionId;
+    state.directionWeights = initialPaperAccount.postTradeReview.currentDirectionWeights;
+    reviewWeightVersion = initialPaperAccount.postTradeReview.weightVersion;
   } finally {
     releaseInitialAccountLock();
   }
-  const isFastLayer = RUN_LAYER === "fast" || RUN_LAYER === "all";
-  const isSlowLayer = RUN_LAYER === "slow" || RUN_LAYER === "all";
-
   const warnings = [
     "仅模拟告警：脚本不会发送实盘订单。",
     "无证据表明新闻聚合、大模型推理或 Polymarket 赔率本身能稳定盈利。"
   ];
   const [aggregatorResult, gdeltNewsResult, polymarketResult, binanceAnnouncementsResult, okxAnnouncementsResult, whaleResult] =
     await Promise.all([
-      isSlowLayer ? fetchMessageAggregator() : { items: [], sourceFailures: [] },
-      isSlowLayer ? fetchWithFallback("GDELT", fetchGdeltNews, []) : [],
-      isFastLayer ? fetchWithFallback("Polymarket", () => fetchPolymarketMarkets(state), []) : [],
-      isFastLayer ? fetchWithFallback("Binance announcements", fetchBinanceAnnouncements, []) : [],
-      isFastLayer ? fetchWithFallback("OKX announcements", fetchOkxAnnouncements, []) : [],
-      isFastLayer ? fetchWithFallback("WhaleAlert", fetchWhaleAlertIfConfigured, { items: [], warning: null }) : { items: [], warning: null }
+      fetchMessageAggregator(),
+      fetchWithFallback("GDELT", fetchGdeltNews, []),
+      fetchWithFallback("Polymarket", () => fetchPolymarketMarkets(state), []),
+      fetchWithFallback("Binance announcements", fetchBinanceAnnouncements, []),
+      fetchWithFallback("OKX announcements", fetchOkxAnnouncements, []),
+      fetchWithFallback("WhaleAlert", fetchWhaleAlertIfConfigured, { items: [], warning: null })
     ]);
 
   const rawAggregatedItems = Array.isArray(aggregatorResult?.items) ? aggregatorResult.items : [];
@@ -2976,6 +3159,7 @@ async function main() {
     if (result?.sourceFailure) warnings.push(result.sourceFailure);
   }
 
+  const collectedAt = new Date().toISOString();
   const allEvents = [
     ...aggregatedItems,
     ...gdeltNews,
@@ -2983,7 +3167,7 @@ async function main() {
     ...binanceAnnouncements,
     ...okxAnnouncements,
     ...whaleItems
-  ];
+  ].map((item) => ({ ...item, receivedAt: item.receivedAt || collectedAt }));
   const storyClustering = clusterMessageItems(allEvents);
   const scoredEvents = storyClustering.items.map(classifyEvent);
   const classifiedEvents = scoredEvents.filter((event) => event.impactScore >= 18);
@@ -3007,13 +3191,27 @@ async function main() {
 
   for (const market of polymarketMarkets) {
     if (market.id) {
-      state.polymarket[market.id] = {
-        yesPrice: typeof market.yesPrice === "number" ? market.yesPrice : null,
-        bullProbability: typeof market.bullProbability === "number" ? market.bullProbability : null,
-        bearProbability: typeof market.bearProbability === "number" ? market.bearProbability : null,
-        bullBearRatio: typeof market.bullBearRatio === "number" ? market.bullBearRatio : null,
-        updatedAt: new Date().toISOString()
-      };
+      state.polymarket[market.id] = updatePredictionMarketTracking(
+        state.polymarket[market.id],
+        {
+          id: market.id,
+          slug: market.marketSlug,
+          title: market.title,
+          active: market.marketActive,
+          closed: market.marketClosed,
+          endDate: market.marketEndDate,
+          yesPrice: market.yesPrice,
+          yesProbability: market.yesProbability,
+          noProbability: market.noProbability,
+          bullProbability: market.bullProbability,
+          bearProbability: market.bearProbability,
+          outcomeRatio: market.outcomeRatio,
+          bullBearRatio: market.bullBearRatio,
+          volume: market.volume,
+          liquidity: market.liquidity
+        },
+        market.receivedAt || new Date().toISOString()
+      );
     }
   }
 
@@ -3024,7 +3222,9 @@ async function main() {
         market,
         eventsBySymbol[market.symbol] || { score: 0, direction: 0, events: [] },
         state.modelWeights,
-        accountConfig
+        accountConfig,
+        reviewWeightVersion,
+        state.calibration
       )
     )
     .filter(Boolean);
@@ -3045,6 +3245,7 @@ async function main() {
       latestPaperAccount.isActive && sameAccountSession
         ? updatePaperAccount(latestPaperAccount, actionableSignals, marketBySymbol)
         : latestPaperAccount;
+    state.directionWeights = updatedPaperAccount.postTradeReview?.currentDirectionWeights || state.directionWeights;
     writeJson(ACCOUNT_STATE_PATH, updatedPaperAccount);
   } finally {
     releaseAccountLock();
@@ -3060,14 +3261,20 @@ async function main() {
     layer: RUN_LAYER,
     simulatedAccount: finalAccountConfig,
     layerTasks: {
-      fast:
-        RUN_LAYER === "fast" || RUN_LAYER === "all"
-          ? ["Binance/OKX market data", "funding", "open interest", "Polymarket price delta", "exchange announcements"]
-          : [],
-      slow:
-        RUN_LAYER === "slow" || RUN_LAYER === "all"
-          ? ["built-in RSS aggregation", "NewsNow trend ranking", "GDELT global news", "story clustering", "event review", "model weight calibration", "TP/SL/expiry review"]
-          : []
+      unifiedHighFrequency: [
+        "Binance/OKX market data",
+        "funding",
+        "open interest",
+        "Polymarket price delta",
+        "exchange announcements",
+        "built-in RSS aggregation",
+        "NewsNow trend ranking",
+        "GDELT global news",
+        "story clustering",
+        "event review",
+        "model weight calibration",
+        "TP/SL/expiry review"
+      ]
     },
     analysisPolicy: {
       noMessageFallback: "消息面为空时，不中断流程；改用数学模型单独分析市场状态。",
@@ -3087,22 +3294,23 @@ async function main() {
         "Markowitz 均值-方差配置"
       ],
       advancedModelWeights: {
-        direction: DIRECTION_MODEL_WEIGHTS,
+        direction: state.directionWeights || DIRECTION_MODEL_WEIGHTS,
         garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
         markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT,
         bayesianPosteriorWeight: BAYESIAN_POSTERIOR_WEIGHT
       },
       mathOnlyGate:
-        "纯数学模式仍必须满足方向强度、胜率、EV 和风险收益硬门槛；未过线只进入观察或模型展示，不发开仓候选。",
+        "纯数学模式仍必须满足方向强度、正 EV 和自适应胜率门槛；门槛由成本保本胜率、校准误差、样本量、行情状态、波动和因子分歧共同决定，未过线只进入观察或模型展示。",
       liveTrading: "paper-alert-only，不会发送实盘订单。"
     },
     reportPath: LAYER_REPORT_PATH,
     disclaimer:
       "Trading signals are not profit guarantees. No live order is sent unless the user separately authorizes real trading API access.",
     gateRules: {
-      minHighExpectancyWinRate: MIN_HIGH_EXPECTANCY_WIN_RATE,
-      minNormalExpectancyWinRate: MIN_NORMAL_EXPECTANCY_WIN_RATE,
-      aggressiveMinNormalExpectancyWinRate: AGGRESSIVE_MIN_NORMAL_EXPECTANCY_WIN_RATE,
+      mode: "adaptive-break-even-plus-uncertainty",
+      formula:
+        "threshold = clamp(cost-adjusted break-even win rate + profile/sample/calibration/regime/volatility/alignment/mode margins - strong-direction discount, profile safety bounds)",
+      safetyBounds: ADAPTIVE_GATE_BOUNDS,
       minHighExpectancyR: MIN_HIGH_EXPECTANCY_R,
       minEvPct: MIN_EV_PCT
     },
@@ -3132,7 +3340,9 @@ async function main() {
     activeSignals: Object.values(state.activeSignals || {}),
     paperAccount: updatedPaperAccount,
     calibration: state.calibration,
-    modelWeights: state.modelWeights
+    modelWeights: state.modelWeights,
+    directionWeights: state.directionWeights,
+    postTradeReview: updatedPaperAccount.postTradeReview || null
   };
 
   writeJson(STATE_PATH, state);
@@ -3351,34 +3561,45 @@ function runAdvancedModelsSelfTest() {
 }
 
 function runRiskProfileSelfTest() {
-  const conservativeGate = evaluateCandidateGate({
+  const stableGate = evaluateAdaptiveEntryGate({
+    riskProfile: "aggressive",
+    expectancyPct: 0.003,
+    riskPct: 0.02,
+    rewardRiskRatio: 1.5,
+    roundTripExecutionCostPct: 0.0016,
+    winRate: 0.58,
+    regime: "trend",
+    volatilityExpansion: 1,
+    alignment: 1,
+    candidateMode: "event_impact",
+    combinedDirection: 0.75,
+    calibration: { samples: 200, wins: 116, avgPredictedWinRate: 0.58 }
+  });
+  const unstableGate = evaluateAdaptiveEntryGate({
     riskProfile: "conservative",
-    expectancyPct: 0.002,
-    expectancyR: 0.1,
-    winRate: 0.6
+    expectancyPct: 0.003,
+    riskPct: 0.02,
+    rewardRiskRatio: 1.5,
+    roundTripExecutionCostPct: 0.0016,
+    winRate: 0.58,
+    regime: "transition",
+    volatilityExpansion: 2,
+    alignment: -0.35,
+    candidateMode: "math_only",
+    combinedDirection: 0.3,
+    calibration: { samples: 0 }
   });
-  const aggressiveGate = evaluateCandidateGate({
-    riskProfile: "aggressive",
-    expectancyPct: 0.002,
-    expectancyR: 0.1,
-    winRate: 0.6
-  });
-  const belowAggressiveGate = evaluateCandidateGate({
-    riskProfile: "aggressive",
-    expectancyPct: 0.002,
-    expectancyR: 0.1,
-    winRate: 0.599
-  });
-  const negativeEvGate = evaluateCandidateGate({
+  const negativeEvGate = evaluateAdaptiveEntryGate({
     riskProfile: "aggressive",
     expectancyPct: -0.001,
-    expectancyR: 0.1,
-    winRate: 0.8
+    riskPct: 0.02,
+    rewardRiskRatio: 1.5,
+    winRate: 0.9
   });
   if (
-    conservativeGate.passesGate ||
-    !aggressiveGate.passesGate ||
-    belowAggressiveGate.passesGate ||
+    !stableGate.passesGate ||
+    unstableGate.passesGate ||
+    unstableGate.adaptiveWinRateThreshold <= stableGate.adaptiveWinRateThreshold ||
     negativeEvGate.passesGate
   ) {
     throw new Error("risk profile gate self-test failed");
@@ -3436,10 +3657,11 @@ function runRiskProfileSelfTest() {
     JSON.stringify({
       passed: true,
       gates: {
-        conservativeAt60Pct: conservativeGate.passesGate,
-        aggressiveAt60Pct: aggressiveGate.passesGate,
-        aggressiveBelow60Pct: belowAggressiveGate.passesGate,
-        aggressiveNegativeEv: negativeEvGate.passesGate
+        stableThreshold: stableGate.adaptiveWinRateThreshold,
+        unstableThreshold: unstableGate.adaptiveWinRateThreshold,
+        stablePassed: stableGate.passesGate,
+        unstablePassed: unstableGate.passesGate,
+        negativeEvPassed: negativeEvGate.passesGate
       },
       leverage: {
         conservativeSuggested: conservativeControl.modelSuggestedLeverage,
