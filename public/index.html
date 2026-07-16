@@ -116,21 +116,15 @@
             <h2>消息面</h2>
             <span id="sourceCounts">-</span>
           </div>
-          <form id="whaleAlertForm" class="whale-alert-form" autocomplete="off">
-            <div class="whale-alert-field">
-              <label for="whaleAlertApiKey">Whale Alert API Key</label>
-              <input
-                id="whaleAlertApiKey"
-                name="apiKey"
-                type="password"
-                inputmode="text"
-                spellcheck="false"
-                autocomplete="new-password"
-                placeholder="输入 API Key"
-              />
+          <form id="messageAggregatorForm" class="message-aggregator-form" autocomplete="off">
+            <div class="message-aggregator-field wide-field">
+              <label for="messageFilterKeywords">保留关键词（逗号分隔，留空使用内置市场词表）</label>
+              <input id="messageFilterKeywords" name="filterKeywords" type="text" spellcheck="false" placeholder="比特币,加密货币,美联储,bitcoin,crypto,fed" />
+              <span class="built-in-source-note">RSS 与国内外热榜来源已内置固定，保存时会重新验证全部来源。</span>
             </div>
-            <button id="whaleAlertConnectButton" type="submit">确认连接</button>
-            <div id="whaleAlertStatus" class="whale-alert-status" aria-live="polite">未配置</div>
+            <label class="message-aggregator-toggle"><input id="messageAggregatorEnabled" type="checkbox" checked /> 启用聚合采集</label>
+            <button id="messageAggregatorConnectButton" type="submit">验证来源并保存关键词</button>
+            <div id="messageAggregatorStatus" class="message-aggregator-status" aria-live="polite">未配置</div>
           </form>
           <div id="messages" class="list"></div>
         </section>

@@ -9,10 +9,9 @@ const state = {
   summaryCharts: new Map(),
   translations: {},
   translationRequestKey: "",
-  whaleAlert: null,
-  whaleAlertEditing: false,
-  whaleAlertSubmitting: false,
-  whaleAlertAwaitingEdit: false
+  messageAggregator: null,
+  messageAggregatorEditing: false,
+  messageAggregatorSubmitting: false
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -111,6 +110,7 @@ const text = {
     "\u6a21\u62df\u8d26\u6237\u5df2\u542f\u52a8\uff0c\u4ece\u4e0b\u4e00\u4e2a\u5b8c\u6574\u76d1\u63a7\u8f6e\u6b21\u5f00\u59cb\u63a5\u6536\u5408\u683c\u5f00\u4ed3\u4fe1\u53f7\u3002",
   viewSummary: "\u67e5\u770b\u603b\u7ed3",
   refreshSummary: "\u5237\u65b0\u603b\u7ed3",
+  collapseSummary: "\u6536\u8d77\u603b\u7ed3",
   loadingSummary: "\u8bfb\u53d6\u4e2d...",
   summaryUpdated: "\u603b\u7ed3\u5df2\u66f4\u65b0",
   accountPeriodSummary: "\u8d26\u6237\u9636\u6bb5\u603b\u7ed3"
@@ -190,7 +190,8 @@ function translateWarning(warning) {
     ["Polymarket", "Polymarket \u76d8\u53e3"],
     ["Binance announcements", "Binance \u516c\u544a"],
     ["OKX announcements", "OKX \u516c\u544a"],
-    ["WhaleAlert", "WhaleAlert \u5de8\u9cb8\u76d1\u63a7"]
+    ["WhaleAlert", "WhaleAlert \u5de8\u9cb8\u76d1\u63a7"],
+    ["Message aggregator", "\u6d88\u606f\u805a\u5408\u5668"]
   ]);
   const [rawLabel, ...rest] = value.split(":");
   let label = rawLabel.trim();
@@ -230,19 +231,64 @@ async function postJson(url, body = {}) {
   return data;
 }
 
+function mergeLayerReports(fastReport, slowReport) {
+  const fast = fastReport && typeof fastReport === "object" ? fastReport : {};
+  const slow = slowReport && typeof slowReport === "object" ? slowReport : {};
+  const messageMap = new Map();
+  for (const item of [...asArray(fast.messageFeed), ...asArray(slow.messageFeed)]) {
+    const key = item.storyId || item.url || `${item.source || ""}:${item.title || ""}`;
+    if (!messageMap.has(key)) messageMap.set(key, item);
+  }
+  const messageFeed = [...messageMap.values()]
+    .sort((left, right) => Number(right.impactScore || 0) - Number(left.impactScore || 0))
+    .slice(0, 80);
+  const fastCounts = fast.sourceCounts || {};
+  const slowCounts = slow.sourceCounts || {};
+  return {
+    ...slow,
+    ...fast,
+    layer: "auto",
+    layerReports: {
+      fastGeneratedAt: fast.generatedAt || null,
+      slowGeneratedAt: slow.generatedAt || null
+    },
+    messageFeed,
+    warnings: [...new Set([...asArray(fast.warnings), ...asArray(slow.warnings)])],
+    sourceCounts: {
+      aggregated: slowCounts.aggregated || 0,
+      rss: slowCounts.rss || 0,
+      trend: slowCounts.trend || 0,
+      gdelt: slowCounts.gdelt || 0,
+      polymarket: fastCounts.polymarket || 0,
+      binanceAnnouncements: fastCounts.binanceAnnouncements || 0,
+      okxAnnouncements: fastCounts.okxAnnouncements || 0,
+      whale: fastCounts.whale || 0,
+      rawEvents: Number(fastCounts.rawEvents || 0) + Number(slowCounts.rawEvents || 0),
+      uniqueStories: messageFeed.length,
+      suppressedDuplicates:
+        Number(fastCounts.suppressedDuplicates || 0) + Number(slowCounts.suppressedDuplicates || 0),
+      classifiedEvents:
+        Number(fastCounts.classifiedEvents || 0) + Number(slowCounts.classifiedEvents || 0),
+      marketAnalyses: fastCounts.marketAnalyses || slowCounts.marketAnalyses || 0
+    }
+  };
+}
+
 async function loadData() {
-  const [report, status, log, account, whaleAlert] = await Promise.all([
+  const [fastReport, slowReport, status, log, account, messageAggregator] = await Promise.all([
     getJson("/api/report?layer=fast"),
+    getJson("/api/report?layer=slow"),
     getJson("/api/status"),
     getJson("/api/log?bytes=80000"),
     getJson("/api/account"),
-    getJson("/api/whale-alert/status")
+    getJson("/api/message-aggregator/status")
   ]);
+  const report = mergeLayerReports(fastReport, slowReport);
   state.report = report;
   state.status = status;
   state.log = log.text || "";
   state.account = account;
-  state.whaleAlert = whaleAlert;
+  state.messageAggregator = messageAggregator;
   render();
   loadMessageTranslations(report).catch(() => {
     // Translation failure must not interrupt monitoring or report rendering.
@@ -298,7 +344,7 @@ function renderSummary() {
   const slowStatus = state.status?.slowLoopRunning ? `\u4f4e\u9891 5m ${text.running}` : `\u4f4e\u9891 ${text.stopped}`;
   $("#loopValue").textContent = `${fastStatus} | ${slowStatus}`;
   $("#reportTime").textContent = report.generatedAt || "-";
-  $("#sourceCounts").textContent = `GDELT ${sourceCounts.gdelt || 0} | Polymarket ${sourceCounts.polymarket || 0} | Binance\u516c\u544a ${sourceCounts.binanceAnnouncements || 0} | OKX\u516c\u544a ${sourceCounts.okxAnnouncements || 0} | Whale ${sourceCounts.whale || 0} | \u5e02\u573a\u8ba1\u7b97 ${sourceCounts.marketAnalyses || 0}`;
+  $("#sourceCounts").textContent = `内置 RSS ${sourceCounts.rss || 0} | 热榜 ${sourceCounts.trend || 0} | GDELT ${sourceCounts.gdelt || 0} | Polymarket ${sourceCounts.polymarket || 0} | 交易所公告 ${(sourceCounts.binanceAnnouncements || 0) + (sourceCounts.okxAnnouncements || 0)} | 合并重复 ${sourceCounts.suppressedDuplicates || 0} | 市场计算 ${sourceCounts.marketAnalyses || 0}`;
   $("#warningCount").textContent = asArray(report.warnings).length;
 }
 
@@ -913,7 +959,10 @@ function renderAccountSummary(summary, currency = "USDT", account = {}) {
   container.innerHTML = `
     <div class="account-summary-head">
       <strong>${text.accountPeriodSummary}</strong>
-      ${updatedText}
+      <div class="account-summary-head-actions">
+        ${updatedText}
+        <button class="summary-collapse-button" data-summary-action="collapse" type="button" aria-label="${text.collapseSummary}">${text.collapseSummary}</button>
+      </div>
     </div>
     <div class="account-summary-grid">
       ${metricCell(text.summaryStart, summary.startTime || "-")}
@@ -997,50 +1046,51 @@ function renderMessages() {
     : `<div class="empty">${models.length ? text.noMessagesMath : text.noMessagesNoMarket}</div>`;
 }
 
-function renderWhaleAlertConnection() {
-  const connection = state.whaleAlert || {};
-  const input = $("#whaleAlertApiKey");
-  const button = $("#whaleAlertConnectButton");
-  const status = $("#whaleAlertStatus");
-  if (!input || !button || !status) return;
+function renderMessageAggregatorConnection() {
+  const connection = state.messageAggregator || {};
+  const config = connection.config || {};
+  const filterKeywords = $("#messageFilterKeywords");
+  const enabled = $("#messageAggregatorEnabled");
+  const button = $("#messageAggregatorConnectButton");
+  const status = $("#messageAggregatorStatus");
+  if (!filterKeywords || !enabled || !button || !status) return;
 
-  if (!state.whaleAlertEditing) {
-    input.value = "";
-    input.placeholder = connection.configured
-      ? `已保存 ${connection.maskedKey || "API Key"}`
-      : "输入 API Key";
+  if (!state.messageAggregatorEditing) {
+    filterKeywords.value = Array.isArray(config.filterKeywords) ? config.filterKeywords.join(",") : "";
+    enabled.checked = config.enabled !== false;
   }
 
-  if (state.whaleAlertSubmitting) {
+  if (state.messageAggregatorSubmitting) {
     button.disabled = true;
-    button.textContent = "连接中...";
-    status.className = "whale-alert-status checking";
-    status.textContent = "正在验证 Whale Alert 接口";
-    return;
-  }
-
-  const hasEditedKey = state.whaleAlertEditing && input.value.trim().length > 0;
-  if (connection.connected && !state.whaleAlertEditing) {
-    button.disabled = true;
-    button.textContent = "已连接";
-    button.classList.add("connected");
-    status.className = "whale-alert-status connected";
-    status.textContent = `连接正常 · 最近获取 ${connection.messageCount || 0} 条 · ${connection.checkedAt || "-"}`;
+    button.textContent = "验证中...";
+    status.className = "message-aggregator-status checking";
+    status.textContent = "正在读取并解析全部聚合源";
     return;
   }
 
   button.classList.remove("connected");
-  button.textContent = "确认连接";
-  button.disabled = state.whaleAlertAwaitingEdit || !hasEditedKey;
-  if (connection.error) {
-    status.className = "whale-alert-status error";
+  button.textContent = "验证来源并保存关键词";
+  button.disabled = false;
+  if (state.messageAggregatorEditing) {
+    status.className = "message-aggregator-status editing";
+    status.textContent = "关键词已修改；固定来源验证成功后才会保存";
+    return;
+  }
+  if (connection.enabled === false && connection.configured) {
+    status.className = "message-aggregator-status";
+    status.textContent = "聚合采集已停用；配置仍保留";
+  } else if (connection.connected) {
+    button.classList.add("connected");
+    const connectedSources = asArray(connection.sources).filter((source) => source.connected).length;
+    const totalSources = asArray(connection.sources).length;
+    status.className = connection.degraded ? "message-aggregator-status editing" : "message-aggregator-status connected";
+    status.textContent = `${connection.degraded ? "部分可用" : "连接正常"} · ${connectedSources}/${totalSources} 个源 · 最近 ${connection.messageCount || 0} 条 · ${connection.checkedAt || "-"}`;
+  } else if (connection.error) {
+    status.className = "message-aggregator-status error";
     status.textContent = connection.error;
-  } else if (state.whaleAlertEditing) {
-    status.className = "whale-alert-status editing";
-    status.textContent = "密钥已修改，确认后才会替换当前连接";
   } else {
-    status.className = "whale-alert-status";
-    status.textContent = connection.configured ? "已保存密钥，等待连接验证" : "未配置 Whale Alert";
+    status.className = "message-aggregator-status";
+    status.textContent = connection.configured ? "已保存，等待低频监控轮次采集" : "等待内置来源首次验证";
   }
 }
 
@@ -1054,6 +1104,19 @@ function messageRow(item) {
   const title = item.url
     ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${escapeHtml(translatedTitle)}</a>`
     : escapeHtml(translatedTitle);
+  const metrics = item.metrics || {};
+  const predictionMeta =
+    Number.isFinite(metrics.bullProbability) && Number.isFinite(metrics.bearProbability)
+      ? `多方隐含概率 ${fmtPct(metrics.bullProbability, 1)} / 空方隐含概率 ${fmtPct(metrics.bearProbability, 1)} | 多空比 ${fmtNumber(metrics.bullBearRatio, 2)} | 较上轮 ${metrics.bullProbabilityDelta >= 0 ? "+" : ""}${fmtPct(metrics.bullProbabilityDelta, 1)}`
+      : "";
+  const storyMeta = [
+    item.sourceTier ? `来源等级 T${item.sourceTier}` : "",
+    item.corroborationCount > 1 ? `${item.corroborationCount} 个来源交叉佐证` : "",
+    metrics.rank ? `热榜第 ${metrics.rank}` : "",
+    metrics.rankDelta ? `排名${metrics.rankDelta > 0 ? "上升" : "下降"} ${Math.abs(metrics.rankDelta)}` : ""
+  ]
+    .filter(Boolean)
+    .join(" | ");
   return `
     <div class="row">
       <div>
@@ -1062,6 +1125,8 @@ function messageRow(item) {
       </div>
       <div>
         <div>${title}</div>
+        ${predictionMeta ? `<div class="row-meta">${escapeHtml(predictionMeta)}</div>` : ""}
+        ${storyMeta ? `<div class="row-meta">${escapeHtml(storyMeta)}</div>` : ""}
         ${translatedDetail ? `<div class="row-meta">${escapeHtml(translatedDetail)}</div>` : ""}
       </div>
       <div>${dir}</div>
@@ -1086,6 +1151,10 @@ function translateMessageDetail(item, translatedTitle) {
     .replace(/\bliquidity=/gi, "流动性=")
     .replace(/\byes=/gi, "赞成概率=")
     .replace(/\bdelta=/gi, "价格变化=")
+    .replace(/\bbull=/gi, "多方隐含概率=")
+    .replace(/\bbear=/gi, "空方隐含概率=")
+    .replace(/\bbullBearRatio=/gi, "多空比=")
+    .replace(/\bbullDelta=/gi, "多方概率变化=")
     .replace(/\bmarket cap=/gi, "市值=")
     .replace(/\bopen interest=/gi, "未平仓量=");
 }
@@ -1229,7 +1298,7 @@ function render() {
   renderSummary();
   renderAccount();
   renderSignals();
-  renderWhaleAlertConnection();
+  renderMessageAggregatorConnection();
   renderMessages();
   renderWarnings();
   renderModels();
@@ -1238,39 +1307,39 @@ function render() {
 
 function bindEvents() {
   $("#refreshButton").addEventListener("click", () => loadData().catch(showError));
-  $("#whaleAlertApiKey").addEventListener("input", () => {
-    state.whaleAlertEditing = true;
-    state.whaleAlertAwaitingEdit = false;
-    state.whaleAlert = {
-      ...(state.whaleAlert || {}),
-      error: null,
-      errorCode: null
-    };
-    renderWhaleAlertConnection();
-  });
-  $("#whaleAlertForm").addEventListener("submit", async (event) => {
+  for (const selector of ["#messageFilterKeywords", "#messageAggregatorEnabled"]) {
+    $(selector).addEventListener("input", () => {
+      state.messageAggregatorEditing = true;
+      state.messageAggregator = {
+        ...(state.messageAggregator || {}),
+        error: null,
+        errorCode: null
+      };
+      renderMessageAggregatorConnection();
+    });
+  }
+  $("#messageAggregatorForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const input = $("#whaleAlertApiKey");
-    const apiKey = input.value.trim();
-    if (!apiKey || state.whaleAlertSubmitting) return;
-    state.whaleAlertSubmitting = true;
-    renderWhaleAlertConnection();
+    if (state.messageAggregatorSubmitting) return;
+    state.messageAggregatorSubmitting = true;
+    renderMessageAggregatorConnection();
     try {
-      state.whaleAlert = await postJson("/api/whale-alert/connect", { apiKey });
-      state.whaleAlertEditing = false;
-      state.whaleAlertAwaitingEdit = false;
-      input.value = "";
+      state.messageAggregator = await postJson("/api/message-aggregator/config", {
+        enabled: $("#messageAggregatorEnabled").checked,
+        filterKeywords: $("#messageFilterKeywords").value,
+        maxItemsPerSource: 15
+      });
+      state.messageAggregatorEditing = false;
     } catch (error) {
-      state.whaleAlert = {
-        ...(state.whaleAlert || {}),
+      state.messageAggregator = {
+        ...(state.messageAggregator || {}),
         connected: false,
         errorCode: error.code,
         error: error.message
       };
-      state.whaleAlertAwaitingEdit = true;
     } finally {
-      state.whaleAlertSubmitting = false;
-      renderWhaleAlertConnection();
+      state.messageAggregatorSubmitting = false;
+      renderMessageAggregatorConnection();
     }
   });
   $("#accountForm").addEventListener("submit", async (event) => {
@@ -1329,6 +1398,13 @@ function bindEvents() {
       button.disabled = false;
       button.textContent = state.summaryVisible ? text.refreshSummary : text.viewSummary;
     }
+  });
+  $("#accountSummary").addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target.closest('[data-summary-action="collapse"]') : null;
+    if (!target) return;
+    state.summaryVisible = false;
+    renderAccount();
+    $("#summaryButton").focus();
   });
   $("#accountMarketType").addEventListener("change", () => {
     const spot = $("#accountMarketType").value === "spot";
