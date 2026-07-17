@@ -73,8 +73,7 @@ const DEFAULT_SYMBOLS = [
   "ARBUSDT",
   "OPUSDT",
   "INJUSDT",
-  "SUIUSDT",
-  "TONUSDT"
+  "SUIUSDT"
 ];
 
 const SYMBOLS = (process.env.SIGNAL_MONITOR_SYMBOLS || DEFAULT_SYMBOLS.join(","))
@@ -133,6 +132,8 @@ const FETCH_IMPL = (process.env.SIGNAL_MONITOR_FETCH_IMPL || "auto")
   .toLowerCase();
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.SIGNAL_MONITOR_TIMEOUT_MS, 8_000);
 const MARKET_CONCURRENCY = toPositiveInt(process.env.SIGNAL_MONITOR_MARKET_CONCURRENCY, 6);
+const GDELT_ENABLED = process.env.SIGNAL_MONITOR_GDELT_ENABLED !== "false";
+const WHALE_ALERT_ENABLED = process.env.WHALE_ALERT_ENABLED !== "false";
 const OPEN_SIGNAL_MAX_AGE_MS = 72 * 60 * 60 * 1000;
 const MIN_HIGH_EXPECTANCY_R = 0.25;
 const MIN_EV_PCT = 0;
@@ -1015,15 +1016,30 @@ function writeMessageAggregatorStatus(value) {
 }
 
 async function firstSuccessful(label, fetchers) {
-  const results = await Promise.allSettled(fetchers.map((fetcher) => fetcher()));
-  for (const result of results) {
-    if (result.status === "fulfilled" && Array.isArray(result.value) && result.value.length) {
-      return result.value;
+  const reasons = [];
+  for (const fetcher of fetchers) {
+    try {
+      const value = await fetcher();
+      if (Array.isArray(value) && value.length) return value;
+      reasons.push("empty response");
+    } catch (error) {
+      reasons.push(error instanceof Error ? error.message : String(error));
     }
   }
-  const reasons = results
-    .filter((result) => result.status === "rejected")
-    .map((result) => (result.reason instanceof Error ? result.reason.message : String(result.reason)));
+  throw new Error(`${label} unavailable: ${reasons.join(" | ") || "empty response"}`);
+}
+
+async function firstSuccessfulNumber(label, fetchers) {
+  const reasons = [];
+  for (const fetcher of fetchers) {
+    try {
+      const value = Number(await fetcher());
+      if (Number.isFinite(value)) return value;
+      reasons.push("empty response");
+    } catch (error) {
+      reasons.push(error instanceof Error ? error.message : String(error));
+    }
+  }
   throw new Error(`${label} unavailable: ${reasons.join(" | ") || "empty response"}`);
 }
 
@@ -1044,8 +1060,8 @@ async function fetchOkxKlines(symbol, interval, limit) {
 
 async function fetchCandles(symbol, interval, limit) {
   return firstSuccessful(`${symbol} ${interval} candles`, [
-    () => fetchBinanceKlines(symbol, interval, limit),
-    () => fetchOkxKlines(symbol, interval, limit)
+    () => fetchOkxKlines(symbol, interval, limit),
+    () => fetchBinanceKlines(symbol, interval, limit)
   ]);
 }
 
@@ -1057,6 +1073,36 @@ async function fetchBinanceOpenInterest(symbol) {
 async function fetchBinanceFunding(symbol) {
   const data = await fetchJson(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`);
   return safeNumber(data?.lastFundingRate);
+}
+
+async function fetchOkxOpenInterest(symbol) {
+  const instId = symbol.replace("USDT", "-USDT-SWAP");
+  const data = await fetchJson(
+    `https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${instId}`
+  );
+  return Number(data?.data?.[0]?.oi);
+}
+
+async function fetchOkxFunding(symbol) {
+  const instId = symbol.replace("USDT", "-USDT-SWAP");
+  const data = await fetchJson(
+    `https://www.okx.com/api/v5/public/funding-rate-history?instId=${instId}&limit=1`
+  );
+  return Number(data?.data?.[0]?.fundingRate);
+}
+
+async function fetchOpenInterest(symbol) {
+  return firstSuccessfulNumber(`${symbol} open interest`, [
+    () => fetchOkxOpenInterest(symbol),
+    () => fetchBinanceOpenInterest(symbol)
+  ]);
+}
+
+async function fetchFunding(symbol) {
+  return firstSuccessfulNumber(`${symbol} funding`, [
+    () => fetchOkxFunding(symbol),
+    () => fetchBinanceFunding(symbol)
+  ]);
 }
 
 function normalizeText(value) {
@@ -1154,9 +1200,17 @@ async function fetchGdeltNews() {
 
 async function fetchPolymarketMarkets(state) {
   const url =
-    "https://gamma-api.polymarket.com/markets?closed=false&active=true&archived=false&limit=100&order=volume_24hr&ascending=false";
-  const data = await fetchJson(url);
-  const rows = Array.isArray(data) ? data : [];
+    "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=10";
+  const data = await fetchJson(url, { timeoutMs: Math.max(20_000, REQUEST_TIMEOUT_MS) });
+  const rows = Array.isArray(data)
+    ? [...data]
+        .sort(
+          (left, right) =>
+            safeNumber(right?.volume24hr, safeNumber(right?.volume)) -
+            safeNumber(left?.volume24hr, safeNumber(left?.volume))
+        )
+        .flatMap((event) => (Array.isArray(event?.markets) ? event.markets : []))
+    : [];
   const discovered = rows.slice(0, 30);
   const discoveredIds = new Set(
     discovered.map((market) => String(market.id || market.conditionId || market.slug || market.question))
@@ -1447,13 +1501,13 @@ async function fetchMessageAggregator() {
 
 async function fetchWhaleAlertIfConfigured() {
   const apiKey = readWhaleAlertApiKey();
-  if (!apiKey) {
+  if (!WHALE_ALERT_ENABLED || !apiKey) {
     writeWhaleAlertStatus({
-      configured: false,
+      configured: Boolean(apiKey),
       connected: false,
       messageCount: 0,
-      errorCode: "not_configured",
-      error: "未配置 Whale Alert API Key。"
+      errorCode: WHALE_ALERT_ENABLED ? "not_configured" : "disabled",
+      error: WHALE_ALERT_ENABLED ? "未配置 Whale Alert API Key。" : "Whale Alert 已由聚合消息源替代。"
     });
     return {
       items: [],
@@ -2919,8 +2973,8 @@ async function analyzeSymbol(symbol, state) {
   const [candles15m, candles1h, fundingRate, openInterest] = await Promise.all([
     fetchCandles(symbol, "15m", 120),
     fetchCandles(symbol, "1h", 120),
-    fetchWithFallback(`${symbol} funding`, () => fetchBinanceFunding(symbol), 0),
-    fetchWithFallback(`${symbol} open interest`, () => fetchBinanceOpenInterest(symbol), 0)
+    fetchWithFallback(`${symbol} funding`, () => fetchFunding(symbol), 0),
+    fetchWithFallback(`${symbol} open interest`, () => fetchOpenInterest(symbol), 0)
   ]);
   const warnings = [];
   if (fundingRate?.sourceFailure) warnings.push(fundingRate.sourceFailure);
@@ -3137,7 +3191,7 @@ async function main() {
   const [aggregatorResult, gdeltNewsResult, polymarketResult, binanceAnnouncementsResult, okxAnnouncementsResult, whaleResult] =
     await Promise.all([
       fetchMessageAggregator(),
-      fetchWithFallback("GDELT", fetchGdeltNews, []),
+      GDELT_ENABLED ? fetchWithFallback("GDELT", fetchGdeltNews, []) : Promise.resolve([]),
       fetchWithFallback("Polymarket", () => fetchPolymarketMarkets(state), []),
       fetchWithFallback("Binance announcements", fetchBinanceAnnouncements, []),
       fetchWithFallback("OKX announcements", fetchOkxAnnouncements, []),

@@ -10,3 +10,9 @@ Thumbs.db
 .idea/
 .vscode/
 coverage/
+
+# Local-only server access helpers contain deployment-specific host details.
+/tools/open-server-dashboard.ps1
+/tools/stop-server-dashboard.ps1
+/打开服务器前端.cmd
+/关闭服务器前端隧道.cmd

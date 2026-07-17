@@ -1105,6 +1105,7 @@ function renderPerformanceCharts(analytics, currency) {
 
 function renderAccountSummary(summary, currency = "USDT", account = {}) {
   const container = $("#accountSummary");
+  if (!container) return;
   container.hidden = !state.summaryVisible;
   $("#summaryButton").textContent = state.summaryVisible ? text.refreshSummary : text.viewSummary;
   disposeSummaryCharts();
@@ -1232,8 +1233,10 @@ function renderMessageAggregatorConnection() {
   button.textContent = "验证来源并保存关键词";
   button.disabled = false;
   if (state.messageAggregatorEditing) {
-    status.className = "message-aggregator-status editing";
-    status.textContent = "关键词已修改；固定来源验证成功后才会保存";
+    status.className = `message-aggregator-status ${connection.error ? "error" : "editing"}`;
+    status.textContent = connection.error
+      ? `验证失败，配置未保存：${connection.error}`
+      : "关键词已修改；固定来源验证成功后才会保存";
     return;
   }
   if (connection.enabled === false && connection.configured) {
@@ -1567,7 +1570,7 @@ function bindEvents() {
       showError(error);
     }
   });
-  $("#postTradeReviewForm").addEventListener("submit", async (event) => {
+  $("#postTradeReviewForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (state.postTradeReviewSubmitting) return;
     state.postTradeReviewSubmitting = true;
@@ -1586,7 +1589,7 @@ function bindEvents() {
       renderAccount();
     }
   });
-  $("#applyReviewCandidateButton").addEventListener("click", async () => {
+  $("#applyReviewCandidateButton")?.addEventListener("click", async () => {
     if (state.postTradeReviewSubmitting) return;
     state.postTradeReviewSubmitting = true;
     renderAccount();
@@ -1600,7 +1603,7 @@ function bindEvents() {
       renderAccount();
     }
   });
-  $("#rollbackReviewWeightsButton").addEventListener("click", async () => {
+  $("#rollbackReviewWeightsButton")?.addEventListener("click", async () => {
     if (state.postTradeReviewSubmitting) return;
     state.postTradeReviewSubmitting = true;
     renderAccount();
@@ -1636,25 +1639,9 @@ function bindEvents() {
     }
   });
   $("#summaryButton").addEventListener("click", async () => {
-    const button = $("#summaryButton");
-    button.disabled = true;
-    button.textContent = text.loadingSummary;
-    try {
-      const data = await getJson("/api/account/summary");
-      state.account = { config: data.config, account: data.account };
-      state.summaryVisible = true;
-      state.summaryFetchedAt = new Date().toLocaleString("zh-CN", { hour12: false });
-      render();
-      renderAccountSummary(data.summary, data.config?.quoteCurrency || "USDT", data.account);
-      $("#accountSummary").scrollIntoView({ behavior: "smooth", block: "nearest" });
-    } catch (error) {
-      showError(error);
-    } finally {
-      button.disabled = false;
-      button.textContent = state.summaryVisible ? text.refreshSummary : text.viewSummary;
-    }
+    window.location.href = "/summary.html";
   });
-  $("#accountSummary").addEventListener("click", (event) => {
+  $("#accountSummary")?.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest('[data-summary-action="collapse"]') : null;
     if (!target) return;
     state.summaryVisible = false;

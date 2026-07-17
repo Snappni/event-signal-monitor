@@ -56,6 +56,42 @@ child.stderr.on("data", (chunk) => {
 
 try {
   await waitForDashboard(baseUrl, child);
+  const [indexResponse, summaryPageResponse, reviewPageResponse, appScriptResponse, summaryScriptResponse, reviewScriptResponse, echartsResponse] =
+    await Promise.all([
+      fetch(baseUrl),
+      fetch(`${baseUrl}/summary.html`),
+      fetch(`${baseUrl}/review.html`),
+      fetch(`${baseUrl}/app.js`),
+      fetch(`${baseUrl}/summary.js`),
+      fetch(`${baseUrl}/review.js`),
+      fetch(`${baseUrl}/vendor/echarts.min.js`)
+    ]);
+  for (const response of [indexResponse, summaryPageResponse, reviewPageResponse, appScriptResponse, summaryScriptResponse, reviewScriptResponse, echartsResponse]) {
+    assert.equal(response.status, 200);
+  }
+  const [indexHtml, summaryHtml, reviewHtml, appScript, summaryScript, reviewScript] = await Promise.all([
+    indexResponse.text(),
+    summaryPageResponse.text(),
+    reviewPageResponse.text(),
+    appScriptResponse.text(),
+    summaryScriptResponse.text(),
+    reviewScriptResponse.text()
+  ]);
+  for (const id of ["accountCapital", "accountMarketType", "accountMaxLeverage", "accountRiskProfile", "startAccountButton", "saveAccountButton", "resetAccountButton", "summaryButton", "messageFilterKeywords", "messageAggregatorEnabled", "messageAggregatorConnectButton"]) {
+    assert.ok(indexHtml.includes(`id="${id}"`), `missing main-page control ${id}`);
+  }
+  assert.ok(summaryHtml.includes('src="/vendor/echarts.min.js"'));
+  assert.ok(summaryHtml.includes('id="refreshSummary"'));
+  for (const id of ["reviewEveryTrades", "reviewAutoApply", "applyCandidate", "rollbackWeights", "refreshReview"]) {
+    assert.ok(reviewHtml.includes(`id="${id}"`), `missing review-page control ${id}`);
+  }
+  for (const binding of ["messageAggregatorForm", "accountForm", "resetAccountButton", "startAccountButton", "summaryButton", "accountMarketType"]) {
+    assert.ok(appScript.includes(`$("#${binding}")`), `missing main-page event binding ${binding}`);
+  }
+  assert.ok(summaryScript.includes('$("#refreshSummary").addEventListener("click", loadSummary)'));
+  for (const binding of ["reviewForm", "applyCandidate", "rollbackWeights", "refreshReview"]) {
+    assert.ok(reviewScript.includes(`$("#${binding}").addEventListener`), `missing review-page event binding ${binding}`);
+  }
   const requested = {
     initialCapital: 25_000,
     marketType: "futures",
@@ -92,7 +128,34 @@ try {
   assert.equal(secondStart.config.maxLeverage, requested.maxLeverage);
   assert.equal(secondStart.account.sessionId, started.account.sessionId);
 
-  console.log("dashboard account start configuration test passed");
+  const resetResponse = await fetch(`${baseUrl}/api/account/reset`, { method: "POST" });
+  assert.equal(resetResponse.status, 200);
+  const reset = await resetResponse.json();
+  assert.equal(reset.config.initialCapital, requested.initialCapital);
+  assert.equal(reset.account.isActive, false);
+  assert.notEqual(reset.account.sessionId, started.account.sessionId);
+
+  const reviewConfigResponse = await fetch(`${baseUrl}/api/post-trade-review/config`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: true, reviewEveryTrades: 12, autoApplyValidatedWeights: true })
+  });
+  assert.equal(reviewConfigResponse.status, 200);
+  const reviewConfig = await reviewConfigResponse.json();
+  assert.equal(reviewConfig.account.postTradeReviewConfig.reviewEveryTrades, 12);
+  assert.equal(reviewConfig.account.postTradeReviewConfig.autoApplyValidatedWeights, true);
+
+  const reviewStateResponse = await fetch(`${baseUrl}/api/post-trade-review`);
+  const reviewState = await reviewStateResponse.json();
+  assert.equal(reviewState.config.reviewEveryTrades, 12);
+  assert.equal(reviewState.config.autoApplyValidatedWeights, true);
+
+  const applyResponse = await fetch(`${baseUrl}/api/post-trade-review/apply`, { method: "POST" });
+  const rollbackResponse = await fetch(`${baseUrl}/api/post-trade-review/rollback`, { method: "POST" });
+  assert.equal(applyResponse.status, 409);
+  assert.equal(rollbackResponse.status, 409);
+
+  console.log("dashboard controls and account actions test passed");
 } finally {
   child.kill();
   await new Promise((resolve) => {

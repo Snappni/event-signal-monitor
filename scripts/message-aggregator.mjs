@@ -80,7 +80,9 @@ export const BUILT_IN_RSS_FEEDS = Object.freeze(
     ["CNBC Markets", "https://www.cnbc.com/id/10000664/device/rss/rss.html"],
     ["CNBC World", "https://www.cnbc.com/id/100727362/device/rss/rss.html"],
     ["CNBC Economy", "https://www.cnbc.com/id/20910258/device/rss/rss.html"]
-  ].map(([name, url]) => Object.freeze({ name, url }))
+  ]
+    .filter(([name]) => process.env.MESSAGE_CFTC_ENABLED !== "false" || !name.startsWith("CFTC "))
+    .map(([name, url]) => Object.freeze({ name, url }))
 );
 
 const NEWSNOW_API_BASE = "https://newsnow.busiyi.world/api/s";

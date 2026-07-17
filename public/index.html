@@ -17,6 +17,8 @@
         </div>
       </div>
       <div class="toolbar">
+        <a class="toolbar-link" href="/summary.html">账户总结</a>
+        <a class="toolbar-link" href="/review.html">迭代复盘</a>
         <button id="refreshButton" type="button">刷新</button>
       </div>
     </header>
@@ -83,7 +85,7 @@
               <button id="startAccountButton" class="primary-action" type="button">启动模拟</button>
               <button id="saveAccountButton" type="submit">仅保存并重置</button>
               <button id="resetAccountButton" type="button">重置账户</button>
-              <button id="summaryButton" type="button">查看总结</button>
+              <button id="summaryButton" type="button">打开总结页</button>
             </div>
           </form>
           <div class="account-metrics" id="accountMetrics"></div>
@@ -100,32 +102,10 @@
           </div>
         </div>
         <div id="accountPositions" class="position-list"></div>
-        <section class="post-trade-review-workbench">
-          <div class="review-heading">
-            <div>
-              <strong>交易后复盘与模型迭代</strong>
-              <span>按已平仓交易批量追踪完整链路，候选权重必须先通过按时间切分的影子验证</span>
-            </div>
-            <span id="postTradeReviewStatus" class="review-status">等待交易样本</span>
-          </div>
-          <form id="postTradeReviewForm" class="review-config-form">
-            <label>
-              <span>每完成多少笔交易复盘</span>
-              <input id="reviewEveryTrades" type="number" min="5" max="500" step="1" value="20" />
-            </label>
-            <label class="review-checkbox">
-              <input id="reviewAutoApply" type="checkbox" />
-              <span>验证通过后自动应用候选权重（仅模拟账户）</span>
-            </label>
-            <div class="review-actions">
-              <button id="saveReviewConfigButton" type="submit">保存复盘设置</button>
-              <button id="applyReviewCandidateButton" type="button">应用已验证候选</button>
-              <button id="rollbackReviewWeightsButton" type="button">回滚上一版权重</button>
-            </div>
-          </form>
-          <div id="postTradeReview" class="post-trade-review"></div>
-        </section>
-        <div id="accountSummary" class="account-summary"></div>
+        <div class="account-page-links">
+          <a href="/summary.html">查看账户阶段总结与图表</a>
+          <a href="/review.html">查看交易链路与模型迭代</a>
+        </div>
       </section>
 
       <section class="panel">
@@ -188,7 +168,6 @@
       </section>
     </main>
 
-    <script src="/vendor/echarts.min.js"></script>
     <script src="/app.js" type="module"></script>
   </body>
 </html>

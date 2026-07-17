@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>账户总结 | 事件信号监控引擎</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">ES</div>
+        <div><span class="eyebrow">ACCOUNT ANALYTICS</span><h1>账户阶段总结</h1><p id="subtitle">读取已缓存的模拟账户数据</p></div>
+      </div>
+      <div class="toolbar">
+        <a class="toolbar-link" href="/">主监控</a>
+        <a class="toolbar-link" href="/review.html">迭代复盘</a>
+        <button id="refreshSummary" type="button">刷新总结</button>
+      </div>
+    </header>
+    <main class="focused-page">
+      <section class="panel progress-panel" aria-labelledby="summaryProgressLabel">
+        <div class="progress-copy"><strong id="summaryProgressLabel">准备读取</strong><span id="summaryElapsed">0 ms</span></div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="summaryProgressBar" class="progress-value"></div>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="section-title"><h2>精确指标</h2><span id="summaryUpdatedAt">-</span></div>
+        <div id="summaryMetrics" class="account-summary-grid"></div>
+      </section>
+      <section class="panel">
+        <div class="section-title"><h2>图表总览</h2><span id="curveMeta">-</span></div>
+        <div class="analytics-grid summary-analytics-grid">
+          <section class="chart-panel chart-panel-wide">
+            <div class="chart-heading">
+              <div><strong>净值与累计收益</strong><span>判断最终是否赚钱及收益路径是否稳定</span></div>
+              <div class="chart-key"><span><i style="--key-color:#44d3a5"></i>账户净值</span><span><i style="--key-color:#5ea7ff"></i>累计收益率</span></div>
+            </div>
+            <div id="equityChart" class="chart-canvas" aria-label="净值与累计收益图"></div>
+          </section>
+          <section class="chart-panel chart-panel-wide">
+            <div class="chart-heading">
+              <div><strong>动态回撤与滚动夏普</strong><span>30 个净值点滚动计算，非年化</span></div>
+              <div class="chart-key"><span><i style="--key-color:#ff6b6b"></i>动态回撤</span><span><i style="--key-color:#f2b84b"></i>滚动夏普</span></div>
+            </div>
+            <div id="riskChart" class="chart-canvas" aria-label="动态回撤与滚动夏普图"></div>
+          </section>
+          <section class="chart-panel chart-panel-wide">
+            <div class="chart-heading">
+              <div><strong>逐笔交易与累计净盈亏</strong><span>用于识别收益是否依赖少数异常交易</span></div>
+              <div class="chart-key"><span><i style="--key-color:#44d3a5"></i>单笔净盈亏</span><span><i style="--key-color:#5ea7ff"></i>累计净盈亏</span></div>
+            </div>
+            <div id="tradeChart" class="chart-canvas" aria-label="逐笔交易与累计净盈亏图"></div>
+          </section>
+          <section class="chart-panel">
+            <div class="chart-heading"><div><strong>成本侵蚀</strong><span>手续费、滑点估算与资金费率净额</span></div></div>
+            <div id="costChart" class="chart-canvas compact-chart" aria-label="交易成本图"></div>
+          </section>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="section-title"><h2>交易质量</h2><span>按全部已平仓样本精确计算</span></div>
+        <div id="qualityMetrics" class="account-summary-grid"></div>
+      </section>
+      <section class="panel">
+        <div class="section-title"><h2>最近已平仓交易</h2><span>最多显示 20 笔</span></div>
+        <div id="recentTrades" class="summary-trades"></div>
+      </section>
+      <p class="page-disclaimer">总结描述现有模拟样本，不构成未来盈利证据。图形会做保留极值的限点显示；上方数值指标始终使用全部样本。</p>
+    </main>
+    <script src="/vendor/echarts.min.js"></script>
+    <script src="/summary.js" type="module"></script>
+  </body>
+</html>

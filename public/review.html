@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>迭代复盘 | 事件信号监控引擎</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark" aria-hidden="true">ES</div><div><span class="eyebrow">POST-TRADE REVIEW</span><h1>交易链路与模型迭代</h1><p id="subtitle">只用具备开仓因子快照的已平仓交易</p></div></div>
+      <div class="toolbar"><a class="toolbar-link" href="/">主监控</a><a class="toolbar-link" href="/summary.html">账户总结</a><button id="refreshReview" type="button">刷新复盘</button></div>
+    </header>
+    <main class="focused-page">
+      <section class="panel post-trade-review-workbench">
+        <div class="review-heading"><div><strong>迭代控制</strong><span>候选方向权重必须通过后段时间样本验证后才能应用</span></div><span id="reviewStatus" class="review-status">读取中</span></div>
+        <form id="reviewForm" class="review-config-form">
+          <label><span>每完成多少笔交易复盘</span><input id="reviewEveryTrades" type="number" min="5" max="500" step="1" value="20" /></label>
+          <label class="review-checkbox"><input id="reviewAutoApply" type="checkbox" /><span>验证通过后自动应用候选权重（仅模拟账户）</span></label>
+          <div class="review-actions"><button type="submit">保存复盘设置</button><button id="applyCandidate" type="button">应用已验证候选</button><button id="rollbackWeights" type="button">回滚上一版权重</button></div>
+        </form>
+      </section>
+      <section class="panel"><div class="section-title"><h2>复盘概览</h2><span id="reviewUpdatedAt">-</span></div><div id="reviewOverview" class="review-overview"></div></section>
+      <section class="panel"><div class="section-title"><h2>训练 / 验证</h2><span>严格按时间顺序切分</span></div><div id="validationMetrics" class="review-validation"></div></section>
+      <section class="panel"><div class="section-title"><h2>因子归因与候选权重</h2><span>关联不等于因果</span></div><div id="factorRows"></div></section>
+      <section class="panel"><div class="section-title"><h2>最近交易完整链路</h2><span>最多显示 20 笔</span></div><div id="reviewTrades"></div></section>
+      <p class="page-disclaimer">无证据表明历史样本中胜出的权重一定提高未来盈利；自动应用仅作用于模拟账户。</p>
+    </main>
+    <script src="/review.js" type="module"></script>
+  </body>
+</html>
