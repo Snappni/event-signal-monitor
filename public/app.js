@@ -12,10 +12,15 @@ const state = {
   messageAggregator: null,
   messageAggregatorEditing: false,
   messageAggregatorSubmitting: false,
-  postTradeReviewSubmitting: false
+  postTradeReviewSubmitting: false,
+  rawLogVisible: false
 };
 
 const $ = (selector) => document.querySelector(selector);
+const setText = (selector, value) => {
+  const element = $(selector);
+  if (element) element.textContent = value;
+};
 
 const text = {
   running: "\u8fd0\u884c\u4e2d",
@@ -269,9 +274,11 @@ async function loadData() {
   state.account = account;
   state.messageAggregator = messageAggregator;
   render();
-  loadMessageTranslations(report).catch(() => {
-    // Translation failure must not interrupt monitoring or report rendering.
-  });
+  if ($("#messages")) {
+    loadMessageTranslations(report).catch(() => {
+      // Translation failure must not interrupt monitoring or report rendering.
+    });
+  }
 }
 
 async function loadMessageTranslations(report) {
@@ -313,29 +320,33 @@ function renderSummary() {
   const watchlist = asArray(report.watchlist);
   const messages = asArray(report.messageFeed);
   const models = asArray(report.modelCalculations);
-  $("#subtitle").textContent = `${report.mode || "paper-alert-only"} | ${report.generatedAt || "-"}`;
-  $("#layerValue").textContent = "统一高频";
-  $("#actionableValue").textContent = actionable.length;
-  $("#watchValue").textContent = watchlist.length;
-  $("#messageValue").textContent = messages.length;
-  $("#modelValue").textContent = models.length;
+  setText("#subtitle", `${report.mode || "paper-alert-only"} | ${report.generatedAt || "-"}`);
+  setText("#pageDataTime", report.generatedAt || "-");
+  setText("#layerValue", "统一高频");
+  setText("#actionableValue", actionable.length);
+  setText("#watchValue", watchlist.length);
+  setText("#messageValue", messages.length);
+  setText("#modelValue", models.length);
+  const loopInterval = Math.max(1, Number(state.status?.loopIntervalSeconds || 10));
   const loopStatus = state.status?.loopRunning
-    ? `统一高频 1m ${text.running}`
+    ? `统一高频 ${loopInterval}s ${text.running}`
     : `统一高频 ${text.stopped}`;
-  $("#loopValue").textContent = loopStatus;
-  $("#reportTime").textContent = report.generatedAt || "-";
-  $("#sourceCounts").textContent = `内置 RSS ${sourceCounts.rss || 0} | 热榜 ${sourceCounts.trend || 0} | GDELT ${sourceCounts.gdelt || 0} | Polymarket ${sourceCounts.polymarket || 0} | 交易所公告 ${(sourceCounts.binanceAnnouncements || 0) + (sourceCounts.okxAnnouncements || 0)} | 合并重复 ${sourceCounts.suppressedDuplicates || 0} | 市场计算 ${sourceCounts.marketAnalyses || 0}`;
-  $("#warningCount").textContent = asArray(report.warnings).length;
+  setText("#loopValue", loopStatus);
+  setText("#reportTime", report.generatedAt || "-");
+  setText("#sourceCounts", `内置 RSS ${sourceCounts.rss || 0} | 热榜 ${sourceCounts.trend || 0} | GDELT ${sourceCounts.gdelt || 0} | Polymarket ${sourceCounts.polymarket || 0} | 交易所公告 ${(sourceCounts.binanceAnnouncements || 0) + (sourceCounts.okxAnnouncements || 0)} | 合并重复 ${sourceCounts.suppressedDuplicates || 0} | 市场计算 ${sourceCounts.marketAnalyses || 0}`);
+  setText("#warningCount", asArray(report.warnings).length);
 }
 
 function renderSignals() {
+  const target = $("#signals");
+  if (!target) return;
   const report = state.report || {};
   const rows = [];
   for (const signal of asArray(report.actionableSignals)) rows.push(signalRow(signal, text.opening, "ok"));
   for (const signal of asArray(report.activeSignals)) rows.push(signalRow(signal, text.tracking, "warn"));
   for (const signal of asArray(report.closedSignals)) rows.push(signalRow(signal, signal.outcome || text.closed, signal.outcome === "TP" ? "ok" : "danger"));
   for (const signal of asArray(report.watchlist).slice(0, 6)) rows.push(signalRow(signal, text.watch, ""));
-  $("#signals").innerHTML = rows.length ? rows.join("") : `<div class="empty">${text.noSignals}</div>`;
+  target.innerHTML = rows.length ? rows.join("") : `<div class="empty">${text.noSignals}</div>`;
 }
 
 function signalRow(signal, label, badgeType) {
@@ -393,11 +404,13 @@ function metricCell(label, value, className = "") {
 }
 
 function renderAccount() {
+  if (!$("#accountForm") || !$("#accountMetrics")) return;
   const { config, account } = getAccountBundle();
   const currency = config.quoteCurrency || "USDT";
   const marketType = config.marketType === "spot" ? "spot" : "futures";
   const riskProfile = config.riskProfile === "aggressive" ? "aggressive" : "conservative";
   const returnPct = account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0;
+  const valueTone = (value) => (Number(value) > 0 ? "metric-positive" : Number(value) < 0 ? "metric-negative" : "");
 
   setInputValueIfUnfocused($("#accountCapital"), config.initialCapital ?? 10000);
   setInputValueIfUnfocused($("#accountMarketType"), marketType);
@@ -412,35 +425,33 @@ function renderAccount() {
   $("#accountUpdatedAt").textContent = `${text.paperOnly} ${account.updatedAt || config.updatedAt || "-"}`;
 
   $("#accountMetrics").innerHTML = [
-    metricCell(text.accountStatus, accountActive ? text.accountRunning : text.accountIdle),
-    metricCell(text.marketType, marketType === "spot" ? text.spot : text.futures),
-    metricCell(text.riskProfile, riskProfile === "aggressive" ? text.aggressive : text.conservative),
-    metricCell(
-      text.entryGate,
-      "自适应：成本保本胜率 + 校准/波动/行情状态裕量"
-    ),
+    metricCell(text.accountEquity, fmtMoney(account.equity, currency), "metric-primary"),
+    metricCell(text.accountReturn, fmtPct(returnPct, 2), `metric-primary ${valueTone(returnPct)}`),
+    metricCell(text.unrealizedPnl, fmtMoney(account.unrealizedPnl, currency), `metric-primary ${valueTone(account.unrealizedPnl)}`),
+    metricCell(text.availableEquity, fmtMoney(account.availableEquity, currency), "metric-primary"),
+    metricCell(text.accountStatus, accountActive ? text.accountRunning : text.accountIdle, accountActive ? "metric-status" : ""),
+    metricCell(text.realizedPnl, fmtMoney(account.realizedPnl, currency), valueTone(account.realizedPnl)),
+    metricCell(text.marginUsed, fmtMoney(account.marginUsed, currency)),
+    metricCell(text.tradingFees, fmtMoney(account.tradingFees || 0, currency)),
+    metricCell(text.slippageCost, fmtMoney(account.slippageCost || 0, currency)),
+    metricCell(text.fundingPnl, fmtMoney(account.fundingPnl || 0, currency), valueTone(account.fundingPnl)),
+    metricCell(text.marketType, marketType === "spot" ? text.spot : text.futures, "metric-policy"),
+    metricCell(text.riskProfile, riskProfile === "aggressive" ? text.aggressive : text.conservative, "metric-policy"),
+    metricCell(text.leverageCap, `${fmtNumber(config.maxLeverage || 1, 0)}x`, "metric-policy"),
+    metricCell(text.entryGate, "自适应：成本保本胜率 + 校准/波动/行情状态裕量", "metric-policy metric-wide"),
     metricCell(
       text.leverageRule,
       marketType === "spot"
         ? "\u73b0\u8d27\u56fa\u5b9a 1x"
         : riskProfile === "aggressive"
           ? "\u4fdd\u5b88\u5efa\u8bae\u503c 2x\uff0c\u4e0d\u8d85\u8fc7\u786c\u4e0a\u9650"
-          : "\u539f\u6a21\u578b\u5efa\u8bae\u503c"
+          : "\u539f\u6a21\u578b\u5efa\u8bae\u503c",
+      "metric-policy metric-wide"
     ),
-    metricCell(text.accountEquity, fmtMoney(account.equity, currency)),
-    metricCell(text.accountReturn, fmtPct(returnPct, 2)),
-    metricCell(text.realizedPnl, fmtMoney(account.realizedPnl, currency)),
-    metricCell(text.unrealizedPnl, fmtMoney(account.unrealizedPnl, currency)),
-    metricCell(text.tradingFees, fmtMoney(account.tradingFees || 0, currency)),
-    metricCell(text.slippageCost, fmtMoney(account.slippageCost || 0, currency)),
-    metricCell(text.fundingPnl, fmtMoney(account.fundingPnl || 0, currency)),
-    metricCell(text.marginUsed, fmtMoney(account.marginUsed, currency)),
-    metricCell(text.availableEquity, fmtMoney(account.availableEquity, currency)),
-    metricCell(text.leverageCap, `${fmtNumber(config.maxLeverage || 1, 0)}x`),
     metricCell(
       text.costModel,
       `费 ${fmtPct(config.takerFeeRate || 0, 3)}/边 · 滑 ${fmtPct(config.slippageRate || 0, 3)}/边${marketType === "futures" ? ` · 资金 ${fmtNumber(config.fundingIntervalHours || 8, 0)}h` : ""}`,
-      "cost-model-metric"
+      "cost-model-metric metric-policy metric-wide"
     )
   ].join("");
 
@@ -615,6 +626,15 @@ function renderPostTradeReview(account, currency) {
 }
 
 function renderAccountPositions(account, currency) {
+  if (!$("#accountPositions")) return;
+  const openDetails = new Set(
+    Array.from(document.querySelectorAll("#accountPositions details.position-details[open][data-position-key]"), (item) => item.dataset.positionKey)
+  );
+  const restoreOpenDetails = () => {
+    document.querySelectorAll("#accountPositions details.position-details[data-position-key]").forEach((item) => {
+      if (openDetails.has(item.dataset.positionKey)) item.open = true;
+    });
+  };
   const positions = Object.values(account.positions || {});
   const closedPositions = asArray(account.tradeHistory);
   $("#openPositionCount").textContent = positions.length;
@@ -630,6 +650,7 @@ function renderAccountPositions(account, currency) {
           .map((position) => closedPositionRow(position, currency))
           .join("")
       : `<div class="empty">${text.noClosedPositions}</div>`;
+    restoreOpenDetails();
     return;
   }
 
@@ -639,6 +660,7 @@ function renderAccountPositions(account, currency) {
         .map((position) => positionRow(position, currency))
         .join("")
     : `<div class="empty">${text.noPositions}</div>`;
+  restoreOpenDetails();
 }
 
 function positionRow(position, currency) {
@@ -664,30 +686,33 @@ function positionRow(position, currency) {
         </div>
         <div>${badge(`${fmtMoney(netPnl, currency)} / ${fmtPct(position.unrealizedReturnPct, 2)}`, pnlType)}</div>
       </div>
-      ${positionGroup("行情与止盈止损", [
-        calcCell(text.signalPrice, fmtPrice(position.signalEntryPrice)),
-        calcCell(text.entry, fmtPrice(position.entry)),
-        calcCell(text.currentPrice, fmtPrice(position.currentPrice)),
-        calcCell(text.takeProfit, fmtPrice(position.takeProfit)),
-        calcCell(text.stopLoss, fmtPrice(position.stopLoss)),
-        calcCell(text.quantity, fmtNumber(position.quantity, 6))
-      ])}
-      ${positionGroup("仓位与风险", [
-        calcCell(text.modelLeverage, `${fmtNumber(position.modelSuggestedLeverage, 1)}x`),
-        calcCell(text.notional, fmtMoney(position.notional, currency)),
-        calcCell(text.marginUsed, fmtMoney(position.marginRequired, currency)),
-        calcCell(text.winRate, fmtPct(position.winRate, 1)),
-        calcCell("EV", fmtPct(position.expectancyPct, 2)),
-        calcCell(text.impact, fmtNumber(position.eventImpactScore, 0))
-      ])}
-      ${positionGroup("交易成本", [
-        calcCell(text.entryFee, fmtMoney(position.entryFee || 0, currency)),
-        calcCell(text.estimatedExitFee, fmtMoney(position.estimatedExitFee || 0, currency)),
-        calcCell(text.estimatedExitSlippage, fmtMoney(position.estimatedExitSlippageCost || 0, currency)),
-        calcCell(text.fundingPnl, fmtMoney(position.fundingPnl || 0, currency)),
-        calcCell(text.fundingSettlements, fmtNumber(position.fundingSettlements || 0, 0))
-      ])}
-      ${titles ? `<div class="position-events"><span>关联事件</span>${escapeHtml(titles)}</div>` : ""}
+      <div class="position-quick-grid">
+        ${calcCell(text.currentPrice, fmtPrice(position.currentPrice))}
+        ${calcCell(text.entry, fmtPrice(position.entry))}
+        ${calcCell(text.takeProfit, fmtPrice(position.takeProfit))}
+        ${calcCell(text.stopLoss, fmtPrice(position.stopLoss))}
+        ${calcCell(text.winRate, fmtPct(position.winRate, 1))}
+        ${calcCell("EV", fmtPct(position.expectancyPct, 2))}
+      </div>
+      <details class="position-details" data-position-key="${escapeHtml(`${position.symbol || "-"}:${position.openedAt || "-"}`)}">
+        <summary>查看仓位、成本与事件详情</summary>
+        ${positionGroup("仓位与风险", [
+          calcCell(text.signalPrice, fmtPrice(position.signalEntryPrice)),
+          calcCell(text.quantity, fmtNumber(position.quantity, 6)),
+          calcCell(text.modelLeverage, `${fmtNumber(position.modelSuggestedLeverage, 1)}x`),
+          calcCell(text.notional, fmtMoney(position.notional, currency)),
+          calcCell(text.marginUsed, fmtMoney(position.marginRequired, currency)),
+          calcCell(text.impact, fmtNumber(position.eventImpactScore, 0))
+        ])}
+        ${positionGroup("交易成本", [
+          calcCell(text.entryFee, fmtMoney(position.entryFee || 0, currency)),
+          calcCell(text.estimatedExitFee, fmtMoney(position.estimatedExitFee || 0, currency)),
+          calcCell(text.estimatedExitSlippage, fmtMoney(position.estimatedExitSlippageCost || 0, currency)),
+          calcCell(text.fundingPnl, fmtMoney(position.fundingPnl || 0, currency)),
+          calcCell(text.fundingSettlements, fmtNumber(position.fundingSettlements || 0, 0))
+        ])}
+        ${titles ? `<div class="position-events"><span>关联事件</span>${escapeHtml(titles)}</div>` : ""}
+      </details>
     </div>
   `;
 }
@@ -716,30 +741,35 @@ function closedPositionRow(position, currency) {
         </div>
         <div>${badge(`${fmtMoney(position.realizedPnl, currency)} / ${fmtPct(position.realizedReturnPct, 2)}`, pnlType)}</div>
       </div>
-      ${positionGroup("成交与平仓结果", [
-        calcCell(text.signalPrice, fmtPrice(position.signalEntryPrice)),
-        calcCell(text.entry, fmtPrice(position.entry)),
-        calcCell("\u5e73\u4ed3\u89e6\u53d1\u4ef7", fmtPrice(position.exitReferencePrice)),
-        calcCell(text.exitPrice, fmtPrice(position.exitPrice)),
-        calcCell(text.takeProfit, fmtPrice(position.takeProfit)),
-        calcCell(text.stopLoss, fmtPrice(position.stopLoss)),
-        calcCell(text.closeReason, position.closeReason || "-")
-      ])}
-      ${positionGroup("仓位与信号质量", [
-        calcCell(text.notional, fmtMoney(position.notional, currency)),
-        calcCell(text.marginUsed, fmtMoney(position.marginRequired, currency)),
-        calcCell(text.quantity, fmtNumber(position.quantity, 6)),
-        calcCell(text.winRate, fmtPct(position.winRate, 1)),
-        calcCell("EV", fmtPct(position.expectancyPct, 2)),
-        calcCell(text.impact, fmtNumber(position.eventImpactScore, 0))
-      ])}
-      ${positionGroup("实际交易成本", [
-        calcCell(text.entryFee, fmtMoney(position.entryFee || 0, currency)),
-        calcCell(text.exitFee, fmtMoney(position.exitFee || 0, currency)),
-        calcCell(text.slippageCost, fmtMoney((position.entrySlippageCost || 0) + (position.exitSlippageCost || 0), currency)),
-        calcCell(text.fundingPnl, fmtMoney(position.fundingPnl || 0, currency))
-      ])}
-      ${titles ? `<div class="position-events"><span>关联事件</span>${escapeHtml(titles)}</div>` : ""}
+      <div class="position-quick-grid">
+        ${calcCell(text.entry, fmtPrice(position.entry))}
+        ${calcCell(text.exitPrice, fmtPrice(position.exitPrice))}
+        ${calcCell(text.closeReason, position.closeReason || "-")}
+        ${calcCell(text.winRate, fmtPct(position.winRate, 1))}
+        ${calcCell("EV", fmtPct(position.expectancyPct, 2))}
+        ${calcCell(text.impact, fmtNumber(position.eventImpactScore, 0))}
+      </div>
+      <details class="position-details" data-position-key="${escapeHtml(`${position.symbol || "-"}:${position.openedAt || "-"}`)}">
+        <summary>查看成交、成本与事件详情</summary>
+        ${positionGroup("成交与平仓结果", [
+          calcCell(text.signalPrice, fmtPrice(position.signalEntryPrice)),
+          calcCell("\u5e73\u4ed3\u89e6\u53d1\u4ef7", fmtPrice(position.exitReferencePrice)),
+          calcCell(text.takeProfit, fmtPrice(position.takeProfit)),
+          calcCell(text.stopLoss, fmtPrice(position.stopLoss))
+        ])}
+        ${positionGroup("仓位与信号质量", [
+          calcCell(text.notional, fmtMoney(position.notional, currency)),
+          calcCell(text.marginUsed, fmtMoney(position.marginRequired, currency)),
+          calcCell(text.quantity, fmtNumber(position.quantity, 6))
+        ])}
+        ${positionGroup("实际交易成本", [
+          calcCell(text.entryFee, fmtMoney(position.entryFee || 0, currency)),
+          calcCell(text.exitFee, fmtMoney(position.exitFee || 0, currency)),
+          calcCell(text.slippageCost, fmtMoney((position.entrySlippageCost || 0) + (position.exitSlippageCost || 0), currency)),
+          calcCell(text.fundingPnl, fmtMoney(position.fundingPnl || 0, currency))
+        ])}
+        ${titles ? `<div class="position-events"><span>关联事件</span>${escapeHtml(titles)}</div>` : ""}
+      </details>
     </div>
   `;
 }
@@ -1200,9 +1230,11 @@ function renderAccountSummary(summary, currency = "USDT", account = {}) {
 }
 
 function renderMessages() {
+  const target = $("#messages");
+  if (!target) return;
   const messages = asArray(state.report?.messageFeed);
   const models = asArray(state.report?.modelCalculations);
-  $("#messages").innerHTML = messages.length
+  target.innerHTML = messages.length
     ? messages.map(messageRow).join("")
     : `<div class="empty">${models.length ? text.noMessagesMath : text.noMessagesNoMarket}</div>`;
 }
@@ -1406,18 +1438,22 @@ function localizeKnownMessageTitle(value) {
 }
 
 function renderWarnings() {
+  const target = $("#warnings");
+  if (!target) return;
   const warnings = asArray(state.report?.warnings);
-  $("#warnings").innerHTML = warnings.length
+  target.innerHTML = warnings.length
     ? warnings.slice(0, 24).map((warning) => `<div class="row"><div>${escapeHtml(translateWarning(warning))}</div></div>`).join("")
     : `<div class="empty">${text.noWarnings}</div>`;
 }
 
 function renderModels() {
+  const target = $("#models");
+  if (!target) return;
   const openDetails = new Set(
     Array.from(document.querySelectorAll("#models details.model-details[open][data-detail-key]"), (item) => item.dataset.detailKey)
   );
   const models = asArray(state.report?.modelCalculations);
-  $("#models").innerHTML = models.length ? models.slice(0, 20).map(modelRow).join("") : `<div class="empty">${text.noModel}</div>`;
+  target.innerHTML = models.length ? models.slice(0, 20).map(modelRow).join("") : `<div class="empty">${text.noModel}</div>`;
   document.querySelectorAll("#models details.model-details[data-detail-key]").forEach((item) => {
     if (openDetails.has(item.dataset.detailKey)) item.open = true;
   });
@@ -1515,7 +1551,14 @@ function localizeHmmRegime(regime) {
 }
 
 function renderLog() {
-  $("#logView").textContent = state.log || text.noLog;
+  const target = $("#logView");
+  if (!target) return;
+  const lines = String(state.log || "").split("\n");
+  const mojibakePattern = /(鍛婅|锛氫|妯℃嫙|浜嬩欢淇|鐩戞帶|寮曟搸|鏃犺瘉鎹)/;
+  const corruptedLines = lines.filter((line) => mojibakePattern.test(line)).length;
+  target.textContent = state.rawLogVisible ? state.log || text.noLog : lines.filter((line) => !mojibakePattern.test(line)).join("\n") || text.noLog;
+  setText("#logNotice", corruptedLines ? `检测到 ${corruptedLines} 行历史乱码，清晰视图已隐藏` : "未检测到历史乱码");
+  setText("#toggleRawLog", state.rawLogVisible ? "隐藏历史乱码" : "显示原始日志");
 }
 
 function render() {
@@ -1530,48 +1573,55 @@ function render() {
 }
 
 function bindEvents() {
-  $("#refreshButton").addEventListener("click", () => loadData().catch(showError));
-  for (const selector of ["#messageFilterKeywords", "#messageAggregatorEnabled"]) {
-    $(selector).addEventListener("input", () => {
-      state.messageAggregatorEditing = true;
-      state.messageAggregator = {
-        ...(state.messageAggregator || {}),
-        error: null,
-        errorCode: null
-      };
+  $("#refreshButton")?.addEventListener("click", () => loadData().catch(showError));
+  $("#toggleRawLog")?.addEventListener("click", () => {
+    state.rawLogVisible = !state.rawLogVisible;
+    renderLog();
+  });
+  const messageForm = $("#messageAggregatorForm");
+  if (messageForm) {
+    for (const selector of ["#messageFilterKeywords", "#messageAggregatorEnabled"]) {
+      $(selector)?.addEventListener("input", () => {
+        state.messageAggregatorEditing = true;
+        state.messageAggregator = {
+          ...(state.messageAggregator || {}),
+          error: null,
+          errorCode: null
+        };
+        renderMessageAggregatorConnection();
+      });
+    }
+    messageForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (state.messageAggregatorSubmitting) return;
+      state.messageAggregatorSubmitting = true;
       renderMessageAggregatorConnection();
+      try {
+        state.messageAggregator = await postJson("/api/message-aggregator/config", {
+          enabled: $("#messageAggregatorEnabled").checked,
+          filterKeywords: $("#messageFilterKeywords").value,
+          maxItemsPerSource: 15
+        });
+        state.messageAggregatorEditing = false;
+      } catch (error) {
+        state.messageAggregator = {
+          ...(state.messageAggregator || {}),
+          connected: false,
+          errorCode: error.code,
+          error: error.message
+        };
+      } finally {
+        state.messageAggregatorSubmitting = false;
+        renderMessageAggregatorConnection();
+      }
     });
   }
-  $("#messageAggregatorForm").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    if (state.messageAggregatorSubmitting) return;
-    state.messageAggregatorSubmitting = true;
-    renderMessageAggregatorConnection();
-    try {
-      state.messageAggregator = await postJson("/api/message-aggregator/config", {
-        enabled: $("#messageAggregatorEnabled").checked,
-        filterKeywords: $("#messageFilterKeywords").value,
-        maxItemsPerSource: 15
-      });
-      state.messageAggregatorEditing = false;
-    } catch (error) {
-      state.messageAggregator = {
-        ...(state.messageAggregator || {}),
-        connected: false,
-        errorCode: error.code,
-        error: error.message
-      };
-    } finally {
-      state.messageAggregatorSubmitting = false;
-      renderMessageAggregatorConnection();
-    }
-  });
-  $("#accountForm").addEventListener("submit", async (event) => {
+  $("#accountForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     try {
       state.account = await postJson("/api/account", getAccountFormPayload());
       render();
-      $("#accountSummary").insertAdjacentHTML("afterbegin", `<div class="notice">${text.saved}</div>`);
+      $("#accountSummary")?.insertAdjacentHTML("afterbegin", `<div class="notice">${text.saved}</div>`);
     } catch (error) {
       showError(error);
     }
@@ -1623,28 +1673,28 @@ function bindEvents() {
       renderAccount();
     }
   });
-  $("#resetAccountButton").addEventListener("click", async () => {
+  $("#resetAccountButton")?.addEventListener("click", async () => {
     try {
       state.account = await postJson("/api/account/reset");
       render();
-      $("#accountSummary").insertAdjacentHTML("afterbegin", `<div class="notice">${text.reset}</div>`);
+      $("#accountSummary")?.insertAdjacentHTML("afterbegin", `<div class="notice">${text.reset}</div>`);
     } catch (error) {
       showError(error);
     }
   });
-  $("#startAccountButton").addEventListener("click", async () => {
+  $("#startAccountButton")?.addEventListener("click", async () => {
     const button = $("#startAccountButton");
     button.disabled = true;
     try {
       state.account = await postJson("/api/account/start", getAccountFormPayload());
       render();
-      $("#accountSummary").insertAdjacentHTML("afterbegin", `<div class="notice">${text.started}</div>`);
+      $("#accountSummary")?.insertAdjacentHTML("afterbegin", `<div class="notice">${text.started}</div>`);
     } catch (error) {
       button.disabled = false;
       showError(error);
     }
   });
-  $("#summaryButton").addEventListener("click", async () => {
+  $("#summaryButton")?.addEventListener("click", async () => {
     window.location.href = "/summary.html";
   });
   $("#accountSummary")?.addEventListener("click", (event) => {
@@ -1654,7 +1704,7 @@ function bindEvents() {
     renderAccount();
     $("#summaryButton").focus();
   });
-  $("#accountMarketType").addEventListener("change", () => {
+  $("#accountMarketType")?.addEventListener("change", () => {
     const spot = $("#accountMarketType").value === "spot";
     $("#accountMaxLeverage").disabled = spot;
     if (spot) $("#accountMaxLeverage").value = 1;
@@ -1669,7 +1719,8 @@ function bindEvents() {
 }
 
 function showError(error) {
-  $("#signals").innerHTML = `<div class="empty">${text.readFailed}\uff1a${escapeHtml(error.message)}</div>`;
+  const target = $("#pageError") || $("#signals") || $("#messages") || $("#models") || $("#logView");
+  if (target) target.innerHTML = `<div class="empty">${text.readFailed}\uff1a${escapeHtml(error.message)}</div>`;
 }
 
 bindEvents();

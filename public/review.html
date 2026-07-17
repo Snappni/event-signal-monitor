@@ -8,10 +8,27 @@
   </head>
   <body>
     <header class="topbar">
-      <div class="brand"><div class="brand-mark" aria-hidden="true">ES</div><div><span class="eyebrow">POST-TRADE REVIEW</span><h1>交易链路与模型迭代</h1><p id="subtitle">只用具备开仓因子快照的已平仓交易</p></div></div>
-      <div class="toolbar"><a class="toolbar-link" href="/">主监控</a><a class="toolbar-link" href="/summary.html">账户总结</a><button id="refreshReview" type="button">刷新复盘</button></div>
+      <div class="brand"><div class="brand-mark" aria-hidden="true">ES</div><div><span class="eyebrow">SIGNAL OPERATIONS</span><h1>事件信号监控引擎</h1><p id="subtitle">交易归因与模型治理</p></div></div>
+      <nav class="toolbar" aria-label="主导航">
+        <span class="nav-caption">分析工作台</span>
+        <a class="toolbar-link" href="/"><span aria-hidden="true">⌂</span>实时监控</a>
+        <a class="toolbar-link" href="/summary.html"><span aria-hidden="true">⌁</span>账户总结</a>
+        <a class="toolbar-link" href="/signals.html"><span aria-hidden="true">⌁</span>信号复盘</a>
+        <a class="toolbar-link" href="/messages.html"><span aria-hidden="true">◫</span>消息情报</a>
+        <a class="toolbar-link" href="/models.html"><span aria-hidden="true">∿</span>模型计算</a>
+        <a class="toolbar-link" href="/logs.html"><span aria-hidden="true">≡</span>运行日志</a>
+        <a class="toolbar-link active" href="/review.html" aria-current="page"><span aria-hidden="true">↻</span>迭代复盘</a>
+        <div class="nav-footer">
+          <span class="environment-state"><i></i>模拟环境</span>
+          <button id="refreshReview" type="button">刷新复盘</button>
+        </div>
+      </nav>
     </header>
     <main class="focused-page">
+      <section class="page-heading">
+        <div><span class="eyebrow">POST-TRADE REVIEW</span><h2>交易链路与模型迭代</h2><p>以时间外验证决定候选权重是否具备晋升资格</p></div>
+        <span class="context-state">影子验证</span>
+      </section>
       <section class="panel post-trade-review-workbench">
         <div class="review-heading"><div><strong>迭代控制</strong><span>候选方向权重必须通过后段时间样本验证后才能应用</span></div><span id="reviewStatus" class="review-status">读取中</span></div>
         <form id="reviewForm" class="review-config-form">

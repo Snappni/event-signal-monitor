@@ -11,19 +11,32 @@
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">ES</div>
         <div>
-          <span class="eyebrow">QUANT OPERATIONS</span>
+          <span class="eyebrow">SIGNAL OPERATIONS</span>
           <h1>事件信号监控引擎</h1>
           <p id="subtitle">paper-alert-only</p>
         </div>
       </div>
-      <div class="toolbar">
-        <a class="toolbar-link" href="/summary.html">账户总结</a>
-        <a class="toolbar-link" href="/review.html">迭代复盘</a>
-        <button id="refreshButton" type="button">刷新</button>
-      </div>
+      <nav class="toolbar" aria-label="主导航">
+        <span class="nav-caption">分析工作台</span>
+        <a class="toolbar-link active" href="/" aria-current="page"><span aria-hidden="true">⌂</span>实时监控</a>
+        <a class="toolbar-link" href="/summary.html"><span aria-hidden="true">⌁</span>账户总结</a>
+        <a class="toolbar-link" href="/signals.html"><span aria-hidden="true">⌁</span>信号复盘</a>
+        <a class="toolbar-link" href="/messages.html"><span aria-hidden="true">◫</span>消息情报</a>
+        <a class="toolbar-link" href="/models.html"><span aria-hidden="true">∿</span>模型计算</a>
+        <a class="toolbar-link" href="/logs.html"><span aria-hidden="true">≡</span>运行日志</a>
+        <a class="toolbar-link" href="/review.html"><span aria-hidden="true">↻</span>迭代复盘</a>
+        <div class="nav-footer">
+          <span class="environment-state"><i></i>模拟环境</span>
+          <button id="refreshButton" type="button">刷新数据</button>
+        </div>
+      </nav>
     </header>
 
     <main>
+      <section class="page-heading">
+        <div><span class="eyebrow">LIVE MARKET DESK</span><h2>实时市场工作台</h2><p>聚合事件、量化信号与模拟账户风险状态</p></div>
+        <span class="live-state"><i></i>高频监控中</span>
+      </section>
       <section class="summary-grid" aria-label="状态摘要">
         <div class="metric">
           <span>分析模式</span>
@@ -104,67 +117,9 @@
         <div id="accountPositions" class="position-list"></div>
         <div class="account-page-links">
           <a href="/summary.html">查看账户阶段总结与图表</a>
+          <a href="/signals.html">查看开仓信号与复盘</a>
           <a href="/review.html">查看交易链路与模型迭代</a>
         </div>
-      </section>
-
-      <section class="panel">
-        <div class="section-title">
-          <h2>开仓与复盘</h2>
-          <span id="reportTime">-</span>
-        </div>
-        <div id="signals"></div>
-      </section>
-
-      <section class="grid-two">
-        <section class="panel">
-          <div class="section-title">
-            <h2>消息面</h2>
-            <span id="sourceCounts">-</span>
-          </div>
-          <form id="messageAggregatorForm" class="message-aggregator-form" autocomplete="off">
-            <div class="message-aggregator-field wide-field">
-              <label for="messageFilterKeywords">保留关键词（逗号或换行分隔，留空使用内置市场词表）</label>
-              <textarea
-                id="messageFilterKeywords"
-                name="filterKeywords"
-                rows="5"
-                wrap="soft"
-                spellcheck="false"
-                placeholder="比特币,加密货币,美联储&#10;bitcoin,crypto,fed"
-              ></textarea>
-              <span class="built-in-source-note">RSS 与国内外热榜来源已内置固定，保存时会重新验证全部来源。</span>
-            </div>
-            <label class="message-aggregator-toggle"><input id="messageAggregatorEnabled" type="checkbox" checked /> 启用聚合采集</label>
-            <button id="messageAggregatorConnectButton" type="submit">验证来源并保存关键词</button>
-            <div id="messageAggregatorStatus" class="message-aggregator-status" aria-live="polite">未配置</div>
-          </form>
-          <div id="messages" class="list"></div>
-        </section>
-
-        <section class="panel">
-          <div class="section-title">
-            <h2>告警</h2>
-            <span id="warningCount">0</span>
-          </div>
-          <div id="warnings" class="list compact"></div>
-        </section>
-      </section>
-
-      <section class="panel">
-        <div class="section-title">
-          <h2>数学模型计算过程</h2>
-          <span>胜率, EV, 风险收益</span>
-        </div>
-        <div id="models" class="model-list"></div>
-      </section>
-
-      <section class="panel">
-        <div class="section-title">
-          <h2>运行日志</h2>
-          <span>fast-loop.log</span>
-        </div>
-        <pre id="logView"></pre>
       </section>
     </main>
 

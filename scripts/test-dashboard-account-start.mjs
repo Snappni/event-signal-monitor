@@ -56,29 +56,51 @@ child.stderr.on("data", (chunk) => {
 
 try {
   await waitForDashboard(baseUrl, child);
-  const [indexResponse, summaryPageResponse, reviewPageResponse, appScriptResponse, summaryScriptResponse, reviewScriptResponse, echartsResponse] =
+  const [indexResponse, summaryPageResponse, reviewPageResponse, signalsPageResponse, messagesPageResponse, modelsPageResponse, logsPageResponse, appScriptResponse, summaryScriptResponse, reviewScriptResponse, echartsResponse] =
     await Promise.all([
       fetch(baseUrl),
       fetch(`${baseUrl}/summary.html`),
       fetch(`${baseUrl}/review.html`),
+      fetch(`${baseUrl}/signals.html`),
+      fetch(`${baseUrl}/messages.html`),
+      fetch(`${baseUrl}/models.html`),
+      fetch(`${baseUrl}/logs.html`),
       fetch(`${baseUrl}/app.js`),
       fetch(`${baseUrl}/summary.js`),
       fetch(`${baseUrl}/review.js`),
       fetch(`${baseUrl}/vendor/echarts.min.js`)
     ]);
-  for (const response of [indexResponse, summaryPageResponse, reviewPageResponse, appScriptResponse, summaryScriptResponse, reviewScriptResponse, echartsResponse]) {
+  for (const response of [indexResponse, summaryPageResponse, reviewPageResponse, signalsPageResponse, messagesPageResponse, modelsPageResponse, logsPageResponse, appScriptResponse, summaryScriptResponse, reviewScriptResponse, echartsResponse]) {
     assert.equal(response.status, 200);
   }
-  const [indexHtml, summaryHtml, reviewHtml, appScript, summaryScript, reviewScript] = await Promise.all([
+  const [indexHtml, summaryHtml, reviewHtml, signalsHtml, messagesHtml, modelsHtml, logsHtml, appScript, summaryScript, reviewScript] = await Promise.all([
     indexResponse.text(),
     summaryPageResponse.text(),
     reviewPageResponse.text(),
+    signalsPageResponse.text(),
+    messagesPageResponse.text(),
+    modelsPageResponse.text(),
+    logsPageResponse.text(),
     appScriptResponse.text(),
     summaryScriptResponse.text(),
     reviewScriptResponse.text()
   ]);
-  for (const id of ["accountCapital", "accountMarketType", "accountMaxLeverage", "accountRiskProfile", "startAccountButton", "saveAccountButton", "resetAccountButton", "summaryButton", "messageFilterKeywords", "messageAggregatorEnabled", "messageAggregatorConnectButton"]) {
+  for (const id of ["accountCapital", "accountMarketType", "accountMaxLeverage", "accountRiskProfile", "startAccountButton", "saveAccountButton", "resetAccountButton", "summaryButton"]) {
     assert.ok(indexHtml.includes(`id="${id}"`), `missing main-page control ${id}`);
+  }
+  assert.ok(signalsHtml.includes('id="signals"'), "missing signals-page list");
+  for (const id of ["messageFilterKeywords", "messageAggregatorEnabled", "messageAggregatorConnectButton", "messages", "warnings"]) {
+    assert.ok(messagesHtml.includes(`id="${id}"`), `missing messages-page control ${id}`);
+  }
+  assert.ok(modelsHtml.includes('id="models"'), "missing models-page list");
+  for (const id of ["logView", "logNotice", "toggleRawLog"]) {
+    assert.ok(logsHtml.includes(`id="${id}"`), `missing logs-page control ${id}`);
+  }
+  const pageHtml = [indexHtml, summaryHtml, reviewHtml, signalsHtml, messagesHtml, modelsHtml, logsHtml];
+  for (const html of pageHtml) {
+    for (const href of ["/", "/summary.html", "/signals.html", "/messages.html", "/models.html", "/logs.html", "/review.html"]) {
+      assert.ok(html.includes(`href="${href}"`), `missing sidebar link ${href}`);
+    }
   }
   assert.ok(summaryHtml.includes('src="/vendor/echarts.min.js"'));
   assert.ok(summaryHtml.includes('id="refreshSummary"'));
