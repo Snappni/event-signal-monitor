@@ -35,10 +35,10 @@ const MESSAGE_AGGREGATOR_CONFIG_PATH = path.join(RUNTIME_DIR, "message-aggregato
 const MESSAGE_AGGREGATOR_STATUS_PATH = path.join(RUNTIME_DIR, "message-aggregator-status.json");
 const ENV_PATH = path.join(ROOT_DIR, ".env");
 const PORT = Number(process.env.SIGNAL_DASHBOARD_PORT || 8788);
-const LOOP_INTERVAL_SECONDS = 60;
+const LOOP_INTERVAL_SECONDS = Math.max(1, Number(process.env.SIGNAL_LOOP_INTERVAL_SECONDS || 10));
 const LOOP_STALE_SECONDS = Math.max(
-  LOOP_INTERVAL_SECONDS * 2,
-  Number(process.env.SIGNAL_LOOP_STALE_SECONDS || 150)
+  LOOP_INTERVAL_SECONDS * 4,
+  Number(process.env.SIGNAL_LOOP_STALE_SECONDS || 60)
 );
 const DEFAULT_FUTURES_TAKER_FEE_RATE = 0.0005;
 const DEFAULT_SPOT_TAKER_FEE_RATE = 0.001;

@@ -19,6 +19,7 @@
           <label class="review-checkbox"><input id="reviewAutoApply" type="checkbox" /><span>验证通过后自动应用候选权重（仅模拟账户）</span></label>
           <div class="review-actions"><button type="submit">保存复盘设置</button><button id="applyCandidate" type="button">应用已验证候选</button><button id="rollbackWeights" type="button">回滚上一版权重</button></div>
         </form>
+        <p id="reviewDecision" class="review-note">读取模型迭代判定中。</p>
       </section>
       <section class="panel"><div class="section-title"><h2>复盘概览</h2><span id="reviewUpdatedAt">-</span></div><div id="reviewOverview" class="review-overview"></div></section>
       <section class="panel"><div class="section-title"><h2>训练 / 验证</h2><span>严格按时间顺序切分</span></div><div id="validationMetrics" class="review-validation"></div></section>

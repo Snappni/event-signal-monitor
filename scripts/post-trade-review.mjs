@@ -366,6 +366,7 @@ export function buildPostTradeReview(trades, currentDirectionWeights, configValu
     qualityFactorStatistics: qualityFactorStatistics(eligibleTrades),
     validation: null,
     promotionEligible: false,
+    promotionBlockers: [],
     applied: false,
     limitations: [
       "Only trades with an entry-time factor snapshot are eligible.",
@@ -375,12 +376,19 @@ export function buildPostTradeReview(trades, currentDirectionWeights, configValu
     trades: eligibleTrades.slice(-Math.max(config.reviewEveryTrades, 20)).map((trade) => explainTrade(trade, weights))
   };
 
-  if (eligibleTrades.length < config.minimumProposalTrades) return review;
+  if (eligibleTrades.length < config.minimumProposalTrades) {
+    review.promotionBlockers.push("minimum_proposal_trades");
+    return review;
+  }
 
   const validationSize = Math.max(5, Math.min(Math.ceil(eligibleTrades.length * 0.3), 40));
   const trainingTrades = eligibleTrades.slice(0, -validationSize);
   const validationTrades = eligibleTrades.slice(-validationSize);
-  if (trainingTrades.length < 10 || validationTrades.length < 5) return review;
+  if (trainingTrades.length < 10 || validationTrades.length < 5) {
+    if (trainingTrades.length < 10) review.promotionBlockers.push("minimum_training_samples");
+    if (validationTrades.length < 5) review.promotionBlockers.push("minimum_validation_samples");
+    return review;
+  }
 
   const proposal = proposeWeights(trainingTrades, weights, config);
   const champion = validationMetrics(validationTrades, weights);
@@ -415,6 +423,10 @@ export function buildPostTradeReview(trades, currentDirectionWeights, configValu
     accuracyDelta: round(accuracyDelta),
     meanSignedMarginDelta: round(marginDelta)
   };
+  if (eligibleTrades.length < config.minimumPromotionTrades) review.promotionBlockers.push("minimum_promotion_trades");
+  if (validationTrades.length < 10) review.promotionBlockers.push("minimum_validation_samples");
+  if (accuracyDelta < 0.03) review.promotionBlockers.push("accuracy_delta");
+  if (marginDelta <= 0) review.promotionBlockers.push("mean_signed_margin_delta");
   review.promotionEligible = promotionEligible;
   return review;
 }

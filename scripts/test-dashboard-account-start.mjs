@@ -82,7 +82,7 @@ try {
   }
   assert.ok(summaryHtml.includes('src="/vendor/echarts.min.js"'));
   assert.ok(summaryHtml.includes('id="refreshSummary"'));
-  for (const id of ["reviewEveryTrades", "reviewAutoApply", "applyCandidate", "rollbackWeights", "refreshReview"]) {
+  for (const id of ["reviewEveryTrades", "reviewAutoApply", "applyCandidate", "rollbackWeights", "refreshReview", "reviewDecision"]) {
     assert.ok(reviewHtml.includes(`id="${id}"`), `missing review-page control ${id}`);
   }
   for (const binding of ["messageAggregatorForm", "accountForm", "resetAccountButton", "startAccountButton", "summaryButton", "accountMarketType"]) {
@@ -92,6 +92,10 @@ try {
   for (const binding of ["reviewForm", "applyCandidate", "rollbackWeights", "refreshReview"]) {
     assert.ok(reviewScript.includes(`$("#${binding}").addEventListener`), `missing review-page event binding ${binding}`);
   }
+  assert.ok(reviewScript.includes("formDirty = true"), "review form must preserve unsaved input");
+  assert.ok(reviewScript.includes("setInterval(loadReview, 15_000)"), "review page must refresh without losing form state");
+  assert.ok(reviewScript.includes('data-detail-key="${esc(detailKey)}"'), "review details need stable expansion keys");
+  assert.ok(appScript.includes('data-detail-key="${escapeHtml(item.symbol || "-")}"'), "model details need stable expansion keys");
   const requested = {
     initialCapital: 25_000,
     marketType: "futures",

@@ -35,7 +35,9 @@ import {
   evaluateAdaptiveEntryGate
 } from "./adaptive-entry-gate.mjs";
 
-const RUNTIME_DIR = path.resolve(".runtime", "event-signal-monitor");
+const RUNTIME_DIR = path.resolve(
+  process.env.SIGNAL_RUNTIME_DIR || path.resolve(".runtime", "event-signal-monitor")
+);
 const STATE_PATH = path.resolve(RUNTIME_DIR, "state.json");
 const REPORT_PATH = path.resolve(RUNTIME_DIR, "latest-report.json");
 const HISTORY_PATH = path.resolve(RUNTIME_DIR, "history.jsonl");
@@ -45,6 +47,7 @@ const WHALE_CREDENTIALS_PATH = path.resolve(RUNTIME_DIR, "whale-alert-credential
 const WHALE_STATUS_PATH = path.resolve(RUNTIME_DIR, "whale-alert-status.json");
 const MESSAGE_AGGREGATOR_CONFIG_PATH = path.resolve(RUNTIME_DIR, "message-aggregator-config.json");
 const MESSAGE_AGGREGATOR_STATUS_PATH = path.resolve(RUNTIME_DIR, "message-aggregator-status.json");
+const RUNTIME_LOG_PATH = path.resolve(RUNTIME_DIR, "fast-loop.log");
 const execFileAsync = promisify(execFile);
 loadDotEnv(path.resolve(".env"));
 
@@ -132,6 +135,13 @@ const FETCH_IMPL = (process.env.SIGNAL_MONITOR_FETCH_IMPL || "auto")
   .toLowerCase();
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.SIGNAL_MONITOR_TIMEOUT_MS, 8_000);
 const MARKET_CONCURRENCY = toPositiveInt(process.env.SIGNAL_MONITOR_MARKET_CONCURRENCY, 6);
+const SOURCE_REFRESH_MS = {
+  aggregator: toPositiveInt(process.env.SIGNAL_AGGREGATOR_REFRESH_MS, 30_000),
+  gdelt: toPositiveInt(process.env.SIGNAL_GDELT_REFRESH_MS, 60_000),
+  polymarket: toPositiveInt(process.env.SIGNAL_POLYMARKET_REFRESH_MS, 10_000),
+  announcements: toPositiveInt(process.env.SIGNAL_ANNOUNCEMENT_REFRESH_MS, 60_000),
+  whale: toPositiveInt(process.env.SIGNAL_WHALE_REFRESH_MS, 15_000)
+};
 const GDELT_ENABLED = process.env.SIGNAL_MONITOR_GDELT_ENABLED !== "false";
 const WHALE_ALERT_ENABLED = process.env.WHALE_ALERT_ENABLED !== "false";
 const OPEN_SIGNAL_MAX_AGE_MS = 72 * 60 * 60 * 1000;
@@ -283,6 +293,22 @@ function appendJsonLine(filePath, value) {
   fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf8");
 }
 
+function appendRuntimeLog(message) {
+  ensureRuntimeDir();
+  fs.appendFileSync(RUNTIME_LOG_PATH, `${message}\n`, "utf8");
+  try {
+    const maxBytes = 5 * 1024 * 1024;
+    const stat = fs.statSync(RUNTIME_LOG_PATH);
+    if (stat.size > maxBytes) {
+      const keepBytes = 2 * 1024 * 1024;
+      const content = fs.readFileSync(RUNTIME_LOG_PATH);
+      fs.writeFileSync(RUNTIME_LOG_PATH, content.subarray(Math.max(0, content.length - keepBytes)), "utf8");
+    }
+  } catch {
+    // Logging must not stop the monitor.
+  }
+}
+
 function createInitialState() {
   return {
     version: MONITOR_VERSION,
@@ -291,6 +317,7 @@ function createInitialState() {
     openInterest: {},
     polymarket: {},
     newsTrends: {},
+    sourceCache: {},
     activeSignals: {},
     closedSignals: [],
     calibration: {
@@ -301,6 +328,24 @@ function createInitialState() {
       avgRealizedR: 0
     }
   };
+}
+
+async function fetchCachedSource(state, key, ttlMs, fetcher) {
+  state.sourceCache = state.sourceCache && typeof state.sourceCache === "object" ? state.sourceCache : {};
+  const cached = state.sourceCache[key];
+  const cachedAt = Date.parse(cached?.fetchedAt || "");
+  if (cached && Number.isFinite(cachedAt) && Date.now() - cachedAt < ttlMs) {
+    return { value: cached.value, cached: true, fetchedAt: cached.fetchedAt, ttlMs };
+  }
+  const value = await fetcher();
+  const failed = value?.sourceFailure || (Array.isArray(value?.sourceFailures) && value.sourceFailures.length > 0 && !value.items?.length);
+  const fetchedAt = new Date().toISOString();
+  if (failed && cached) {
+    const refreshFailure = value?.sourceFailure || value.sourceFailures.join("；");
+    return { value: cached.value, cached: true, stale: true, fetchedAt: cached.fetchedAt, attemptedAt: fetchedAt, refreshFailure, ttlMs };
+  }
+  if (!failed) state.sourceCache[key] = { fetchedAt, value };
+  return { value, cached: false, stale: false, fetchedAt, ttlMs };
 }
 
 function normalizeAccountConfig(value) {
@@ -3171,6 +3216,7 @@ async function main() {
   state.polymarket = state.polymarket || {};
   state.openInterest = state.openInterest || {};
   state.newsTrends = state.newsTrends || {};
+  state.sourceCache = state.sourceCache || {};
   const releaseInitialAccountLock = await acquireAccountLock();
   let accountConfig;
   let accountSessionId;
@@ -3188,15 +3234,38 @@ async function main() {
     "仅模拟告警：脚本不会发送实盘订单。",
     "无证据表明新闻聚合、大模型推理或 Polymarket 赔率本身能稳定盈利。"
   ];
-  const [aggregatorResult, gdeltNewsResult, polymarketResult, binanceAnnouncementsResult, okxAnnouncementsResult, whaleResult] =
+  const [aggregatorFetch, gdeltFetch, polymarketFetch, binanceFetch, okxFetch, whaleFetch] =
     await Promise.all([
-      fetchMessageAggregator(),
-      GDELT_ENABLED ? fetchWithFallback("GDELT", fetchGdeltNews, []) : Promise.resolve([]),
-      fetchWithFallback("Polymarket", () => fetchPolymarketMarkets(state), []),
-      fetchWithFallback("Binance announcements", fetchBinanceAnnouncements, []),
-      fetchWithFallback("OKX announcements", fetchOkxAnnouncements, []),
-      fetchWithFallback("WhaleAlert", fetchWhaleAlertIfConfigured, { items: [], warning: null })
+      fetchCachedSource(state, "aggregator", SOURCE_REFRESH_MS.aggregator, fetchMessageAggregator),
+      fetchCachedSource(state, "gdelt", SOURCE_REFRESH_MS.gdelt, () =>
+        GDELT_ENABLED ? fetchWithFallback("GDELT", fetchGdeltNews, []) : Promise.resolve([])
+      ),
+      fetchCachedSource(state, "polymarket", SOURCE_REFRESH_MS.polymarket, () =>
+        fetchWithFallback("Polymarket", () => fetchPolymarketMarkets(state), [])
+      ),
+      fetchCachedSource(state, "binanceAnnouncements", SOURCE_REFRESH_MS.announcements, () =>
+        fetchWithFallback("Binance announcements", fetchBinanceAnnouncements, [])
+      ),
+      fetchCachedSource(state, "okxAnnouncements", SOURCE_REFRESH_MS.announcements, () =>
+        fetchWithFallback("OKX announcements", fetchOkxAnnouncements, [])
+      ),
+      fetchCachedSource(state, "whale", SOURCE_REFRESH_MS.whale, () =>
+        fetchWithFallback("WhaleAlert", fetchWhaleAlertIfConfigured, { items: [], warning: null })
+      )
     ]);
+  const aggregatorResult = aggregatorFetch.value;
+  const gdeltNewsResult = gdeltFetch.value;
+  const polymarketResult = polymarketFetch.value;
+  const binanceAnnouncementsResult = binanceFetch.value;
+  const okxAnnouncementsResult = okxFetch.value;
+  const whaleResult = whaleFetch.value;
+  for (const result of [aggregatorFetch, gdeltFetch, polymarketFetch, binanceFetch, okxFetch, whaleFetch]) {
+    if (result.refreshFailure) warnings.push(`缓存降级：${result.refreshFailure}`);
+  }
+  const sourceRefresh = Object.fromEntries(
+    Object.entries({ aggregator: aggregatorFetch, gdelt: gdeltFetch, polymarket: polymarketFetch, binanceAnnouncements: binanceFetch, okxAnnouncements: okxFetch, whale: whaleFetch })
+      .map(([key, result]) => [key, { cached: result.cached, stale: result.stale === true, fetchedAt: result.fetchedAt, attemptedAt: result.attemptedAt || null, refreshFailure: result.refreshFailure || null, ttlMs: result.ttlMs }])
+  );
 
   const rawAggregatedItems = Array.isArray(aggregatorResult?.items) ? aggregatorResult.items : [];
   const trendUpdate = updateTrendHistory(rawAggregatedItems, state.newsTrends);
@@ -3384,6 +3453,7 @@ async function main() {
       classifiedEvents: classifiedEvents.length,
       marketAnalyses: marketAnalyses.length
     },
+    sourceRefresh,
     storyClustering: storyClustering.stats,
     warnings: [...new Set(warnings)].slice(0, 80),
     messageFeed,
@@ -3412,9 +3482,15 @@ async function main() {
 }
 
 async function run() {
+  const startedAt = Date.now();
+  appendRuntimeLog(`[${new Date(startedAt).toISOString()}] signal:monitor run started`);
   const releaseLock = await acquireRuntimeLock();
   try {
     await main();
+    appendRuntimeLog(`[${new Date().toISOString()}] signal:monitor run completed elapsedMs=${Date.now() - startedAt}`);
+  } catch (error) {
+    appendRuntimeLog(`[${new Date().toISOString()}] signal:monitor run failed elapsedMs=${Date.now() - startedAt} error=${error instanceof Error ? error.message : String(error)}`);
+    throw error;
   } finally {
     releaseLock();
   }

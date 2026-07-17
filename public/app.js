@@ -1413,8 +1413,14 @@ function renderWarnings() {
 }
 
 function renderModels() {
+  const openDetails = new Set(
+    Array.from(document.querySelectorAll("#models details.model-details[open][data-detail-key]"), (item) => item.dataset.detailKey)
+  );
   const models = asArray(state.report?.modelCalculations);
   $("#models").innerHTML = models.length ? models.slice(0, 20).map(modelRow).join("") : `<div class="empty">${text.noModel}</div>`;
+  document.querySelectorAll("#models details.model-details[data-detail-key]").forEach((item) => {
+    if (openDetails.has(item.dataset.detailKey)) item.open = true;
+  });
 }
 
 function modelRow(item) {
@@ -1450,7 +1456,7 @@ function modelRow(item) {
         ${calcCell("EV", fmtPct(signal.expectancyPct, 2))}
         ${calcCell(text.modelLeverage, accountControl.modelSuggestedLeverage ? `${fmtNumber(accountControl.modelSuggestedLeverage, 2)}x` : "-")}
       </div>
-      <details class="model-details">
+      <details class="model-details" data-detail-key="${escapeHtml(item.symbol || "-")}">
         <summary>展开完整计算</summary>
         <div class="calc-grid calc-grid-detail">
           ${calcCell("Math Signal", fmtNumber(item.mathSignal, 4))}

@@ -64,6 +64,7 @@ const insufficient = buildPostTradeReview(
 );
 assert.equal(insufficient.status, "insufficient_data");
 assert.equal(insufficient.excludedTrades, 1);
+assert.deepEqual(insufficient.promotionBlockers, ["minimum_proposal_trades"]);
 
 const review = buildPostTradeReview(
   Array.from({ length: 40 }, (_, index) => syntheticTrade(index)),
@@ -75,6 +76,7 @@ assert.ok(review.candidateDirectionWeights);
 assert.ok(review.candidateDirectionWeights.trend > review.currentDirectionWeights.trend);
 assert.ok(review.candidateDirectionWeights.momentum < review.currentDirectionWeights.momentum);
 assert.equal(review.validation.chronologicalSplit, true);
+assert.ok(review.promotionBlockers.includes("minimum_promotion_trades"));
 
 const account = {
   sessionId: "session-test",
