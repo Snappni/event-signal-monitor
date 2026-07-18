@@ -34,6 +34,12 @@ import {
   ADAPTIVE_GATE_BOUNDS,
   evaluateAdaptiveEntryGate
 } from "./adaptive-entry-gate.mjs";
+import {
+  DEFAULT_EXIT_MODEL_WEIGHTS,
+  evaluateAdaptivePositionExit,
+  normalizeExitWeights
+} from "./adaptive-position-exit.mjs";
+import { appendCompactHistory } from "./compact-history.mjs";
 
 const RUNTIME_DIR = path.resolve(
   process.env.SIGNAL_RUNTIME_DIR || path.resolve(".runtime", "event-signal-monitor")
@@ -51,10 +57,9 @@ const RUNTIME_LOG_PATH = path.resolve(RUNTIME_DIR, "fast-loop.log");
 const execFileAsync = promisify(execFile);
 loadDotEnv(path.resolve(".env"));
 
-const MONITOR_VERSION = "0.14.0";
+const MONITOR_VERSION = "0.15.0";
 const RUN_LAYER = "unified-high-frequency";
 const LAYER_REPORT_PATH = REPORT_PATH;
-const LAYER_HISTORY_PATH = HISTORY_PATH;
 const LOCK_PATH = path.resolve(RUNTIME_DIR, "run.lock");
 const ACCOUNT_LOCK_PATH = path.resolve(RUNTIME_DIR, "account.lock");
 const DEFAULT_SYMBOLS = [
@@ -289,10 +294,6 @@ function writeJson(filePath, value) {
   }
 }
 
-function appendJsonLine(filePath, value) {
-  fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf8");
-}
-
 function appendRuntimeLog(message) {
   ensureRuntimeDir();
   fs.appendFileSync(RUNTIME_LOG_PATH, `${message}\n`, "utf8");
@@ -418,6 +419,8 @@ function createPaperAccount(accountConfig, now = new Date().toISOString()) {
     availableEquity: config.initialCapital,
     positions: {},
     tradeHistory: [],
+    lifetimeClosedTrades: 0,
+    lifetimeWinningTrades: 0,
     postTradeReviewConfig: normalizePostTradeReviewConfig(),
     postTradeReview: createPostTradeReviewState(DIRECTION_MODEL_WEIGHTS, null),
     equityCurve: [
@@ -457,6 +460,17 @@ function readPaperAccount(accountConfig) {
       position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
   }
   account.tradeHistory = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+  account.lifetimeClosedTrades = Math.max(
+    account.tradeHistory.length,
+    Math.round(safeNumber(account.lifetimeClosedTrades, account.tradeHistory.length))
+  );
+  const retainedWinningTrades = account.tradeHistory.filter(
+    (trade) => safeNumber(trade.realizedPnl) > 0
+  ).length;
+  account.lifetimeWinningTrades = Math.max(
+    retainedWinningTrades,
+    Math.round(safeNumber(account.lifetimeWinningTrades, retainedWinningTrades))
+  );
   account.postTradeReviewConfig = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
   account.postTradeReview = normalizePostTradeReviewState(
     account.postTradeReview,
@@ -2701,23 +2715,72 @@ function closePaperPosition(account, positionId, price, reason, now) {
     grossTradingPnl,
     closedAt: now,
     closeReason: reason,
+    exitFactorSnapshot: position.exitEvaluation
+      ? {
+          version: position.exitEvaluation.version,
+          evaluatedAt: position.exitEvaluation.evaluatedAt,
+          signals: position.exitEvaluation.signals,
+          weights: position.exitEvaluation.weights,
+          exitScore: position.exitEvaluation.exitScore,
+          threshold: position.exitEvaluation.threshold,
+          diagnostics: position.exitEvaluation.diagnostics
+        }
+      : null,
     realizedPnl,
     realizedReturnPct: position.marginRequired > 0 ? realizedPnl / position.marginRequired : 0,
     accountReturnPct: account.startingCapital > 0 ? realizedPnl / account.startingCapital : 0
   };
+  if (["ADAPTIVE_EXIT", "MAX_HOLDING_TIME"].includes(reason) && position.exitEvaluation) {
+    const horizonHours = safeNumber(position.exitEvaluation.counterfactualHorizonHours, 4);
+    closed.exitCounterfactual = {
+      status: "pending",
+      horizonHours,
+      dueAt: new Date(new Date(now).getTime() + horizonHours * 3_600_000).toISOString(),
+      evaluatedAt: null,
+      referenceExitPrice: exitPrice,
+      counterfactualPrice: null,
+      counterfactualReturnPct: null,
+      avoidedReturnPct: null,
+      beneficial: null
+    };
+  }
   account.realizedPnl = safeNumber(account.realizedPnl) + closeSettlementPnl;
   account.tradingFees = safeNumber(account.tradingFees) + exitFee;
   account.slippageCost = safeNumber(account.slippageCost) + exitSlippageCost;
+  account.lifetimeClosedTrades = Math.max(
+    safeNumber(account.lifetimeClosedTrades),
+    Array.isArray(account.tradeHistory) ? account.tradeHistory.length : 0
+  ) + 1;
+  if (realizedPnl > 0) {
+    account.lifetimeWinningTrades = Math.max(
+      safeNumber(account.lifetimeWinningTrades),
+      (account.tradeHistory || []).filter((trade) => safeNumber(trade.realizedPnl) > 0).length
+    ) + 1;
+  }
   delete account.positions[positionId];
   account.tradeHistory = [...(account.tradeHistory || []), closed].slice(-500);
   return closed;
 }
 
-function closeTriggeredPaperPositions(account, marketBySymbol, now) {
+function closeTriggeredPaperPositions(account, marketBySymbol, candidatesBySymbol, now) {
   const closed = [];
+  const exitWeights = normalizeExitWeights(
+    account.postTradeReview?.currentExitWeights,
+    DEFAULT_EXIT_MODEL_WEIGHTS
+  );
   for (const [positionId, position] of Object.entries(account.positions || {})) {
-    const price = marketBySymbol[position.symbol]?.latest;
+    const market = marketBySymbol[position.symbol];
+    const price = market?.latest;
     if (!price) continue;
+    if (!position.exitPolicyStartedAt) position.exitPolicyStartedAt = now;
+    position.exitPolicyVersion = 1;
+    position.exitEvaluation = evaluateAdaptivePositionExit({
+      position,
+      market,
+      candidate: candidatesBySymbol[position.symbol] || null,
+      now,
+      weights: exitWeights
+    });
     let reason = null;
     if (position.side === "long") {
       if (price >= position.takeProfit) reason = "TP";
@@ -2725,6 +2788,15 @@ function closeTriggeredPaperPositions(account, marketBySymbol, now) {
     } else {
       if (price <= position.takeProfit) reason = "TP";
       if (price >= position.stopLoss) reason = "SL";
+    }
+    if (!reason) {
+      position.exitConfirmationCount = position.exitEvaluation.recommendsExit
+        ? safeNumber(position.exitConfirmationCount) + 1
+        : 0;
+      if (position.exitEvaluation.hardExpired) reason = "MAX_HOLDING_TIME";
+      else if (position.exitConfirmationCount >= position.exitEvaluation.confirmationRunsRequired) {
+        reason = "ADAPTIVE_EXIT";
+      }
     }
     if (reason) {
       const item = closePaperPosition(account, positionId, price, reason, now);
@@ -2815,6 +2887,10 @@ function openPaperPosition(account, signal, now) {
         openInterest: 0
       }
     ],
+    exitPolicyVersion: 1,
+    exitPolicyStartedAt: now,
+    exitConfirmationCount: 0,
+    exitEvaluation: null,
     unrealizedPnl: 0,
     unrealizedReturnPct: 0,
     priceReturnPct: 0
@@ -2867,7 +2943,17 @@ function buildPaperAccountSummary(account) {
   const returnStd = std(returns);
   const sharpeRatio = returnStd > 0 ? (avgReturn / returnStd) * Math.sqrt(Math.max(returns.length, 1)) : 0;
   const trades = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
-  const wins = trades.filter((trade) => safeNumber(trade.realizedPnl) > 0).length;
+  const closedTrades = Math.max(
+    trades.length,
+    Math.round(safeNumber(account.lifetimeClosedTrades, trades.length))
+  );
+  const wins = Math.min(
+    closedTrades,
+    Math.max(
+      trades.filter((trade) => safeNumber(trade.realizedPnl) > 0).length,
+      Math.round(safeNumber(account.lifetimeWinningTrades))
+    )
+  );
   return {
     startTime: account.startedAt || account.createdAt,
     endTime: account.updatedAt,
@@ -2877,10 +2963,10 @@ function buildPaperAccountSummary(account) {
     maxReturnPct: startingCapital > 0 ? maxEquity / startingCapital - 1 : 0,
     maxDrawdownPct,
     sharpeRatio,
-    closedTrades: trades.length,
+    closedTrades,
     wins,
-    losses: trades.length - wins,
-    winRate: trades.length ? wins / trades.length : 0,
+    losses: closedTrades - wins,
+    winRate: closedTrades ? wins / closedTrades : 0,
     openPositions: Object.keys(account.positions || {}).length,
     realizedPnl: safeNumber(account.realizedPnl),
     unrealizedPnl: safeNumber(account.unrealizedPnl),
@@ -2894,12 +2980,36 @@ function buildPaperAccountSummary(account) {
   };
 }
 
-function updatePaperAccount(account, actionableSignals, marketBySymbol) {
+function settleExitCounterfactuals(account, marketBySymbol, now) {
+  const nowMs = Date.parse(now);
+  for (const trade of account.tradeHistory || []) {
+    const counterfactual = trade?.exitCounterfactual;
+    if (!counterfactual || counterfactual.status !== "pending") continue;
+    if (nowMs < Date.parse(counterfactual.dueAt || "")) continue;
+    const price = safeNumber(marketBySymbol[trade.symbol]?.latest);
+    const exitPrice = safeNumber(counterfactual.referenceExitPrice, trade.exitPrice);
+    if (price <= 0 || exitPrice <= 0) continue;
+    const counterfactualReturnPct =
+      trade.side === "short" ? 1 - price / exitPrice : price / exitPrice - 1;
+    trade.exitCounterfactual = {
+      ...counterfactual,
+      status: "evaluated",
+      evaluatedAt: now,
+      counterfactualPrice: price,
+      counterfactualReturnPct,
+      avoidedReturnPct: -counterfactualReturnPct,
+      beneficial: counterfactualReturnPct <= 0
+    };
+  }
+}
+
+function updatePaperAccount(account, actionableSignals, allCandidates, marketBySymbol) {
   const now = new Date().toISOString();
   account.version = MONITOR_VERSION;
   account.updatedAt = now;
   markPaperPositions(account, marketBySymbol, now);
-  const closedPositions = closeTriggeredPaperPositions(account, marketBySymbol, now);
+  const candidatesBySymbol = Object.fromEntries(allCandidates.map((candidate) => [candidate.symbol, candidate]));
+  const closedPositions = closeTriggeredPaperPositions(account, marketBySymbol, candidatesBySymbol, now);
   markPaperPositions(account, marketBySymbol, now);
   const openedPositions = [];
   for (const signal of actionableSignals) {
@@ -2910,6 +3020,7 @@ function updatePaperAccount(account, actionableSignals, marketBySymbol) {
     }
   }
   markPaperPositions(account, marketBySymbol, now);
+  settleExitCounterfactuals(account, marketBySymbol, now);
   appendEquityPoint(account, now);
   const postTradeReviewResult = maybeRunPostTradeReview(account, DIRECTION_MODEL_WEIGHTS, now);
   account.summary = buildPaperAccountSummary(account);
@@ -3366,7 +3477,7 @@ async function main() {
       sameAccountConfig(accountConfig, finalAccountConfig) && accountSessionId === latestPaperAccount.sessionId;
     updatedPaperAccount =
       latestPaperAccount.isActive && sameAccountSession
-        ? updatePaperAccount(latestPaperAccount, actionableSignals, marketBySymbol)
+        ? updatePaperAccount(latestPaperAccount, actionableSignals, candidates, marketBySymbol)
         : latestPaperAccount;
     state.directionWeights = updatedPaperAccount.postTradeReview?.currentDirectionWeights || state.directionWeights;
     writeJson(ACCOUNT_STATE_PATH, updatedPaperAccount);
@@ -3396,7 +3507,7 @@ async function main() {
         "story clustering",
         "event review",
         "model weight calibration",
-        "TP/SL/expiry review"
+        "TP/SL/adaptive exit/expiry review"
       ]
     },
     analysisPolicy: {
@@ -3418,6 +3529,7 @@ async function main() {
       ],
       advancedModelWeights: {
         direction: state.directionWeights || DIRECTION_MODEL_WEIGHTS,
+        exit: updatedPaperAccount.postTradeReview?.currentExitWeights || DEFAULT_EXIT_MODEL_WEIGHTS,
         garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
         markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT,
         bayesianPosteriorWeight: BAYESIAN_POSTERIOR_WEIGHT
@@ -3469,14 +3581,32 @@ async function main() {
     postTradeReview: updatedPaperAccount.postTradeReview || null
   };
 
+  let historyStorage;
+  try {
+    historyStorage = appendCompactHistory({
+      filePath: HISTORY_PATH,
+      report,
+      state,
+      now: report.generatedAt
+    });
+  } catch (error) {
+    historyStorage = {
+      written: false,
+      reason: "write_failed",
+      error: error instanceof Error ? error.message : String(error)
+    };
+    report.warnings = [
+      ...new Set([...report.warnings, `历史摘要写入失败：${historyStorage.error}`])
+    ];
+  }
+  report.historyStorage = historyStorage;
+  if (historyStorage.reason === "low_disk") {
+    report.warnings = [...new Set([...report.warnings, "历史摘要写入已暂停：磁盘可用空间低于 10%。"])];
+  }
   writeJson(STATE_PATH, state);
   writeJson(LAYER_REPORT_PATH, report);
   if (LAYER_REPORT_PATH !== REPORT_PATH) {
     writeJson(REPORT_PATH, report);
-  }
-  appendJsonLine(LAYER_HISTORY_PATH, report);
-  if (LAYER_HISTORY_PATH !== HISTORY_PATH) {
-    appendJsonLine(HISTORY_PATH, report);
   }
   console.log(renderConsoleReport(report));
 }
@@ -3802,12 +3932,110 @@ function runRiskProfileSelfTest() {
   );
 }
 
+function runAdaptiveExitIntegrationSelfTest() {
+  const config = normalizeAccountConfig({
+    initialCapital: 1000,
+    marketType: "futures",
+    maxLeverage: 2
+  });
+  const account = createPaperAccount(config, "2026-07-18T00:00:00.000Z");
+  account.isActive = true;
+  account.postTradeReview.currentExitWeights = normalizeExitWeights({
+    signalReversal: 0.7,
+    netExpectancyDecay: 0.01,
+    eventDecay: 0.01,
+    timeDecay: 0.01
+  });
+  const signal = {
+    id: "EXIT-INTEGRATION-LONG",
+    status: "passed",
+    symbol: "BTCUSDT",
+    side: "long",
+    candidateMode: "math_only",
+    entry: 100,
+    takeProfit: 110,
+    stopLoss: 90,
+    winRate: 0.6,
+    expectancyPct: 0.01,
+    expectancyR: 0.5,
+    eventImpactScore: 0,
+    relatedEvents: [],
+    regime: "range",
+    factorSnapshot: { regime: "range", marketInputs: { atrPct: 0.01 } },
+    accountControl: {
+      allowed: true,
+      appliedLeverage: 2,
+      modelSuggestedLeverage: 2,
+      leverageCapped: false,
+      notional: 1998,
+      marginRequired: 999,
+      maxLossAmount: 100
+    }
+  };
+  const opened = openPaperPosition(account, signal, "2026-07-18T00:00:00.000Z");
+  const marketBySymbol = { BTCUSDT: { latest: 100, fundingRate: 0 } };
+  markPaperPositions(account, marketBySymbol, "2026-07-18T00:00:10.000Z");
+  const availableRatio = account.equity > 0 ? account.availableEquity / account.equity : 0;
+  if (!opened || !(availableRatio < 0.2)) {
+    throw new Error("position sizing unexpectedly reserves 20% free equity");
+  }
+  const candidatesBySymbol = {
+    BTCUSDT: { side: "short", combinedDirection: -1, winRate: 0.86 }
+  };
+  for (let index = 1; index <= 2; index += 1) {
+    const closed = closeTriggeredPaperPositions(
+      account,
+      marketBySymbol,
+      candidatesBySymbol,
+      index === 1 ? "2026-07-18T00:00:20.000Z" : "2026-07-18T00:00:30.000Z"
+    );
+    if (closed.length || !account.positions[opened.id]) {
+      throw new Error("adaptive exit ignored its confirmation requirement");
+    }
+  }
+  const closed = closeTriggeredPaperPositions(
+    account,
+    marketBySymbol,
+    candidatesBySymbol,
+    "2026-07-18T00:00:40.000Z"
+  );
+  if (
+    closed.length !== 1 ||
+    closed[0].closeReason !== "ADAPTIVE_EXIT" ||
+    closed[0].exitCounterfactual?.status !== "pending" ||
+    account.lifetimeClosedTrades !== 1
+  ) {
+    throw new Error(
+      `adaptive exit integration self-test failed: ${JSON.stringify({
+        closedCount: closed.length,
+        reason: closed[0]?.closeReason,
+        counterfactualStatus: closed[0]?.exitCounterfactual?.status,
+        lifetimeClosedTrades: account.lifetimeClosedTrades,
+        positionRemaining: Boolean(account.positions[opened.id]),
+        confirmationCount: account.positions[opened.id]?.exitConfirmationCount,
+        exitEvaluation: account.positions[opened.id]?.exitEvaluation
+      })}`
+    );
+  }
+  console.log(
+    JSON.stringify({
+      passed: true,
+      availableEquityRatio: availableRatio,
+      confirmationRuns: 3,
+      closeReason: closed[0].closeReason,
+      lifetimeClosedTrades: account.lifetimeClosedTrades
+    })
+  );
+}
+
 const execution = process.argv.includes("--self-test-costs")
   ? Promise.resolve().then(runCostModelSelfTest)
   : process.argv.includes("--self-test-models")
     ? Promise.resolve().then(runAdvancedModelsSelfTest)
     : process.argv.includes("--self-test-profiles")
       ? Promise.resolve().then(runRiskProfileSelfTest)
+      : process.argv.includes("--self-test-exit-integration")
+        ? Promise.resolve().then(runAdaptiveExitIntegrationSelfTest)
       : run();
 
 execution.catch((error) => {

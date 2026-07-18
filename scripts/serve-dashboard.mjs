@@ -487,6 +487,8 @@ function createPaperAccount(config, now = new Date().toISOString()) {
     availableEquity: normalized.initialCapital,
     positions: {},
     tradeHistory: [],
+    lifetimeClosedTrades: 0,
+    lifetimeWinningTrades: 0,
     postTradeReviewConfig: normalizePostTradeReviewConfig(),
     postTradeReview: createPostTradeReviewState(DEFAULT_DIRECTION_MODEL_WEIGHTS, null),
     equityCurve: [
@@ -547,6 +549,17 @@ function readAccountBundle() {
         position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
     }
     account.tradeHistory = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+    account.lifetimeClosedTrades = Math.max(
+      account.tradeHistory.length,
+      Math.round(safeNumber(account.lifetimeClosedTrades, account.tradeHistory.length))
+    );
+    const retainedWinningTrades = account.tradeHistory.filter(
+      (trade) => safeNumber(trade.realizedPnl) > 0
+    ).length;
+    account.lifetimeWinningTrades = Math.max(
+      retainedWinningTrades,
+      Math.round(safeNumber(account.lifetimeWinningTrades, retainedWinningTrades))
+    );
     account.postTradeReviewConfig = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
     account.postTradeReview = normalizePostTradeReviewState(
       account.postTradeReview,
@@ -664,7 +677,163 @@ function sendJson(response, value, statusCode = 200) {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store"
   });
-  response.end(JSON.stringify(value, null, 2));
+  response.end(JSON.stringify(value));
+}
+
+function loopStatus(latestReportOverride = null) {
+  const fastPidPath = path.join(RUNTIME_DIR, "fast-loop.pid");
+  const fastPid = Number(fs.existsSync(fastPidPath) ? fs.readFileSync(fastPidPath, "utf8").trim() : 0);
+  const pidRunning = isProcessRunning(fastPid);
+  const latestReport = latestReportOverride || readJson(path.join(RUNTIME_DIR, "latest-report.json"), null);
+  const reportGeneratedAt = latestReport?.generatedAt || null;
+  const reportTimestamp = Date.parse(reportGeneratedAt || "");
+  const reportAgeMs = Number.isFinite(reportTimestamp) ? Math.max(0, Date.now() - reportTimestamp) : null;
+  const reportFresh = reportAgeMs !== null && reportAgeMs <= LOOP_STALE_SECONDS * 1000;
+  return {
+    generatedAt: new Date().toISOString(),
+    loopMode: "unified-high-frequency",
+    loopPid: fastPid || null,
+    loopRunning: pidRunning || reportFresh,
+    loopBackend: pidRunning ? "process-pid" : reportFresh ? "report-heartbeat" : "none",
+    loopIntervalSeconds: LOOP_INTERVAL_SECONDS,
+    loopLastReportAt: reportGeneratedAt,
+    loopReportAgeSeconds: reportAgeMs === null ? null : Math.round(reportAgeMs / 1000),
+    loopStaleAfterSeconds: LOOP_STALE_SECONDS,
+    runtimeDir: RUNTIME_DIR
+  };
+}
+
+function reportHeader(report) {
+  return {
+    version: report?.version || null,
+    generatedAt: report?.generatedAt || null,
+    mode: report?.mode || "paper-alert-only",
+    layer: report?.layer || "unified-high-frequency",
+    sourceCounts: report?.sourceCounts || {},
+    uiCounts: {
+      actionable: Array.isArray(report?.actionableSignals) ? report.actionableSignals.length : 0,
+      watch: Array.isArray(report?.watchlist) ? report.watchlist.length : 0,
+      messages: Array.isArray(report?.messageFeed) ? report.messageFeed.length : 0,
+      models: Array.isArray(report?.modelCalculations) ? report.modelCalculations.length : 0
+    }
+  };
+}
+
+function compactRelatedEvents(events) {
+  return (Array.isArray(events) ? events : []).slice(0, 2).map((event) => ({
+    title: event?.title || event?.text || ""
+  }));
+}
+
+function compactPositionForDashboard(position) {
+  const keep = [
+    "id", "symbol", "side", "openedAt", "closedAt", "candidateMode", "riskProfile", "leverage",
+    "currentPrice", "entry", "signalEntryPrice", "exitReferencePrice", "exitPrice", "takeProfit", "stopLoss",
+    "winRate", "expectancyPct", "eventImpactScore", "unrealizedPnl", "netPnl", "unrealizedReturnPct",
+    "realizedPnl", "realizedReturnPct", "closeReason", "quantity", "modelSuggestedLeverage", "notional",
+    "marginRequired", "entryFee", "estimatedExitFee", "estimatedExitSlippageCost", "fundingPnl",
+    "fundingSettlements", "exitFee", "entrySlippageCost", "exitSlippageCost", "exitEvaluation",
+    "exitConfirmationCount"
+  ];
+  const result = Object.fromEntries(keep.map((key) => [key, position?.[key]]));
+  result.relatedEvents = compactRelatedEvents(position?.relatedEvents);
+  return result;
+}
+
+function compactAccountForDashboard(account) {
+  const positions = Object.fromEntries(
+    Object.entries(account?.positions || {}).map(([id, position]) => [id, compactPositionForDashboard(position)])
+  );
+  return {
+    sessionId: account?.sessionId || null,
+    isActive: account?.isActive === true,
+    startedAt: account?.startedAt || null,
+    createdAt: account?.createdAt || null,
+    updatedAt: account?.updatedAt || null,
+    startingCapital: safeNumber(account?.startingCapital),
+    realizedPnl: safeNumber(account?.realizedPnl),
+    unrealizedPnl: safeNumber(account?.unrealizedPnl),
+    tradingFees: safeNumber(account?.tradingFees),
+    slippageCost: safeNumber(account?.slippageCost),
+    fundingPnl: safeNumber(account?.fundingPnl),
+    equity: safeNumber(account?.equity),
+    marginUsed: safeNumber(account?.marginUsed),
+    availableEquity: safeNumber(account?.availableEquity),
+    positions,
+    tradeHistory: (Array.isArray(account?.tradeHistory) ? account.tradeHistory : []).map(compactPositionForDashboard),
+    summary: account?.summary || null
+  };
+}
+
+function pageData(view) {
+  const report = readJson(reportPath("latest"), null);
+  if (!report) return null;
+  const header = reportHeader(report);
+  if (view === "signals") {
+    return {
+      report: {
+        ...header,
+        actionableSignals: report.actionableSignals || [],
+        activeSignals: report.activeSignals || [],
+        closedSignals: report.closedSignals || [],
+        watchlist: report.watchlist || []
+      },
+      status: loopStatus(report)
+    };
+  }
+  if (view === "messages") {
+    return {
+      report: {
+        ...header,
+        warnings: report.warnings || [],
+        messageFeed: report.messageFeed || []
+      },
+      messageAggregator: publicMessageAggregatorStatus()
+    };
+  }
+  if (view === "models") {
+    return {
+      report: {
+        ...header,
+        modelCalculations: report.modelCalculations || []
+      }
+    };
+  }
+  if (view === "logs") {
+    return {
+      report: header,
+      status: loopStatus(report),
+      log: { text: readTail(path.join(RUNTIME_DIR, "fast-loop.log"), 80_000) }
+    };
+  }
+  const { config, account } = readAccountBundle();
+  return {
+    report: header,
+    status: loopStatus(report),
+    account: { config, account: compactAccountForDashboard(account) }
+  };
+}
+
+function compactAccountForSummary(account) {
+  return {
+    updatedAt: account?.updatedAt || null,
+    equity: safeNumber(account?.equity),
+    equityCurve: (Array.isArray(account?.equityCurve) ? account.equityCurve : []).map((point) => ({
+      time: point?.time,
+      equity: safeNumber(point?.equity),
+      returnPct: safeNumber(point?.returnPct)
+    })),
+    tradeHistory: (Array.isArray(account?.tradeHistory) ? account.tradeHistory : []).map((trade) => ({
+      id: trade?.id || null,
+      symbol: trade?.symbol || null,
+      side: trade?.side || null,
+      closedAt: trade?.closedAt || null,
+      closeReason: trade?.closeReason || null,
+      realizedPnl: safeNumber(trade?.realizedPnl),
+      winRate: safeNumber(trade?.winRate),
+      expectancyPct: safeNumber(trade?.expectancyPct)
+    }))
+  };
 }
 
 function sendStatic(response, requestPath) {
@@ -700,6 +869,16 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     sendJson(response, report);
+    return;
+  }
+  if (url.pathname === "/api/page-data") {
+    const view = String(url.searchParams.get("view") || "overview");
+    const data = pageData(view);
+    if (!data) {
+      sendJson(response, { error: "report_not_found" }, 404);
+      return;
+    }
+    sendJson(response, data);
     return;
   }
   if (url.pathname === "/api/translate" && request.method === "POST") {
@@ -842,7 +1021,10 @@ const server = http.createServer(async (request, response) => {
     sendJson(response, {
       config: account.postTradeReviewConfig,
       review: account.postTradeReview,
-      closedTrades: Array.isArray(account.tradeHistory) ? account.tradeHistory.length : 0
+      closedTrades: Math.max(
+        Array.isArray(account.tradeHistory) ? account.tradeHistory.length : 0,
+        safeNumber(account.lifetimeClosedTrades)
+      )
     });
     return;
   }
@@ -991,7 +1173,7 @@ const server = http.createServer(async (request, response) => {
   }
   if (url.pathname === "/api/account/summary") {
     const { config, account } = readAccountBundle();
-    sendJson(response, { config, summary: account.summary || null, account });
+    sendJson(response, { config, summary: account.summary || null, account: compactAccountForSummary(account) });
     return;
   }
   if (url.pathname === "/api/log") {
@@ -1002,26 +1184,7 @@ const server = http.createServer(async (request, response) => {
     return;
   }
   if (url.pathname === "/api/status") {
-    const fastPidPath = path.join(RUNTIME_DIR, "fast-loop.pid");
-    const fastPid = Number(fs.existsSync(fastPidPath) ? fs.readFileSync(fastPidPath, "utf8").trim() : 0);
-    const pidRunning = isProcessRunning(fastPid);
-    const latestReport = readJson(path.join(RUNTIME_DIR, "latest-report.json"), null);
-    const reportGeneratedAt = latestReport?.generatedAt || null;
-    const reportTimestamp = Date.parse(reportGeneratedAt || "");
-    const reportAgeMs = Number.isFinite(reportTimestamp) ? Math.max(0, Date.now() - reportTimestamp) : null;
-    const reportFresh = reportAgeMs !== null && reportAgeMs <= LOOP_STALE_SECONDS * 1000;
-    sendJson(response, {
-      generatedAt: new Date().toISOString(),
-      loopMode: "unified-high-frequency",
-      loopPid: fastPid || null,
-      loopRunning: pidRunning || reportFresh,
-      loopBackend: pidRunning ? "process-pid" : reportFresh ? "report-heartbeat" : "none",
-      loopIntervalSeconds: LOOP_INTERVAL_SECONDS,
-      loopLastReportAt: reportGeneratedAt,
-      loopReportAgeSeconds: reportAgeMs === null ? null : Math.round(reportAgeMs / 1000),
-      loopStaleAfterSeconds: LOOP_STALE_SECONDS,
-      runtimeDir: RUNTIME_DIR
-    });
+    sendJson(response, loopStatus());
     return;
   }
   sendStatic(response, url.pathname);

@@ -9,6 +9,25 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dashboardPath = path.join(__dirname, "serve-dashboard.mjs");
 const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "event-signal-dashboard-test-"));
+const largeMessage = `MESSAGE_ONLY_${"x".repeat(100_000)}`;
+const largeModel = `MODEL_ONLY_${"y".repeat(100_000)}`;
+fs.writeFileSync(
+  path.join(runtimeDir, "latest-report.json"),
+  JSON.stringify({
+    version: "test",
+    generatedAt: new Date().toISOString(),
+    mode: "paper-alert-only",
+    sourceCounts: { rss: 1, marketAnalyses: 1 },
+    warnings: [],
+    messageFeed: [{ title: "message", text: largeMessage }],
+    modelCalculations: [{ symbol: "BTCUSDT", mathBreakdown: { formula: largeModel } }],
+    actionableSignals: [],
+    watchlist: [],
+    activeSignals: [],
+    closedSignals: []
+  }),
+  "utf8"
+);
 
 function getFreePort() {
   return new Promise((resolve, reject) => {
@@ -115,9 +134,31 @@ try {
     assert.ok(reviewScript.includes(`$("#${binding}").addEventListener`), `missing review-page event binding ${binding}`);
   }
   assert.ok(reviewScript.includes("formDirty = true"), "review form must preserve unsaved input");
+  assert.ok(
+    reviewScript.includes("previousExitWeights"),
+    "exit-only promotions must remain rollback-capable"
+  );
   assert.ok(reviewScript.includes("setInterval(loadReview, 15_000)"), "review page must refresh without losing form state");
   assert.ok(reviewScript.includes('data-detail-key="${esc(detailKey)}"'), "review details need stable expansion keys");
   assert.ok(appScript.includes('data-detail-key="${escapeHtml(item.symbol || "-")}"'), "model details need stable expansion keys");
+  assert.ok(appScript.includes("/api/page-data?view="), "dedicated pages must use the slim page-data endpoint");
+  assert.ok(!appScript.includes('getJson("/api/report")'), "dedicated pages must not download the full report");
+  assert.ok(reviewHtml.includes('id="exitFactorRows"'), "review page must expose exit-factor iteration");
+
+  const pageResponses = await Promise.all(
+    ["overview", "signals", "messages", "models", "logs"].map((view) =>
+      fetch(`${baseUrl}/api/page-data?view=${view}`)
+    )
+  );
+  for (const response of pageResponses) assert.equal(response.status, 200);
+  const [overviewText, signalsText, messagesText, modelsText, logsText] = await Promise.all(
+    pageResponses.map((response) => response.text())
+  );
+  assert.ok(overviewText.length < 100_000, "overview payload must stay compact");
+  assert.ok(signalsText.length < 100_000, "signals payload must omit messages and models");
+  assert.ok(messagesText.includes("MESSAGE_ONLY_") && !messagesText.includes("MODEL_ONLY_"));
+  assert.ok(modelsText.includes("MODEL_ONLY_") && !modelsText.includes("MESSAGE_ONLY_"));
+  assert.ok(!logsText.includes("MESSAGE_ONLY_") && !logsText.includes("MODEL_ONLY_"));
   const requested = {
     initialCapital: 25_000,
     marketType: "futures",
@@ -145,6 +186,12 @@ try {
   assert.equal(persisted.config.riskProfile, requested.riskProfile);
   assert.equal(persisted.account.isActive, true);
 
+  const compactSummaryResponse = await fetch(`${baseUrl}/api/account/summary`);
+  const compactSummaryText = await compactSummaryResponse.text();
+  assert.equal(compactSummaryResponse.status, 200);
+  assert.ok(!compactSummaryText.includes("factorSnapshot"));
+  assert.ok(!compactSummaryText.includes('"positions"'));
+
   const secondStartResponse = await fetch(`${baseUrl}/api/account/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -160,6 +207,8 @@ try {
   assert.equal(reset.config.initialCapital, requested.initialCapital);
   assert.equal(reset.account.isActive, false);
   assert.notEqual(reset.account.sessionId, started.account.sessionId);
+  assert.equal(reset.account.lifetimeClosedTrades, 0);
+  assert.equal(reset.account.lifetimeWinningTrades, 0);
 
   const reviewConfigResponse = await fetch(`${baseUrl}/api/post-trade-review/config`, {
     method: "POST",
@@ -171,10 +220,18 @@ try {
   assert.equal(reviewConfig.account.postTradeReviewConfig.reviewEveryTrades, 12);
   assert.equal(reviewConfig.account.postTradeReviewConfig.autoApplyValidatedWeights, true);
 
+  reviewConfig.account.lifetimeClosedTrades = 640;
+  fs.writeFileSync(
+    path.join(runtimeDir, "paper-account.json"),
+    JSON.stringify(reviewConfig.account),
+    "utf8"
+  );
+
   const reviewStateResponse = await fetch(`${baseUrl}/api/post-trade-review`);
   const reviewState = await reviewStateResponse.json();
   assert.equal(reviewState.config.reviewEveryTrades, 12);
   assert.equal(reviewState.config.autoApplyValidatedWeights, true);
+  assert.equal(reviewState.closedTrades, 640);
 
   const applyResponse = await fetch(`${baseUrl}/api/post-trade-review/apply`, { method: "POST" });
   const rollbackResponse = await fetch(`${baseUrl}/api/post-trade-review/rollback`, { method: "POST" });

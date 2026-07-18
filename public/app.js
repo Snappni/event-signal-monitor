@@ -261,18 +261,21 @@ async function postJson(url, body = {}) {
 }
 
 async function loadData() {
-  const [report, status, log, account, messageAggregator] = await Promise.all([
-    getJson("/api/report"),
-    getJson("/api/status"),
-    getJson("/api/log?bytes=80000"),
-    getJson("/api/account"),
-    getJson("/api/message-aggregator/status")
-  ]);
-  state.report = report;
-  state.status = status;
-  state.log = log.text || "";
-  state.account = account;
-  state.messageAggregator = messageAggregator;
+  const view = location.pathname === "/messages.html"
+    ? "messages"
+    : location.pathname === "/models.html"
+      ? "models"
+      : location.pathname === "/signals.html"
+        ? "signals"
+        : location.pathname === "/logs.html"
+          ? "logs"
+          : "overview";
+  const data = await getJson(`/api/page-data?view=${view}`);
+  state.report = data.report || {};
+  state.status = data.status || {};
+  state.log = data.log?.text || "";
+  state.account = data.account || {};
+  state.messageAggregator = data.messageAggregator || {};
   render();
   if ($("#messages")) {
     loadMessageTranslations(report).catch(() => {
@@ -316,6 +319,7 @@ async function loadMessageTranslations(report) {
 function renderSummary() {
   const report = state.report || {};
   const sourceCounts = report.sourceCounts || {};
+  const uiCounts = report.uiCounts || {};
   const actionable = asArray(report.actionableSignals);
   const watchlist = asArray(report.watchlist);
   const messages = asArray(report.messageFeed);
@@ -323,10 +327,10 @@ function renderSummary() {
   setText("#subtitle", `${report.mode || "paper-alert-only"} | ${report.generatedAt || "-"}`);
   setText("#pageDataTime", report.generatedAt || "-");
   setText("#layerValue", "统一高频");
-  setText("#actionableValue", actionable.length);
-  setText("#watchValue", watchlist.length);
-  setText("#messageValue", messages.length);
-  setText("#modelValue", models.length);
+  setText("#actionableValue", uiCounts.actionable ?? actionable.length);
+  setText("#watchValue", uiCounts.watch ?? watchlist.length);
+  setText("#messageValue", uiCounts.messages ?? messages.length);
+  setText("#modelValue", uiCounts.models ?? models.length);
   const loopInterval = Math.max(1, Number(state.status?.loopIntervalSeconds || 10));
   const loopStatus = state.status?.loopRunning
     ? `统一高频 ${loopInterval}s ${text.running}`
@@ -484,7 +488,10 @@ function renderPostTradeReview(account, currency) {
   const config = account.postTradeReviewConfig || {};
   const reviewState = account.postTradeReview || {};
   const latest = reviewState.latestReview || null;
-  const closedTrades = asArray(account.tradeHistory).length;
+  const closedTrades = Math.max(
+    asArray(account.tradeHistory).length,
+    Number(account.summary?.closedTrades || 0)
+  );
   const reviewedTrades = Number(reviewState.reviewedTradeCount || 0);
   const newTrades = Math.max(0, closedTrades - reviewedTrades);
   const interval = Number(config.reviewEveryTrades || 20);
@@ -516,7 +523,11 @@ function renderPostTradeReview(account, currency) {
   const applyButton = $("#applyReviewCandidateButton");
   const rollbackButton = $("#rollbackReviewWeightsButton");
   if (applyButton) applyButton.disabled = state.postTradeReviewSubmitting || !latest?.promotionEligible || latest?.applied;
-  if (rollbackButton) rollbackButton.disabled = state.postTradeReviewSubmitting || !reviewState.previousDirectionWeights;
+  if (rollbackButton) {
+    rollbackButton.disabled =
+      state.postTradeReviewSubmitting ||
+      (!reviewState.previousDirectionWeights && !reviewState.previousExitWeights);
+  }
 
   const target = $("#postTradeReview");
   if (!target) return;
@@ -637,8 +648,12 @@ function renderAccountPositions(account, currency) {
   };
   const positions = Object.values(account.positions || {});
   const closedPositions = asArray(account.tradeHistory);
+  const lifetimeClosedPositions = Math.max(
+    closedPositions.length,
+    Number(account.summary?.closedTrades || 0)
+  );
   $("#openPositionCount").textContent = positions.length;
-  $("#closedPositionCount").textContent = closedPositions.length;
+  $("#closedPositionCount").textContent = lifetimeClosedPositions;
   document.querySelectorAll("[data-position-view]").forEach((button) => {
     button.classList.toggle("active", button.dataset.positionView === state.positionView);
   });
@@ -711,6 +726,14 @@ function positionRow(position, currency) {
           calcCell(text.fundingPnl, fmtMoney(position.fundingPnl || 0, currency)),
           calcCell(text.fundingSettlements, fmtNumber(position.fundingSettlements || 0, 0))
         ])}
+        ${position.exitEvaluation ? positionGroup("自适应退出评估", [
+          calcCell("退出评分 / 门槛", `${fmtNumber(position.exitEvaluation.exitScore, 3)} / ${fmtNumber(position.exitEvaluation.threshold, 3)}`),
+          calcCell("确认轮次", `${fmtNumber(position.exitConfirmationCount || 0, 0)} / ${fmtNumber(position.exitEvaluation.confirmationRunsRequired || 3, 0)}`),
+          calcCell("自适应最长持仓", `${fmtNumber(position.exitEvaluation.maxHoldingHours, 1)}h`),
+          calcCell("信号反转", fmtPct(position.exitEvaluation.signals?.signalReversal, 1)),
+          calcCell("净EV失效", fmtPct(position.exitEvaluation.signals?.netExpectancyDecay, 1)),
+          calcCell("事件 / 时间衰减", `${fmtPct(position.exitEvaluation.signals?.eventDecay, 1)} / ${fmtPct(position.exitEvaluation.signals?.timeDecay, 1)}`)
+        ]) : ""}
         ${titles ? `<div class="position-events"><span>关联事件</span>${escapeHtml(titles)}</div>` : ""}
       </details>
     </div>
@@ -1233,10 +1256,10 @@ function renderMessages() {
   const target = $("#messages");
   if (!target) return;
   const messages = asArray(state.report?.messageFeed);
-  const models = asArray(state.report?.modelCalculations);
+  const modelCount = Number(state.report?.uiCounts?.models || 0);
   target.innerHTML = messages.length
     ? messages.map(messageRow).join("")
-    : `<div class="empty">${models.length ? text.noMessagesMath : text.noMessagesNoMarket}</div>`;
+    : `<div class="empty">${modelCount ? text.noMessagesMath : text.noMessagesNoMarket}</div>`;
 }
 
 function renderMessageAggregatorConnection() {
@@ -1730,4 +1753,5 @@ window.addEventListener("resize", () => {
   }
 });
 loadData().catch(showError);
-setInterval(() => loadData().catch(showError), 15_000);
+const refreshIntervalMs = location.pathname === "/messages.html" ? 30_000 : 10_000;
+setInterval(() => loadData().catch(showError), refreshIntervalMs);
