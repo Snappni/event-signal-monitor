@@ -233,6 +233,9 @@ try {
       relatedEvents: [{ title: largeMessage }]
     }))
   };
+  reviewAccount.account.postTradeReview.reviewHistory = Array.from({ length: 20 }, () => ({
+    trades: [{ relatedEvents: [{ title: largeMessage }] }]
+  }));
   fs.writeFileSync(
     path.join(runtimeDir, "paper-account.json"),
     JSON.stringify(reviewAccount.account),
@@ -247,6 +250,7 @@ try {
   assert.equal(reviewState.config.autoApplyValidatedWeights, true);
   assert.equal(reviewState.closedTrades, 640);
   assert.equal(reviewState.review.latestReview.trades.length, 20);
+  assert.equal("reviewHistory" in reviewState.review, false);
   assert.ok(!reviewStateText.includes("MESSAGE_ONLY_"), "review payload must omit unused related-event bodies");
 
   const applyResponse = await fetch(`${baseUrl}/api/post-trade-review/apply`, { method: "POST" });

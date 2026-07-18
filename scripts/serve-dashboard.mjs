@@ -859,7 +859,14 @@ function publicPostTradeReview(account) {
   return {
     config: account?.postTradeReviewConfig,
     review: {
-      ...review,
+      version: review.version,
+      sessionId: review.sessionId,
+      completedReviews: safeNumber(review.completedReviews),
+      reviewedTradeCount: safeNumber(review.reviewedTradeCount),
+      weightVersion: safeNumber(review.weightVersion),
+      exitWeightVersion: safeNumber(review.exitWeightVersion),
+      currentDirectionWeights: review.currentDirectionWeights || {},
+      currentExitWeights: review.currentExitWeights || {},
       latestReview: latest ? { ...latest, trades } : null
     },
     closedTrades: Math.max(
