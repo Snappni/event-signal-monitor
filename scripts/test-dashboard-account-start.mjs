@@ -216,22 +216,38 @@ try {
     body: JSON.stringify({ enabled: true, reviewEveryTrades: 12, autoApplyValidatedWeights: true })
   });
   assert.equal(reviewConfigResponse.status, 200);
-  const reviewConfig = await reviewConfigResponse.json();
-  assert.equal(reviewConfig.account.postTradeReviewConfig.reviewEveryTrades, 12);
-  assert.equal(reviewConfig.account.postTradeReviewConfig.autoApplyValidatedWeights, true);
+  const reviewConfigText = await reviewConfigResponse.text();
+  assert.ok(reviewConfigText.length < 10_000, "review config mutation must not return the full account");
+  assert.ok(!reviewConfigText.includes('"tradeHistory"'));
+  const reviewConfig = JSON.parse(reviewConfigText);
+  assert.equal(reviewConfig.config.reviewEveryTrades, 12);
+  assert.equal(reviewConfig.config.autoApplyValidatedWeights, true);
 
-  reviewConfig.account.lifetimeClosedTrades = 640;
+  const reviewAccountResponse = await fetch(`${baseUrl}/api/account`);
+  const reviewAccount = await reviewAccountResponse.json();
+  reviewAccount.account.lifetimeClosedTrades = 640;
+  reviewAccount.account.postTradeReview.latestReview = {
+    trades: Array.from({ length: 25 }, (_, index) => ({
+      symbol: `TEST${index}`,
+      realizedPnl: index,
+      relatedEvents: [{ title: largeMessage }]
+    }))
+  };
   fs.writeFileSync(
     path.join(runtimeDir, "paper-account.json"),
-    JSON.stringify(reviewConfig.account),
+    JSON.stringify(reviewAccount.account),
     "utf8"
   );
 
   const reviewStateResponse = await fetch(`${baseUrl}/api/post-trade-review`);
-  const reviewState = await reviewStateResponse.json();
+  const reviewStateText = await reviewStateResponse.text();
+  assert.ok(reviewStateText.length < 100_000, "review page payload must stay compact");
+  const reviewState = JSON.parse(reviewStateText);
   assert.equal(reviewState.config.reviewEveryTrades, 12);
   assert.equal(reviewState.config.autoApplyValidatedWeights, true);
   assert.equal(reviewState.closedTrades, 640);
+  assert.equal(reviewState.review.latestReview.trades.length, 20);
+  assert.ok(!reviewStateText.includes("MESSAGE_ONLY_"), "review payload must omit unused related-event bodies");
 
   const applyResponse = await fetch(`${baseUrl}/api/post-trade-review/apply`, { method: "POST" });
   const rollbackResponse = await fetch(`${baseUrl}/api/post-trade-review/rollback`, { method: "POST" });

@@ -836,6 +836,39 @@ function compactAccountForSummary(account) {
   };
 }
 
+function publicPostTradeReview(account) {
+  const review = account?.postTradeReview || {};
+  const latest = review.latestReview || null;
+  const trades = (Array.isArray(latest?.trades) ? latest.trades : []).slice(-20).map((trade) => ({
+    symbol: trade?.symbol || null,
+    side: trade?.side || null,
+    openedAt: trade?.openedAt || null,
+    closedAt: trade?.closedAt || null,
+    closeReason: trade?.closeReason || null,
+    realizedPnl: safeNumber(trade?.realizedPnl),
+    classification: trade?.classification || null,
+    entry: safeNumber(trade?.entry),
+    exitPrice: safeNumber(trade?.exitPrice),
+    takeProfit: safeNumber(trade?.takeProfit),
+    stopLoss: safeNumber(trade?.stopLoss),
+    decision: trade?.decision || null,
+    factorContributions: trade?.factorContributions || [],
+    exitDecision: trade?.exitDecision || null,
+    exitCounterfactual: trade?.exitCounterfactual || null
+  }));
+  return {
+    config: account?.postTradeReviewConfig,
+    review: {
+      ...review,
+      latestReview: latest ? { ...latest, trades } : null
+    },
+    closedTrades: Math.max(
+      Array.isArray(account?.tradeHistory) ? account.tradeHistory.length : 0,
+      safeNumber(account?.lifetimeClosedTrades)
+    )
+  };
+}
+
 function sendStatic(response, requestPath) {
   const relativePath = requestPath === "/" ? "index.html" : requestPath.replace(/^\/+/, "");
   const filePath = path.resolve(PUBLIC_DIR, relativePath);
@@ -1018,21 +1051,14 @@ const server = http.createServer(async (request, response) => {
   }
   if (url.pathname === "/api/post-trade-review" && request.method === "GET") {
     const { account } = readAccountBundle();
-    sendJson(response, {
-      config: account.postTradeReviewConfig,
-      review: account.postTradeReview,
-      closedTrades: Math.max(
-        Array.isArray(account.tradeHistory) ? account.tradeHistory.length : 0,
-        safeNumber(account.lifetimeClosedTrades)
-      )
-    });
+    sendJson(response, publicPostTradeReview(account));
     return;
   }
   if (url.pathname === "/api/post-trade-review/config" && request.method === "POST") {
     try {
       const body = await readRequestJson(request);
       const result = await withAccountLock(() => {
-        const { config, account } = readAccountBundle();
+        const { account } = readAccountBundle();
         account.postTradeReviewConfig = normalizePostTradeReviewConfig({
           ...account.postTradeReviewConfig,
           ...body
@@ -1041,9 +1067,8 @@ const server = http.createServer(async (request, response) => {
         account.updatedAt = new Date().toISOString();
         writeJson(ACCOUNT_STATE_PATH, account);
         return {
-          config,
-          account,
-          triggeredReview: reviewResult.review
+          config: account.postTradeReviewConfig,
+          triggeredReview: Boolean(reviewResult.review)
         };
       });
       sendJson(response, result);
@@ -1055,11 +1080,15 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname === "/api/post-trade-review/apply" && request.method === "POST") {
     try {
       const result = await withAccountLock(() => {
-        const { config, account } = readAccountBundle();
+        const { account } = readAccountBundle();
         applyLatestReviewCandidate(account, DEFAULT_DIRECTION_MODEL_WEIGHTS);
         account.updatedAt = new Date().toISOString();
         writeJson(ACCOUNT_STATE_PATH, account);
-        return { config, account };
+        return {
+          config: account.postTradeReviewConfig,
+          weightVersion: account.postTradeReview?.weightVersion || 1,
+          exitWeightVersion: account.postTradeReview?.exitWeightVersion || 1
+        };
       });
       sendJson(response, result);
     } catch (error) {
@@ -1070,11 +1099,15 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname === "/api/post-trade-review/rollback" && request.method === "POST") {
     try {
       const result = await withAccountLock(() => {
-        const { config, account } = readAccountBundle();
+        const { account } = readAccountBundle();
         rollbackPostTradeReviewWeights(account, DEFAULT_DIRECTION_MODEL_WEIGHTS);
         account.updatedAt = new Date().toISOString();
         writeJson(ACCOUNT_STATE_PATH, account);
-        return { config, account };
+        return {
+          config: account.postTradeReviewConfig,
+          weightVersion: account.postTradeReview?.weightVersion || 1,
+          exitWeightVersion: account.postTradeReview?.exitWeightVersion || 1
+        };
       });
       sendJson(response, result);
     } catch (error) {
