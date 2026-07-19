@@ -2,8 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 const WRITE_INTERVAL_MS = 60_000;
-const MAX_ACTIVE_FILE_BYTES = 128 * 1024 * 1024;
-const MAX_ARCHIVES = 4;
+const MAX_ACTIVE_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_ARCHIVES = 2;
+const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 const MIN_FREE_RATIO = 0.1;
 
 function safeNumber(value, fallback = 0) {
@@ -120,7 +121,7 @@ function rotateOversizedHistory(filePath, now) {
   }
 }
 
-export function pruneHistoryArchives(filePath, keep = MAX_ARCHIVES) {
+export function pruneHistoryArchives(filePath, keep = MAX_ARCHIVES, maxBytes = MAX_ARCHIVE_BYTES) {
   const directory = path.dirname(filePath);
   const prefix = `${path.basename(filePath)}.`;
   let entries;
@@ -134,13 +135,22 @@ export function pruneHistoryArchives(filePath, keep = MAX_ARCHIVES) {
     .filter((entry) => entry.isFile() && entry.name.startsWith(prefix) && entry.name.endsWith(".archive"))
     .map((entry) => {
       const archivePath = path.join(directory, entry.name);
-      return { path: archivePath, mtimeMs: fs.statSync(archivePath).mtimeMs };
+      const stat = fs.statSync(archivePath);
+      return { path: archivePath, mtimeMs: stat.mtimeMs, size: stat.size };
     })
     .sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path));
-  const kept = archives.slice(0, Math.max(0, keep)).map((item) => item.path);
+  const kept = [];
   const removed = [];
   const errors = [];
-  for (const item of archives.slice(Math.max(0, keep))) {
+  let keptBytes = 0;
+  for (const item of archives) {
+    const withinCount = kept.length < Math.max(0, keep);
+    const withinBytes = keptBytes + item.size <= Math.max(0, maxBytes);
+    if (withinCount && withinBytes) {
+      kept.push(item.path);
+      keptBytes += item.size;
+      continue;
+    }
     try {
       fs.unlinkSync(item.path);
       removed.push(item.path);
@@ -148,7 +158,7 @@ export function pruneHistoryArchives(filePath, keep = MAX_ARCHIVES) {
       errors.push({ path: item.path, error: error instanceof Error ? error.message : String(error) });
     }
   }
-  return { kept, removed, errors };
+  return { kept, removed, errors, keptBytes, maxBytes };
 }
 
 export function appendCompactHistory({ filePath, report, state, now = report?.generatedAt }) {

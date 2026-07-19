@@ -2,14 +2,18 @@ export const EXIT_FACTOR_KEYS = Object.freeze([
   "signalReversal",
   "netExpectancyDecay",
   "eventDecay",
-  "timeDecay"
+  "timeDecay",
+  "capitalEfficiency",
+  "profitProtection"
 ]);
 
 export const DEFAULT_EXIT_MODEL_WEIGHTS = Object.freeze({
-  signalReversal: 0.35,
-  netExpectancyDecay: 0.3,
-  eventDecay: 0.15,
-  timeDecay: 0.2
+  signalReversal: 0.277,
+  netExpectancyDecay: 0.238,
+  eventDecay: 0.119,
+  timeDecay: 0.158,
+  capitalEfficiency: 0.088,
+  profitProtection: 0.12
 });
 
 function safeNumber(value, fallback = 0) {
@@ -19,6 +23,16 @@ function safeNumber(value, fallback = 0) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function regimeKind(value, side) {
+  const regime = String(value || "unknown").toLowerCase();
+  if (regime.includes("transition")) return "transition";
+  if (regime.includes("range")) return "range";
+  if (regime.includes("bull")) return side === "short" ? "transition" : "trend";
+  if (regime.includes("bear")) return side === "long" ? "transition" : "trend";
+  if (regime.includes("trend")) return "trend";
+  return "unknown";
 }
 
 export function normalizeExitWeights(value, fallback = DEFAULT_EXIT_MODEL_WEIGHTS) {
@@ -58,7 +72,7 @@ function adaptiveMaxHoldingHours(position) {
     )
   );
   const volatilityFactor = clamp(0.012 / atrPct, 0.65, 1.35);
-  const regime = String(position?.regime || position?.factorSnapshot?.regime || "unknown");
+  const regime = regimeKind(position?.regime || position?.factorSnapshot?.regime, position?.side);
   const regimeFactor = regime === "trend" ? 1.15 : regime === "range" ? 0.85 : regime === "transition" ? 0.75 : 1;
   return clamp(baseHours * volatilityFactor * regimeFactor, 4, 24);
 }
@@ -119,25 +133,53 @@ export function evaluateAdaptivePositionExit({ position, market, candidate, now,
     signalReversal: reversalStrength,
     netExpectancyDecay,
     eventDecay,
-    timeDecay
+    timeDecay,
+    capitalEfficiency: 0,
+    profitProtection: clamp(safeNumber(position?.dynamicProtection?.profitProtection), 0, 1)
   };
   const exitScore = EXIT_FACTOR_KEYS.reduce(
     (score, key) => score + signals[key] * currentWeights[key],
     0
   );
-  const regime = String(position?.regime || position?.factorSnapshot?.regime || "unknown");
-  const threshold = regime === "trend" ? 0.72 : regime === "range" ? 0.64 : regime === "transition" ? 0.62 : 0.68;
+  const regime = regimeKind(position?.regime || position?.factorSnapshot?.regime, position?.side);
+  const baseThreshold = regime === "trend" ? 0.72 : regime === "range" ? 0.64 : regime === "transition" ? 0.62 : 0.68;
   const hardExpired = timeDecay >= 1;
+  const materialNegativeExpectancy =
+    ageMs >= 10 * 60 * 1000 &&
+    remainingExpectancyPct <= -Math.max(0.0015, futureExecutionCostPct);
+  const threshold = hardExpired || materialNegativeExpectancy ? Math.min(baseThreshold, exitScore) : baseThreshold;
+  const recommendsExit = hardExpired || materialNegativeExpectancy || exitScore >= threshold;
+  const entryExpectancyPct = Math.max(0, safeNumber(position?.expectancyPct));
+  const qualityRetention = entryExpectancyPct > 0
+    ? remainingExpectancyPct / entryExpectancyPct
+    : 1;
+  const deRiskCostFloorPct = futureExecutionCostPct + projectedFundingCostPct;
+  const qualityDeteriorated =
+    entryExpectancyPct > 0 && remainingExpectancyPct <= entryExpectancyPct * 0.55;
+  const recommendsDeRisk =
+    !recommendsExit &&
+    ageMs >= 20 * 60 * 1000 &&
+    (qualityDeteriorated || remainingExpectancyPct <= deRiskCostFloorPct);
+  const deRiskFraction = recommendsDeRisk
+    ? remainingExpectancyPct <= 0 || qualityRetention <= 0.25
+      ? 0.5
+      : 0.25
+    : 0;
   return {
-    version: 1,
+    version: 4,
     evaluatedAt: nowIso,
     policyStartedAt,
     signals,
     weights: currentWeights,
     exitScore,
     threshold,
-    recommendsExit: hardExpired || exitScore >= threshold,
+    recommendsExit,
+    recommendsDeRisk,
+    deRiskFraction,
+    deRiskConfirmationRunsRequired: 3,
+    deRiskCooldownMinutes: 30,
     hardExpired,
+    materialNegativeExpectancy,
     maxHoldingHours,
     confirmationRunsRequired: hardExpired ? 1 : 3,
     counterfactualHorizonHours: clamp(maxHoldingHours / 4, 1, 4),
@@ -148,9 +190,15 @@ export function evaluateAdaptivePositionExit({ position, market, candidate, now,
       remainingRewardPct: distances.rewardPct,
       remainingRiskPct: distances.riskPct,
       remainingExpectancyPct,
+      entryExpectancyPct,
+      qualityRetention,
+      deRiskCostFloorPct,
+      qualityDeteriorated,
       futureExecutionCostPct,
       projectedFundingCostPct,
       freshestEventWeight,
+      normalizedRegime: regime,
+      baseThreshold,
       policyAgeHours: ageMs / 3_600_000
     }
   };

@@ -62,6 +62,11 @@ assert.equal(
   4,
   "archive retention must bound future history growth"
 );
+for (const archivePath of retention.kept) fs.writeFileSync(archivePath, "123456");
+const byteRetention = pruneHistoryArchives(filePath, 4, 10);
+assert.equal(byteRetention.kept.length, 1, "archive retention must enforce the total byte limit");
+assert.equal(byteRetention.removed.length, 3);
+assert.ok(byteRetention.keptBytes <= 10);
 fs.rmSync(runtime, { recursive: true, force: true });
 
 console.log("compact history tests passed");

@@ -1,3 +1,5 @@
+import "./beijing-clock.js";
+
 const state = {
   report: null,
   status: null,
@@ -7,11 +9,13 @@ const state = {
   summaryFetchedAt: null,
   positionView: "open",
   summaryCharts: new Map(),
+  positionCharts: new Map(),
   translations: {},
   translationRequestKey: "",
   messageAggregator: null,
   messageAggregatorEditing: false,
   messageAggregatorSubmitting: false,
+  accountFormDirty: false,
   postTradeReviewSubmitting: false,
   rawLogVisible: false
 };
@@ -26,7 +30,7 @@ const text = {
   running: "\u8fd0\u884c\u4e2d",
   stopped: "\u672a\u8fd0\u884c",
   opening: "\u5f00\u4ed3\u5019\u9009",
-  tracking: "\u8ddf\u8e2a\u4e2d",
+  tracking: "信号结果观察中（最长 72 小时，非仓位）",
   closed: "\u5df2\u5173\u95ed",
   watch: "\u89c2\u5bdf",
   none: "\u65e0\u5019\u9009",
@@ -67,7 +71,8 @@ const text = {
   tradingFees: "\u7d2f\u8ba1\u624b\u7eed\u8d39",
   slippageCost: "\u7d2f\u8ba1\u6ed1\u70b9\u6210\u672c",
   fundingPnl: "\u8d44\u91d1\u8d39\u7387\u51c0\u989d",
-  costModel: "\u6210\u672c\u6a21\u578b",
+  notExecutable: "\u672a\u901a\u8fc7\u5f00\u4ed3\u95e8\u69db",
+  notApplicable: "\u4e0d\u9002\u7528",
   marginUsed: "\u5df2\u7528\u4fdd\u8bc1\u91d1",
   availableEquity: "\u53ef\u7528\u6743\u76ca",
   openPositions: "\u6301\u4ed3",
@@ -83,7 +88,6 @@ const text = {
   conservative: "\u4fdd\u5b88\u578b",
   aggressive: "\u6fc0\u8fdb\u578b",
   entryGate: "\u5f00\u4ed3\u95e8\u69db",
-  leverageRule: "\u6760\u6746\u89c4\u5219",
   notional: "\u540d\u4e49\u4ed3\u4f4d",
   quantity: "\u6570\u91cf",
   currentPrice: "\u5f53\u524d\u4ef7",
@@ -98,10 +102,10 @@ const text = {
   closedAt: "\u5e73\u4ed3\u65f6\u95f4",
   paperOnly: "\u4ec5\u6a21\u62df\uff0c\u4e0d\u4e0b\u5b9e\u76d8\u5355\u3002",
   accountStatus: "\u8d26\u6237\u72b6\u6001",
-  accountRunning: "\u6a21\u62df\u8fd0\u884c\u4e2d",
-  accountIdle: "\u672a\u542f\u52a8",
-  startAccount: "\u542f\u52a8\u6a21\u62df",
-  runningAccount: "\u5df2\u542f\u52a8",
+  accountRunning: "\u7eb8\u9762\u5f00\u4ed3\u5df2\u542f\u7528",
+  accountIdle: "\u7eb8\u9762\u5f00\u4ed3\u5df2\u6682\u505c",
+  startAccount: "\u542f\u7528\u7eb8\u9762\u5f00\u4ed3",
+  runningAccount: "\u6682\u505c\u7eb8\u9762\u5f00\u4ed3",
   summaryStart: "\u5f00\u59cb\u65f6\u95f4",
   summaryEnd: "\u622a\u6b62\u65f6\u95f4",
   finalReturn: "\u6700\u7ec8\u6536\u76ca\u7387",
@@ -113,7 +117,9 @@ const text = {
   reset:
     "\u5df2\u91cd\u7f6e\u6a21\u62df\u8d26\u6237\uff0c\u65e7\u6301\u4ed3\u548c\u5386\u53f2\u5df2\u6e05\u7a7a\u3002\u8d26\u6237\u4fdd\u6301\u672a\u542f\u52a8\uff0c\u70b9\u51fb\u201c\u542f\u52a8\u6a21\u62df\u201d\u540e\u624d\u4f1a\u63a5\u6536\u65b0\u4fe1\u53f7\u3002",
   started:
-    "\u6a21\u62df\u8d26\u6237\u5df2\u542f\u52a8\uff0c\u4ece\u4e0b\u4e00\u4e2a\u5b8c\u6574\u76d1\u63a7\u8f6e\u6b21\u5f00\u59cb\u63a5\u6536\u5408\u683c\u5f00\u4ed3\u4fe1\u53f7\u3002",
+    "\u7eb8\u9762\u5f00\u4ed3\u5df2\u542f\u7528\uff0c\u76d1\u63a7\u670d\u52a1\u59cb\u7ec8\u72ec\u7acb\u8fd0\u884c\u3002",
+  stopped:
+    "\u7eb8\u9762\u5f00\u4ed3\u5df2\u6682\u505c\uff1b\u65e2\u6709\u4ed3\u4f4d\u4ecd\u4f1a\u6301\u7eed\u8ddf\u8e2a\u3001\u6b62\u76c8\u6b62\u635f\u548c\u5e73\u4ed3\u3002",
   viewSummary: "\u67e5\u770b\u603b\u7ed3",
   refreshSummary: "\u5237\u65b0\u603b\u7ed3",
   collapseSummary: "\u6536\u8d77\u603b\u7ed3",
@@ -159,15 +165,17 @@ function fmtTimestamp(value) {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "-";
-  return new Intl.DateTimeFormat("zh-CN", {
+  const formatted = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-    hour12: false
+    hourCycle: "h23"
   }).format(date);
+  return `${formatted}（北京时间 UTC+8）`;
 }
 
 function fmtAgeMinutes(value) {
@@ -278,7 +286,7 @@ async function loadData() {
   state.messageAggregator = data.messageAggregator || {};
   render();
   if ($("#messages")) {
-    loadMessageTranslations(report).catch(() => {
+    loadMessageTranslations(state.report).catch(() => {
       // Translation failure must not interrupt monitoring or report rendering.
     });
   }
@@ -324,19 +332,37 @@ function renderSummary() {
   const watchlist = asArray(report.watchlist);
   const messages = asArray(report.messageFeed);
   const models = asArray(report.modelCalculations);
-  setText("#subtitle", `${report.mode || "paper-alert-only"} | ${report.generatedAt || "-"}`);
-  setText("#pageDataTime", report.generatedAt || "-");
-  setText("#layerValue", "统一高频");
+  const messageStats = report.messageFeedStats || {};
+  const messageTotal = Number(uiCounts.messages ?? messageStats.total ?? sourceCounts.uniqueStories ?? messages.length);
+  const displayedMessages = Number(uiCounts.messagesDisplayed ?? messageStats.displayed ?? messages.length);
+  const messageLimit = Number(messageStats.limit ?? displayedMessages);
+  setText("#subtitle", `${report.mode || "paper-alert-only"} | ${fmtTimestamp(report.generatedAt)}`);
+  setText("#pageDataTime", fmtTimestamp(report.generatedAt));
+  setText("#layerValue", "事件驱动 + 自适应轮询");
   setText("#actionableValue", uiCounts.actionable ?? actionable.length);
   setText("#watchValue", uiCounts.watch ?? watchlist.length);
-  setText("#messageValue", uiCounts.messages ?? messages.length);
+  setText("#messageValue", Number.isFinite(messageTotal) ? messageTotal : messages.length);
+  setText(
+    "#messageDisplayCount",
+    displayedMessages < messageTotal
+      ? `当前展示 ${displayedMessages} / 总计 ${messageTotal}（上限 ${messageLimit}）`
+      : `当前展示 ${displayedMessages} 条（上限 ${messageLimit}）`
+  );
   setText("#modelValue", uiCounts.models ?? models.length);
-  const loopInterval = Math.max(1, Number(state.status?.loopIntervalSeconds || 10));
   const loopStatus = state.status?.loopRunning
-    ? `统一高频 ${loopInterval}s ${text.running}`
-    : `统一高频 ${text.stopped}`;
+    ? `${state.status?.priceConnected ? "行情流已连接" : "决策服务已运行"} · ${text.running}`
+    : `事件驱动服务 ${text.stopped}`;
   setText("#loopValue", loopStatus);
-  setText("#reportTime", report.generatedAt || "-");
+  const healthStatus = $("#healthStatus");
+  if (healthStatus) {
+    healthStatus.classList.toggle("stopped", !state.status?.loopRunning);
+    healthStatus.lastChild.textContent = state.status?.loopRunning
+      ? state.status?.priceConnected
+        ? "行情流监控中"
+        : "决策服务运行中"
+      : "监控服务未运行";
+  }
+  setText("#reportTime", fmtTimestamp(report.generatedAt));
   setText("#sourceCounts", `内置 RSS ${sourceCounts.rss || 0} | 热榜 ${sourceCounts.trend || 0} | GDELT ${sourceCounts.gdelt || 0} | Polymarket ${sourceCounts.polymarket || 0} | 交易所公告 ${(sourceCounts.binanceAnnouncements || 0) + (sourceCounts.okxAnnouncements || 0)} | 合并重复 ${sourceCounts.suppressedDuplicates || 0} | 市场计算 ${sourceCounts.marketAnalyses || 0}`);
   setText("#warningCount", asArray(report.warnings).length);
 }
@@ -346,26 +372,42 @@ function renderSignals() {
   if (!target) return;
   const report = state.report || {};
   const rows = [];
-  for (const signal of asArray(report.actionableSignals)) rows.push(signalRow(signal, text.opening, "ok"));
-  for (const signal of asArray(report.activeSignals)) rows.push(signalRow(signal, text.tracking, "warn"));
-  for (const signal of asArray(report.closedSignals)) rows.push(signalRow(signal, signal.outcome || text.closed, signal.outcome === "TP" ? "ok" : "danger"));
-  for (const signal of asArray(report.watchlist).slice(0, 6)) rows.push(signalRow(signal, text.watch, ""));
+  for (const signal of asArray(report.actionableSignals)) rows.push(signalRow(signal, text.opening, "ok", true));
+  for (const signal of asArray(report.activeSignals)) rows.push(signalRow(signal, text.tracking, "warn", true));
+  for (const signal of asArray(report.closedSignals)) {
+    const outcomeLabel = signal.outcome === "UNRESOLVED_EXPIRED" ? "到期未评估" : signal.outcome || text.closed;
+    rows.push(signalRow(signal, outcomeLabel, signal.outcome === "TP" ? "ok" : "danger", true));
+  }
+  for (const signal of asArray(report.watchlist).slice(0, 6)) rows.push(signalRow(signal, text.watch, "", false));
   target.innerHTML = rows.length ? rows.join("") : `<div class="empty">${text.noSignals}</div>`;
 }
 
-function signalRow(signal, label, badgeType) {
+function signalRow(signal, label, badgeType, showExecution) {
   const mode = signal.candidateMode === "math_only" ? "math-only" : signal.candidateMode || "-";
   const accountControl = signal.accountControl || {};
-  const leverageText =
-    accountControl.appliedLeverage > 0
-      ? `${fmtNumber(accountControl.appliedLeverage, 2)}x / ${fmtNumber(accountControl.maxLeverage, 0)}x`
+  const leverageText = !showExecution
+    ? text.notExecutable
+    : accountControl.appliedLeverage > 0
+      ? accountControl.leverageRuleExact
+        ? `${fmtNumber(accountControl.appliedLeverage, 0)}x / 币安档位 ${fmtNumber(accountControl.maxLeverage, 0)}x`
+        : `${fmtNumber(accountControl.appliedLeverage, 0)}x（模拟，账户档位未验证）`
       : accountControl.blockReason || "-";
+  const notionalText = showExecution
+    ? fmtMoney(accountControl.notional, accountControl.quoteCurrency || "USDT")
+    : text.notApplicable;
   const adaptiveGateText = Number.isFinite(Number(signal.adaptiveWinRateThreshold))
     ? `${fmtPct(signal.adaptiveWinRateThreshold, 1)} / 保本 ${fmtPct(signal.breakEvenWinRate, 1)}`
     : "旧信号未记录";
+  const lifecycleText = signal.closedAt
+    ? `结束时间 ${fmtTimestamp(signal.closedAt)}`
+    : signal.expiresAt
+      ? `观察截止 ${fmtTimestamp(signal.expiresAt)}`
+      : signal.createdAt
+        ? `信号时间 ${fmtTimestamp(signal.createdAt)}`
+        : "";
   return `
     <div class="signal-grid">
-      <div class="signal-cell"><span>${text.status}</span><strong>${badge(`${label} / ${mode}`, badgeType)}</strong></div>
+      <div class="signal-cell"><span>${text.status}</span><strong>${badge(`${label} / ${mode}`, badgeType)}</strong>${lifecycleText ? `<div class="row-meta">${escapeHtml(lifecycleText)}</div>` : ""}</div>
       <div class="signal-cell"><span>${text.symbol}</span><strong>${escapeHtml(signal.symbol)} ${escapeHtml(String(signal.side || "").toUpperCase())}</strong></div>
       <div class="signal-cell"><span>${text.entry}</span><strong>${fmtPrice(signal.entry)}</strong></div>
       <div class="signal-cell"><span>${text.takeProfit}</span><strong>${fmtPrice(signal.takeProfit)}</strong></div>
@@ -374,7 +416,7 @@ function signalRow(signal, label, badgeType) {
       <div class="signal-cell"><span>自适应胜率门槛 / 保本</span><strong>${escapeHtml(adaptiveGateText)}</strong></div>
       <div class="signal-cell"><span>EV / EV-R</span><strong>${fmtPct(signal.expectancyPct, 2)} / ${fmtNumber(signal.expectancyR, 2)}</strong></div>
       <div class="signal-cell"><span>${text.leverage}</span><strong>${escapeHtml(leverageText)}${accountControl.leverageCapped ? " cap" : ""}</strong></div>
-      <div class="signal-cell"><span>${text.notional}</span><strong>${fmtMoney(accountControl.notional, accountControl.quoteCurrency || "USDT")}</strong></div>
+      <div class="signal-cell"><span>${text.notional}</span><strong>${escapeHtml(notionalText)}</strong></div>
     </div>
   `;
 }
@@ -398,8 +440,11 @@ function getAccountFormPayload() {
   return {
     initialCapital: Number($("#accountCapital").value),
     marketType,
-    maxLeverage: marketType === "spot" ? 1 : Number($("#accountMaxLeverage").value),
-    riskProfile: $("#accountRiskProfile").value === "aggressive" ? "aggressive" : "conservative"
+    maxLeverage: marketType === "spot" ? 1 : Math.floor(Number($("#accountMaxLeverage").value)),
+    riskProfile: $("#accountRiskProfile").value === "aggressive" ? "aggressive" : "conservative",
+    takerFeeRate: Number($("#accountTakerFeePct").value) / 100,
+    slippageRate: Number($("#accountSlippagePct").value) / 100,
+    fundingIntervalHours: Number($("#accountFundingIntervalHours").value)
   };
 }
 
@@ -416,17 +461,28 @@ function renderAccount() {
   const returnPct = account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0;
   const valueTone = (value) => (Number(value) > 0 ? "metric-positive" : Number(value) < 0 ? "metric-negative" : "");
 
-  setInputValueIfUnfocused($("#accountCapital"), config.initialCapital ?? 10000);
-  setInputValueIfUnfocused($("#accountMarketType"), marketType);
-  setInputValueIfUnfocused($("#accountMaxLeverage"), marketType === "spot" ? 1 : config.maxLeverage ?? 3);
-  setInputValueIfUnfocused($("#accountRiskProfile"), riskProfile);
-  $("#accountMaxLeverage").disabled = marketType === "spot";
+  if (!state.accountFormDirty) {
+    setInputValueIfUnfocused($("#accountCapital"), config.initialCapital ?? 10000);
+    setInputValueIfUnfocused($("#accountMarketType"), marketType);
+    setInputValueIfUnfocused($("#accountMaxLeverage"), marketType === "spot" ? 1 : config.maxLeverage ?? 3);
+    setInputValueIfUnfocused($("#accountRiskProfile"), riskProfile);
+    setInputValueIfUnfocused(
+      $("#accountTakerFeePct"),
+      Number((safeNumber(config.takerFeeRate, marketType === "spot" ? 0.001 : 0.0005) * 100).toFixed(4))
+    );
+    setInputValueIfUnfocused(
+      $("#accountSlippagePct"),
+      Number((safeNumber(config.slippageRate, 0.0003) * 100).toFixed(4))
+    );
+    setInputValueIfUnfocused($("#accountFundingIntervalHours"), safeNumber(config.fundingIntervalHours, 8));
+  }
+  $("#accountMaxLeverage").disabled = $("#accountMarketType").value === "spot";
   const accountActive = account.isActive === true;
   const startButton = $("#startAccountButton");
-  startButton.disabled = accountActive;
+  startButton.disabled = false;
   startButton.textContent = accountActive ? text.runningAccount : text.startAccount;
   startButton.classList.toggle("is-running", accountActive);
-  $("#accountUpdatedAt").textContent = `${text.paperOnly} ${account.updatedAt || config.updatedAt || "-"}`;
+  $("#accountUpdatedAt").textContent = `${text.paperOnly} ${fmtTimestamp(account.updatedAt || config.updatedAt)}`;
 
   $("#accountMetrics").innerHTML = [
     metricCell(text.accountEquity, fmtMoney(account.equity, currency), "metric-primary"),
@@ -442,21 +498,7 @@ function renderAccount() {
     metricCell(text.marketType, marketType === "spot" ? text.spot : text.futures, "metric-policy"),
     metricCell(text.riskProfile, riskProfile === "aggressive" ? text.aggressive : text.conservative, "metric-policy"),
     metricCell(text.leverageCap, `${fmtNumber(config.maxLeverage || 1, 0)}x`, "metric-policy"),
-    metricCell(text.entryGate, "自适应：成本保本胜率 + 校准/波动/行情状态裕量", "metric-policy metric-wide"),
-    metricCell(
-      text.leverageRule,
-      marketType === "spot"
-        ? "\u73b0\u8d27\u56fa\u5b9a 1x"
-        : riskProfile === "aggressive"
-          ? "\u4fdd\u5b88\u5efa\u8bae\u503c 2x\uff0c\u4e0d\u8d85\u8fc7\u786c\u4e0a\u9650"
-          : "\u539f\u6a21\u578b\u5efa\u8bae\u503c",
-      "metric-policy metric-wide"
-    ),
-    metricCell(
-      text.costModel,
-      `费 ${fmtPct(config.takerFeeRate || 0, 3)}/边 · 滑 ${fmtPct(config.slippageRate || 0, 3)}/边${marketType === "futures" ? ` · 资金 ${fmtNumber(config.fundingIntervalHours || 8, 0)}h` : ""}`,
-      "cost-model-metric metric-policy metric-wide"
-    )
+    metricCell(text.entryGate, "自适应：成本保本胜率 + 校准/波动/行情状态裕量", "metric-policy metric-wide")
   ].join("");
 
   renderAccountPositions(account, currency);
@@ -481,7 +523,13 @@ const reviewFactorLabels = {
   hiddenMarkov: "HMM置信度",
   markowitz: "Markowitz仓位",
   poisson: "事件到达强度",
-  bayesian: "贝叶斯校准"
+  bayesian: "贝叶斯校准",
+  signalReversal: "信号反转",
+  netExpectancyDecay: "净EV失效",
+  eventDecay: "事件衰减",
+  timeDecay: "时间衰减",
+  capitalEfficiency: "资金效率",
+  profitProtection: "盈利保护"
 };
 
 function renderPostTradeReview(account, currency) {
@@ -540,6 +588,7 @@ function renderPostTradeReview(account, currency) {
   }
 
   const validation = latest.validation || null;
+  const exitValidation = latest.exitValidation || null;
   const factorRows = asArray(latest.factorStatistics)
     .map((item) => {
       const delta = Number(item.normalizedChangePct || 0);
@@ -551,6 +600,21 @@ function renderPostTradeReview(account, currency) {
           <div><span class="row-meta">候选权重</span>${item.candidateWeight == null ? "-" : fmtPct(item.candidateWeight, 2)}</div>
           <div class="review-factor-delta ${deltaClass}"><span class="row-meta">建议变化</span>${item.candidateWeight == null ? "-" : fmtPct(delta, 2)}</div>
           <div><span class="row-meta">方向关联</span>${fmtNumber(item.directionAssociation || 0, 3)}</div>
+        </div>
+      `;
+    })
+    .join("");
+  const exitFactorRows = asArray(latest.exitFactorStatistics)
+    .map((item) => {
+      const delta = Number(item.normalizedChangePct || 0);
+      const deltaClass = delta > 0 ? "up" : delta < 0 ? "down" : "";
+      return `
+        <div class="review-factor-row">
+          <div class="review-factor-name"><strong>${escapeHtml(reviewFactorLabels[item.factor] || item.factor)}</strong><span>${fmtNumber(item.activeSamples || 0, 0)}/${fmtNumber(item.samples || 0, 0)} 笔有效</span></div>
+          <div><span class="row-meta">当前权重</span>${fmtPct(item.currentWeight || 0, 2)}</div>
+          <div><span class="row-meta">候选权重</span>${item.candidateWeight == null ? "-" : fmtPct(item.candidateWeight, 2)}</div>
+          <div class="review-factor-delta ${deltaClass}"><span class="row-meta">建议变化</span>${item.candidateWeight == null ? "-" : fmtPct(delta, 2)}</div>
+          <div><span class="row-meta">反事实关联</span>${fmtNumber(item.directionAssociation || 0, 3)}</div>
         </div>
       `;
     })
@@ -578,7 +642,7 @@ function renderPostTradeReview(account, currency) {
       };
       return `
         <div class="review-trade-row">
-          <div><strong>${escapeHtml(trade.symbol || "-")} ${escapeHtml(String(trade.side || "").toUpperCase())}</strong><div class="row-meta">${escapeHtml(trade.openedAt || "-")} → ${escapeHtml(trade.closedAt || "-")}</div></div>
+          <div><strong>${escapeHtml(trade.symbol || "-")} ${escapeHtml(String(trade.side || "").toUpperCase())}</strong><div class="row-meta">${escapeHtml(fmtTimestamp(trade.openedAt))} → ${escapeHtml(fmtTimestamp(trade.closedAt))}</div></div>
           <div><strong>${fmtMoney(trade.realizedPnl || 0, currency)} / ${fmtNumber(trade.netR || 0, 2)}R</strong><div class="row-meta">${escapeHtml(classificationLabels[trade.classification] || trade.classification || "-")}</div></div>
           <div>
             <div>${escapeHtml(contributionText || "无可用贡献数据")}</div>
@@ -628,6 +692,16 @@ function renderPostTradeReview(account, currency) {
     ` : `<p class="review-note">目前只有 ${fmtNumber(latest.eligibleTrades || 0, 0)} 笔可归因交易；至少需要 ${fmtNumber(config.minimumProposalTrades || 20, 0)} 笔才生成候选权重。</p>`}
     <div class="review-subtitle">因子归因与候选权重</div>
     <div>${factorRows || `<div class="empty">暂无因子统计</div>`}</div>
+    <div class="review-subtitle">退出因子迭代（含动态盈利保护）</div>
+    ${exitValidation ? `
+      <div class="review-validation">
+        <div class="review-card"><span>退出训练样本</span><strong>${fmtNumber(exitValidation.trainingSamples || 0, 0)}</strong></div>
+        <div class="review-card"><span>退出验证样本</span><strong>${fmtNumber(exitValidation.validationSamples || 0, 0)}</strong></div>
+        <div class="review-card"><span>原退出权重准确率</span><strong>${fmtPct(exitValidation.champion?.accuracy || 0, 1)}</strong></div>
+        <div class="review-card"><span>候选退出权重准确率</span><strong>${fmtPct(exitValidation.challenger?.accuracy || 0, 1)}</strong></div>
+      </div>
+    ` : `<p class="review-note">动态止盈、动态止损和减仓后的反事实样本不足时，只记录盈利保护因子，不晋升退出权重。</p>`}
+    <div>${exitFactorRows || `<div class="empty">暂无退出因子统计</div>`}</div>
     <div class="review-subtitle">事件、风险与仓位因子诊断（只诊断，不混入方向权重）</div>
     <div>${qualityRows || `<div class="empty">暂无质量因子统计</div>`}</div>
     <div class="review-subtitle">最近交易完整链路摘要</div>
@@ -638,6 +712,10 @@ function renderPostTradeReview(account, currency) {
 
 function renderAccountPositions(account, currency) {
   if (!$("#accountPositions")) return;
+  for (const chart of state.positionCharts.values()) {
+    if (chart && !chart.isDisposed()) chart.dispose();
+  }
+  state.positionCharts.clear();
   const openDetails = new Set(
     Array.from(document.querySelectorAll("#accountPositions details.position-details[open][data-position-key]"), (item) => item.dataset.positionKey)
   );
@@ -676,6 +754,160 @@ function renderAccountPositions(account, currency) {
         .join("")
     : `<div class="empty">${text.noPositions}</div>`;
   restoreOpenDetails();
+  if (positions.length) requestAnimationFrame(() => renderPositionCharts(positions));
+}
+
+function plannedRiskReward(position) {
+  const entry = safeNumber(position.entry);
+  const takeProfit = safeNumber(position.originalTakeProfit, position.takeProfit);
+  const stopLoss = safeNumber(position.originalStopLoss, position.stopLoss);
+  const risk = Math.abs(entry - stopLoss);
+  return risk > 0 ? Math.abs(takeProfit - entry) / risk : 0;
+}
+
+function protectionStageLabel(stage) {
+  return {
+    inactive: "尚未触发",
+    tightening: "向保本线收紧",
+    trailing: "盈利跟踪",
+    runner: "剩余仓位延伸",
+    exit: "退出触发"
+  }[stage] || "等待评估";
+}
+
+function renderPositionCharts(positions) {
+  if (!window.echarts) return;
+  const byId = new Map(positions.map((position) => [String(position.id), position]));
+  document.querySelectorAll("[data-position-chart]").forEach((element) => {
+    const position = byId.get(element.dataset.positionChart);
+    if (!position) return;
+    const chart = window.echarts.init(element, null, { renderer: "canvas" });
+    chart.setOption(positionChartOption(position), true);
+    state.positionCharts.set(String(position.id), chart);
+  });
+}
+
+function positionChartOption(position) {
+  const openedAt = Number.isFinite(Date.parse(position.openedAt || ""))
+    ? Date.parse(position.openedAt)
+    : Date.now() - 1_000;
+  const observations = asArray(position.holdingObservations)
+    .map((item) => [Date.parse(item.time || ""), Number(item.price)])
+    .filter(([time, price]) => Number.isFinite(time) && Number.isFinite(price) && price > 0)
+    .sort((left, right) => left[0] - right[0]);
+  const currentPoint = [Date.now(), safeNumber(position.currentPrice, position.entry)];
+  if (!observations.length) observations.push([openedAt, safeNumber(position.entry)]);
+  const lastObservation = observations.at(-1);
+  if (currentPoint[0] > lastObservation[0] || currentPoint[1] !== lastObservation[1]) observations.push(currentPoint);
+  if (observations.length === 1) observations.unshift([Math.min(openedAt, observations[0][0] - 1_000), observations[0][1]]);
+  const endTime = observations.at(-1)[0];
+  const adjustments = asArray(position.dynamicProtection?.adjustmentHistory)
+    .map((item) => ({ ...item, timestamp: Date.parse(item.time || "") }))
+    .filter((item) => Number.isFinite(item.timestamp))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const stepData = (field, initialValue, currentValue) => {
+    const data = [[openedAt, safeNumber(initialValue, currentValue)]];
+    for (const item of adjustments) {
+      const value = Number(item[field]);
+      if (Number.isFinite(value)) data.push([item.timestamp, value]);
+    }
+    data.push([endTime, safeNumber(currentValue, initialValue)]);
+    return data;
+  };
+  const entry = safeNumber(position.entry);
+  const originalTakeProfit = safeNumber(position.originalTakeProfit, position.takeProfit);
+  const originalStopLoss = safeNumber(position.originalStopLoss, position.stopLoss);
+  const latestPoint = observations.at(-1);
+  const markAreas = position.side === "short"
+    ? [
+        [{ name: "计划收益区", yAxis: originalTakeProfit, itemStyle: { color: "rgba(49, 196, 141, 0.07)" } }, { yAxis: entry }],
+        [{ name: "初始风险区", yAxis: entry, itemStyle: { color: "rgba(255, 102, 112, 0.07)" } }, { yAxis: originalStopLoss }]
+      ]
+    : [
+        [{ name: "计划收益区", yAxis: entry, itemStyle: { color: "rgba(49, 196, 141, 0.07)" } }, { yAxis: originalTakeProfit }],
+        [{ name: "初始风险区", yAxis: originalStopLoss, itemStyle: { color: "rgba(255, 102, 112, 0.07)" } }, { yAxis: entry }]
+      ];
+  return {
+    animation: false,
+    aria: { enabled: true, description: `${position.symbol} 当前价格、动态止盈、开仓价和动态止损走势` },
+    color: ["#e8f1f8", "#f2b84b", "#ff6b70", "#6baeff"],
+    grid: { left: 58, right: 18, top: 42, bottom: 32 },
+    legend: {
+      top: 4,
+      left: 4,
+      itemWidth: 16,
+      itemHeight: 3,
+      textStyle: { color: "#9fb1c2", fontSize: 10 },
+      data: ["当前价格", "动态止盈", "动态止损"]
+    },
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: "rgba(5, 15, 24, 0.96)",
+      borderColor: "#2b4c63",
+      textStyle: { color: "#dce8f1", fontSize: 11 },
+      valueFormatter: (value) => fmtPrice(Number(value))
+    },
+    xAxis: {
+      type: "time",
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: "#294256" } },
+      axisLabel: { color: "#75899b", fontSize: 9, hideOverlap: true },
+      splitLine: { show: false }
+    },
+    yAxis: {
+      type: "value",
+      scale: true,
+      axisLabel: { color: "#75899b", fontSize: 9, formatter: (value) => fmtPrice(value) },
+      splitLine: { lineStyle: { color: "rgba(53, 78, 97, 0.32)" } }
+    },
+    series: [
+      {
+        name: "当前价格",
+        type: "line",
+        data: observations,
+        showSymbol: false,
+        smooth: 0.18,
+        lineStyle: { width: 2 },
+        markLine: {
+          silent: true,
+          symbol: "none",
+          label: { color: "#8fa6b8", fontSize: 9, position: "insideEndTop" },
+          lineStyle: { color: "#547188", type: "dashed", width: 1 },
+          data: [
+            { name: "开仓", yAxis: entry },
+            { name: "原止盈", yAxis: originalTakeProfit },
+            { name: "原止损", yAxis: originalStopLoss }
+          ]
+        },
+        markArea: { silent: true, label: { show: false }, data: markAreas }
+      },
+      {
+        name: "动态止盈",
+        type: "line",
+        data: stepData("takeProfit", originalTakeProfit, position.takeProfit),
+        step: "end",
+        showSymbol: false,
+        lineStyle: { width: 1.5 }
+      },
+      {
+        name: "动态止损",
+        type: "line",
+        data: stepData("stopLoss", originalStopLoss, position.stopLoss),
+        step: "end",
+        showSymbol: false,
+        lineStyle: { width: 1.5 }
+      },
+      {
+        name: "最新",
+        type: "scatter",
+        data: [latestPoint],
+        symbolSize: 8,
+        itemStyle: { color: "#e8f1f8", borderColor: "#081722", borderWidth: 2 },
+        tooltip: { show: false },
+        z: 5
+      }
+    ]
+  };
 }
 
 function positionRow(position, currency) {
@@ -687,6 +919,8 @@ function positionRow(position, currency) {
     .map((item) => item.title || item.text || "")
     .filter(Boolean)
     .join(" | ");
+  const riskReward = plannedRiskReward(position);
+  const protection = position.dynamicProtection || {};
   return `
     <div class="position-row">
       <div class="position-head">
@@ -694,29 +928,54 @@ function positionRow(position, currency) {
           <div class="row-title">
             ${escapeHtml(position.symbol)}
             ${badge(sideLabel, position.side === "long" ? "ok" : "danger")}
-            ${badge(`${fmtNumber(position.leverage, 1)}x`, "leverage")}
-            ${badge(position.riskProfile === "aggressive" ? text.aggressive : text.conservative, position.riskProfile === "aggressive" ? "warn" : "")}
+            ${badge(`${fmtNumber(position.leverage, 0)}x`, "leverage")}
+            ${badge(`胜率 ${fmtPct(position.winRate, 1)}`, "probability")}
+            ${badge(`盈亏比 ${fmtNumber(riskReward, 2)}`, "ratio")}
           </div>
-          <div class="row-meta">${escapeHtml(position.openedAt || "-")} | ${escapeHtml(position.candidateMode || "-")}</div>
+          <div class="row-meta">${escapeHtml(fmtTimestamp(position.openedAt))} | ${escapeHtml(position.candidateMode || "-")}</div>
         </div>
         <div>${badge(`${fmtMoney(netPnl, currency)} / ${fmtPct(position.unrealizedReturnPct, 2)}`, pnlType)}</div>
       </div>
+      <section class="position-chart-shell">
+        <div class="position-chart-heading"><strong>价格与保护线</strong><span>实线动态调整 · 虚线为原始计划</span></div>
+        <div class="position-price-chart" data-position-chart="${escapeHtml(String(position.id))}" role="img" aria-label="${escapeHtml(`${position.symbol} 价格、止盈、开仓价与止损动态走势`)}"></div>
+      </section>
       <div class="position-quick-grid">
         ${calcCell(text.currentPrice, fmtPrice(position.currentPrice))}
         ${calcCell(text.entry, fmtPrice(position.entry))}
-        ${calcCell(text.takeProfit, fmtPrice(position.takeProfit))}
-        ${calcCell(text.stopLoss, fmtPrice(position.stopLoss))}
-        ${calcCell(text.winRate, fmtPct(position.winRate, 1))}
-        ${calcCell("EV", fmtPct(position.expectancyPct, 2))}
+        ${calcCell("动态止盈", fmtPrice(position.takeProfit))}
+        ${calcCell("动态止损", fmtPrice(position.stopLoss))}
+        ${calcCell("当前 / 最高 R", `${fmtNumber(protection.priceR, 2)} / ${fmtNumber(protection.mfeR, 2)}`)}
+        ${calcCell("保护阶段", protectionStageLabel(protection.stage))}
       </div>
       <details class="position-details" data-position-key="${escapeHtml(`${position.symbol || "-"}:${position.openedAt || "-"}`)}">
         <summary>查看仓位、成本与事件详情</summary>
         ${positionGroup("仓位与风险", [
           calcCell(text.signalPrice, fmtPrice(position.signalEntryPrice)),
           calcCell(text.quantity, fmtNumber(position.quantity, 6)),
-          calcCell(text.modelLeverage, `${fmtNumber(position.modelSuggestedLeverage, 1)}x`),
+          calcCell(text.modelLeverage, `${fmtNumber(position.modelSuggestedLeverage, 0)}x`),
           calcCell(text.notional, fmtMoney(position.notional, currency)),
           calcCell(text.marginUsed, fmtMoney(position.marginRequired, currency)),
+          calcCell("保证金集中度上限", fmtPct(position.marginConcentrationCapRatio, 1)),
+          calcCell(
+            "集中度约束",
+            position.marginConcentrationCapRatio == null
+              ? "旧仓未记录"
+              : position.marginConcentrationCapped
+                ? "已缩小仓位"
+                : "未触发"
+          ),
+          calcCell("币安最小成交额", position.exchangeRule ? fmtMoney(position.exchangeRule.minNotional, currency) : "旧仓未记录"),
+          calcCell("数量步进", position.exchangeRule?.stepSize || "旧仓未记录"),
+          calcCell("价格步进", position.exchangeRule?.tickSize || "旧仓未记录"),
+          calcCell(
+            "杠杆规则来源",
+            position.leverageRuleExact
+              ? "币安账户档位"
+              : position.leverageRuleSource === "paper-model-account-cap-unverified-bracket"
+                ? "模拟：模型值 + 账户上限（币安档位未验证）"
+                : position.leverageRuleSource || "旧仓未记录"
+          ),
           calcCell(text.impact, fmtNumber(position.eventImpactScore, 0))
         ])}
         ${positionGroup("交易成本", [
@@ -732,8 +991,30 @@ function positionRow(position, currency) {
           calcCell("自适应最长持仓", `${fmtNumber(position.exitEvaluation.maxHoldingHours, 1)}h`),
           calcCell("信号反转", fmtPct(position.exitEvaluation.signals?.signalReversal, 1)),
           calcCell("净EV失效", fmtPct(position.exitEvaluation.signals?.netExpectancyDecay, 1)),
-          calcCell("事件 / 时间衰减", `${fmtPct(position.exitEvaluation.signals?.eventDecay, 1)} / ${fmtPct(position.exitEvaluation.signals?.timeDecay, 1)}`)
+          calcCell("事件 / 时间衰减", `${fmtPct(position.exitEvaluation.signals?.eventDecay, 1)} / ${fmtPct(position.exitEvaluation.signals?.timeDecay, 1)}`),
+          calcCell("盈利保护因子", fmtPct(position.exitEvaluation.signals?.profitProtection, 1)),
+          calcCell("持仓质量保留", fmtPct(position.exitEvaluation.diagnostics?.qualityRetention, 1)),
+          calcCell(
+            "减仓建议",
+            typeof position.exitEvaluation.recommendsDeRisk !== "boolean"
+              ? "等待新一轮评估"
+              : position.exitEvaluation.recommendsDeRisk
+                ? `减仓 ${fmtPct(position.exitEvaluation.deRiskFraction, 0)}`
+                : "继续持有"
+          ),
+          calcCell("减仓确认轮次", `${fmtNumber(position.deRiskConfirmationCount || 0, 0)} / ${fmtNumber(position.exitEvaluation.deRiskConfirmationRunsRequired || 3, 0)}`),
+          calcCell("已执行自适应减仓", `${fmtNumber(position.adaptiveDeRiskCount || 0, 0)} 次`)
         ]) : ""}
+        ${positionGroup("动态止盈止损", [
+          calcCell("原始止盈", fmtPrice(position.originalTakeProfit || position.takeProfit)),
+          calcCell("原始止损", fmtPrice(position.originalStopLoss || position.stopLoss)),
+          calcCell("启动保护", `${fmtNumber(protection.activationR, 2)}R`),
+          calcCell("完成保本", `${fmtNumber(protection.breakEvenR, 2)}R`),
+          calcCell("允许回吐", `${fmtNumber(protection.givebackR, 2)}R`),
+          calcCell("最高 / 最低 R", `${fmtNumber(protection.mfeR, 2)} / ${fmtNumber(protection.maeR, 2)}`),
+          calcCell("止盈部分退出", `${fmtNumber(position.dynamicTakeProfitPartialCount || 0, 0)} / 1 次`),
+          calcCell("最近调整", protection.lastAdjustedAt || "尚未调整")
+        ])}
         ${titles ? `<div class="position-events"><span>关联事件</span>${escapeHtml(titles)}</div>` : ""}
       </details>
     </div>
@@ -749,6 +1030,7 @@ function closedPositionRow(position, currency) {
     .map((item) => item.title || item.text || "")
     .filter(Boolean)
     .join(" | ");
+  const riskReward = plannedRiskReward(position);
   return `
     <div class="position-row closed-position">
       <div class="position-head">
@@ -756,11 +1038,12 @@ function closedPositionRow(position, currency) {
           <div class="row-title">
             ${escapeHtml(position.symbol)}
             ${badge(sideLabel, position.side === "long" ? "ok" : "danger")}
-            ${badge(`${fmtNumber(position.leverage, 1)}x`, "leverage")}
-            ${badge(position.riskProfile === "aggressive" ? text.aggressive : text.conservative, position.riskProfile === "aggressive" ? "warn" : "")}
+            ${badge(`${fmtNumber(position.leverage, 0)}x`, "leverage")}
+            ${badge(`胜率 ${fmtPct(position.winRate, 1)}`, "probability")}
+            ${badge(`盈亏比 ${fmtNumber(riskReward, 2)}`, "ratio")}
             ${badge(position.closeReason || text.closed, resultType)}
           </div>
-          <div class="row-meta">${escapeHtml(position.openedAt || "-")} \u2192 ${escapeHtml(position.closedAt || "-")}</div>
+          <div class="row-meta">${escapeHtml(fmtTimestamp(position.openedAt))} \u2192 ${escapeHtml(fmtTimestamp(position.closedAt))}</div>
         </div>
         <div>${badge(`${fmtMoney(position.realizedPnl, currency)} / ${fmtPct(position.realizedReturnPct, 2)}`, pnlType)}</div>
       </div>
@@ -1179,8 +1462,8 @@ function renderAccountSummary(summary, currency = "USDT", account = {}) {
       </div>
     </div>
     <div class="account-summary-grid">
-      ${metricCell(text.summaryStart, summary.startTime || "-")}
-      ${metricCell(text.summaryEnd, summary.endTime || "-")}
+      ${metricCell(text.summaryStart, fmtTimestamp(summary.startTime))}
+      ${metricCell(text.summaryEnd, fmtTimestamp(summary.endTime))}
       ${metricCell(text.finalReturn, fmtPct(summary.finalReturnPct, 2))}
       ${metricCell(text.maxReturn, fmtPct(summary.maxReturnPct, 2))}
       ${metricCell(text.maxDrawdown, fmtPct(summary.maxDrawdownPct, 2))}
@@ -1302,7 +1585,7 @@ function renderMessageAggregatorConnection() {
     const connectedSources = asArray(connection.sources).filter((source) => source.connected).length;
     const totalSources = asArray(connection.sources).length;
     status.className = connection.degraded ? "message-aggregator-status editing" : "message-aggregator-status connected";
-    status.textContent = `${connection.degraded ? "部分可用" : "连接正常"} · ${connectedSources}/${totalSources} 个源 · 最近 ${connection.messageCount || 0} 条 · ${connection.checkedAt || "-"}`;
+    status.textContent = `${connection.degraded ? "部分可用" : "连接正常"} · ${connectedSources}/${totalSources} 个源 · 最近 ${connection.messageCount || 0} 条 · ${fmtTimestamp(connection.checkedAt)}`;
   } else if (connection.error) {
     status.className = "message-aggregator-status error";
     status.textContent = connection.error;
@@ -1472,6 +1755,22 @@ function renderWarnings() {
 function renderModels() {
   const target = $("#models");
   if (!target) return;
+  const dataset = state.report?.signalOutcomeDataset || {};
+  const training = dataset.training || {};
+  const validation = dataset.validation || {};
+  const calibration = $("#signalCalibration");
+  if (calibration) {
+    calibration.innerHTML = [
+      calcCell("活动观察窗", `${fmtNumber(dataset.observationWindowHours, 0)} 小时`),
+      calcCell("紧凑结果集", `${fmtNumber(dataset.storedSamples, 0)} / ${fmtNumber(dataset.historyLimit, 0)}`),
+      calcCell("可校准 / 未评估", `${fmtNumber(dataset.eligibleSamples, 0)} / ${fmtNumber(dataset.unresolvedSamples, 0)}`),
+      calcCell("训练 / 验证样本", `${fmtNumber(training.samples, 0)} / ${fmtNumber(validation.samples, 0)}`),
+      calcCell("训练实际胜率 / 平均 R", `${fmtPct(training.winRate, 1)} / ${fmtNumber(training.avgRealizedR, 3)}`),
+      calcCell("验证实际胜率 / 平均 R", `${fmtPct(validation.winRate, 1)} / ${fmtNumber(validation.avgRealizedR, 3)}`),
+      calcCell("训练 Brier", training.brierScore == null ? "-" : fmtNumber(training.brierScore, 4)),
+      calcCell("验证 Brier", validation.brierScore == null ? "-" : fmtNumber(validation.brierScore, 4))
+    ].join("");
+  }
   const openDetails = new Set(
     Array.from(document.querySelectorAll("#models details.model-details[open][data-detail-key]"), (item) => item.dataset.detailKey)
   );
@@ -1513,7 +1812,7 @@ function modelRow(item) {
         ${calcCell(text.winRate, fmtPct(signal.winRate, 1))}
         ${calcCell("自适应门槛", fmtPct(gate.adaptiveWinRateThreshold, 1))}
         ${calcCell("EV", fmtPct(signal.expectancyPct, 2))}
-        ${calcCell(text.modelLeverage, accountControl.modelSuggestedLeverage ? `${fmtNumber(accountControl.modelSuggestedLeverage, 2)}x` : "-")}
+        ${calcCell(text.modelLeverage, accountControl.modelSuggestedLeverage ? `${fmtNumber(accountControl.modelSuggestedLeverage, 0)}x` : "-")}
       </div>
       <details class="model-details" data-detail-key="${escapeHtml(item.symbol || "-")}">
         <summary>展开完整计算</summary>
@@ -1538,7 +1837,7 @@ function modelRow(item) {
           ${calcCell("成本保本胜率", fmtPct(gate.breakEvenWinRate, 1))}
           ${calcCell("门槛不确定性裕量", fmtPct(gate.uncertaintyMargin, 1))}
           ${calcCell("Markowitz权重", fmtPct(markowitz.weight, 1))}
-          ${calcCell(text.leverage, accountControl.appliedLeverage ? `${fmtNumber(accountControl.appliedLeverage, 2)}x` : "-")}
+          ${calcCell(text.leverage, accountControl.appliedLeverage ? `${fmtNumber(accountControl.appliedLeverage, 0)}x` : "-")}
         </div>
         <div class="formula">${escapeHtml(buildFormulaText(item))}</div>
       </details>
@@ -1579,8 +1878,17 @@ function renderLog() {
   const lines = String(state.log || "").split("\n");
   const mojibakePattern = /(鍛婅|锛氫|妯℃嫙|浜嬩欢淇|鐩戞帶|寮曟搸|鏃犺瘉鎹)/;
   const corruptedLines = lines.filter((line) => mojibakePattern.test(line)).length;
-  target.textContent = state.rawLogVisible ? state.log || text.noLog : lines.filter((line) => !mojibakePattern.test(line)).join("\n") || text.noLog;
-  setText("#logNotice", corruptedLines ? `检测到 ${corruptedLines} 行历史乱码，清晰视图已隐藏` : "未检测到历史乱码");
+  const cleanLog = lines
+    .filter((line) => !mojibakePattern.test(line))
+    .join("\n")
+    .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z/g, (value) => fmtTimestamp(value));
+  target.textContent = state.rawLogVisible ? state.log || text.noLog : cleanLog || text.noLog;
+  setText(
+    "#logNotice",
+    corruptedLines
+      ? `检测到 ${corruptedLines} 行历史乱码，清晰视图已隐藏；时间显示为北京时间 UTC+8`
+      : "清晰视图时间：北京时间 UTC+8"
+  );
   setText("#toggleRawLog", state.rawLogVisible ? "隐藏历史乱码" : "显示原始日志");
 }
 
@@ -1639,10 +1947,17 @@ function bindEvents() {
       }
     });
   }
-  $("#accountForm")?.addEventListener("submit", async (event) => {
+  const accountForm = $("#accountForm");
+  for (const eventName of ["input", "change"]) {
+    accountForm?.addEventListener(eventName, () => {
+      state.accountFormDirty = true;
+    });
+  }
+  accountForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
     try {
       state.account = await postJson("/api/account", getAccountFormPayload());
+      state.accountFormDirty = false;
       render();
       $("#accountSummary")?.insertAdjacentHTML("afterbegin", `<div class="notice">${text.saved}</div>`);
     } catch (error) {
@@ -1699,6 +2014,7 @@ function bindEvents() {
   $("#resetAccountButton")?.addEventListener("click", async () => {
     try {
       state.account = await postJson("/api/account/reset");
+      state.accountFormDirty = false;
       render();
       $("#accountSummary")?.insertAdjacentHTML("afterbegin", `<div class="notice">${text.reset}</div>`);
     } catch (error) {
@@ -1709,9 +2025,16 @@ function bindEvents() {
     const button = $("#startAccountButton");
     button.disabled = true;
     try {
-      state.account = await postJson("/api/account/start", getAccountFormPayload());
+      const accountActive = getAccountBundle().account.isActive === true;
+      state.account = accountActive
+        ? await postJson("/api/account/stop")
+        : await postJson("/api/account/start", getAccountFormPayload());
+      if (!accountActive) state.accountFormDirty = false;
       render();
-      $("#accountSummary")?.insertAdjacentHTML("afterbegin", `<div class="notice">${text.started}</div>`);
+      $("#accountSummary")?.insertAdjacentHTML(
+        "afterbegin",
+        `<div class="notice">${accountActive ? text.stopped : text.started}</div>`
+      );
     } catch (error) {
       button.disabled = false;
       showError(error);
@@ -1729,8 +2052,15 @@ function bindEvents() {
   });
   $("#accountMarketType")?.addEventListener("change", () => {
     const spot = $("#accountMarketType").value === "spot";
-    $("#accountMaxLeverage").disabled = spot;
-    if (spot) $("#accountMaxLeverage").value = 1;
+    const leverageInput = $("#accountMaxLeverage");
+    if (spot) {
+      if (!leverageInput.disabled) leverageInput.dataset.futuresValue = leverageInput.value;
+      leverageInput.value = 1;
+    } else {
+      const { config } = getAccountBundle();
+      leverageInput.value = leverageInput.dataset.futuresValue || config.maxLeverage || 3;
+    }
+    leverageInput.disabled = spot;
   });
   document.querySelectorAll("[data-position-view]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1751,7 +2081,14 @@ window.addEventListener("resize", () => {
   for (const chart of state.summaryCharts.values()) {
     if (chart && !chart.isDisposed()) chart.resize();
   }
+  for (const chart of state.positionCharts.values()) {
+    if (chart && !chart.isDisposed()) chart.resize();
+  }
 });
 loadData().catch(showError);
-const refreshIntervalMs = location.pathname === "/messages.html" ? 30_000 : 10_000;
+const refreshIntervalMs = location.pathname === "/messages.html"
+  ? 30_000
+  : ["/", "/index.html"].includes(location.pathname)
+    ? 2_000
+    : 10_000;
 setInterval(() => loadData().catch(showError), refreshIntervalMs);

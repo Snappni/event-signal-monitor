@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
@@ -18,6 +19,13 @@ import {
   normalizePostTradeReviewState,
   rollbackPostTradeReviewWeights
 } from "./post-trade-review.mjs";
+import {
+  appendTradeHistoryRecords,
+  deleteTradeHistoryRecords,
+  loadTradeHistoryRecords,
+  queryTradeHistory,
+  tradeHistoryStats
+} from "./trade-history-store.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -33,13 +41,17 @@ const WHALE_CREDENTIALS_PATH = path.join(RUNTIME_DIR, "whale-alert-credentials.j
 const WHALE_STATUS_PATH = path.join(RUNTIME_DIR, "whale-alert-status.json");
 const MESSAGE_AGGREGATOR_CONFIG_PATH = path.join(RUNTIME_DIR, "message-aggregator-config.json");
 const MESSAGE_AGGREGATOR_STATUS_PATH = path.join(RUNTIME_DIR, "message-aggregator-status.json");
+const DEMO_POSITION_PREVIEW_PATH = path.join(RUNTIME_DIR, "demo-position-preview.json");
+const MONITOR_SUPERVISOR_PATH = path.join(__dirname, "supervise-event-signal-service.mjs");
 const ENV_PATH = path.join(ROOT_DIR, ".env");
 const PORT = Number(process.env.SIGNAL_DASHBOARD_PORT || 8788);
-const LOOP_INTERVAL_SECONDS = Math.max(1, Number(process.env.SIGNAL_LOOP_INTERVAL_SECONDS || 10));
-const LOOP_STALE_SECONDS = Math.max(
-  LOOP_INTERVAL_SECONDS * 4,
-  Number(process.env.SIGNAL_LOOP_STALE_SECONDS || 60)
+const SERVICE_STALE_SECONDS = Math.max(3, Number(process.env.SIGNAL_SERVICE_STALE_SECONDS || 5));
+const AUTO_START_MONITOR_SERVICE = process.env.SIGNAL_DASHBOARD_AUTO_START_SERVICE !== "false";
+const SERVICE_ENSURE_INTERVAL_MS = Math.max(
+  1_000,
+  Number(process.env.SIGNAL_SERVICE_ENSURE_INTERVAL_MS || 5_000)
 );
+const MODEL_TRADE_HISTORY_LIMIT = 20_000;
 const DEFAULT_FUTURES_TAKER_FEE_RATE = 0.0005;
 const DEFAULT_SPOT_TAKER_FEE_RATE = 0.001;
 const DEFAULT_SLIPPAGE_RATE = 0.0003;
@@ -424,7 +436,7 @@ function normalizeAccountConfig(value) {
   const marketType = raw.marketType === "spot" ? "spot" : "futures";
   const riskProfile = raw.riskProfile === "aggressive" ? "aggressive" : "conservative";
   const initialCapital = clamp(safeNumber(raw.initialCapital, DEFAULT_ACCOUNT_CONFIG.initialCapital), 100, 1_000_000_000);
-  const maxLeverage = marketType === "spot" ? 1 : clamp(safeNumber(raw.maxLeverage, DEFAULT_ACCOUNT_CONFIG.maxLeverage), 1, 125);
+  const maxLeverage = marketType === "spot" ? 1 : clamp(Math.floor(safeNumber(raw.maxLeverage, DEFAULT_ACCOUNT_CONFIG.maxLeverage)), 1, 125);
   const defaultFeeRate =
     marketType === "spot" ? DEFAULT_SPOT_TAKER_FEE_RATE : DEFAULT_FUTURES_TAKER_FEE_RATE;
   return {
@@ -461,7 +473,16 @@ function sameAccountConfig(left, right) {
 
 function hasAccountConfigInput(value) {
   if (!value || typeof value !== "object") return false;
-  return ["initialCapital", "quoteCurrency", "marketType", "maxLeverage", "riskProfile"].some(
+  return [
+    "initialCapital",
+    "quoteCurrency",
+    "marketType",
+    "maxLeverage",
+    "riskProfile",
+    "takerFeeRate",
+    "slippageRate",
+    "fundingIntervalHours"
+  ].some(
     (key) => Object.hasOwn(value, key)
   );
 }
@@ -473,6 +494,7 @@ function createPaperAccount(config, now = new Date().toISOString()) {
     sessionId: randomUUID(),
     isActive: false,
     startedAt: null,
+    stoppedAt: null,
     createdAt: now,
     updatedAt: now,
     configSnapshot: normalized,
@@ -539,6 +561,7 @@ function readAccountBundle() {
     if (!Object.hasOwn(account, "startedAt")) {
       account.startedAt = account.isActive ? account.createdAt : null;
     }
+    if (!Object.hasOwn(account, "stoppedAt")) account.stoppedAt = null;
     account.tradingFees = safeNumber(account.tradingFees);
     account.slippageCost = safeNumber(account.slippageCost);
     account.fundingPnl = safeNumber(account.fundingPnl);
@@ -682,38 +705,92 @@ function sendJson(response, value, statusCode = 200) {
 
 function loopStatus(latestReportOverride = null) {
   const fastPidPath = path.join(RUNTIME_DIR, "fast-loop.pid");
+  const serviceStatusPath = path.join(RUNTIME_DIR, "service-status.json");
   const fastPid = Number(fs.existsSync(fastPidPath) ? fs.readFileSync(fastPidPath, "utf8").trim() : 0);
   const pidRunning = isProcessRunning(fastPid);
+  const service = readJson(serviceStatusPath, null);
+  const serviceHeartbeatMs = Date.parse(service?.heartbeatAt || "");
+  const serviceAgeMs = Number.isFinite(serviceHeartbeatMs) ? Math.max(0, Date.now() - serviceHeartbeatMs) : null;
+  const serviceFresh = serviceAgeMs !== null && serviceAgeMs <= SERVICE_STALE_SECONDS * 1_000;
   const latestReport = latestReportOverride || readJson(path.join(RUNTIME_DIR, "latest-report.json"), null);
   const reportGeneratedAt = latestReport?.generatedAt || null;
   const reportTimestamp = Date.parse(reportGeneratedAt || "");
   const reportAgeMs = Number.isFinite(reportTimestamp) ? Math.max(0, Date.now() - reportTimestamp) : null;
-  const reportFresh = reportAgeMs !== null && reportAgeMs <= LOOP_STALE_SECONDS * 1000;
   return {
     generatedAt: new Date().toISOString(),
-    loopMode: "unified-high-frequency",
+    loopMode: service?.mode || "event-driven-hybrid",
     loopPid: fastPid || null,
-    loopRunning: pidRunning || reportFresh,
-    loopBackend: pidRunning ? "process-pid" : reportFresh ? "report-heartbeat" : "none",
-    loopIntervalSeconds: LOOP_INTERVAL_SECONDS,
+    servicePid: service?.pid || null,
+    loopRunning: pidRunning || serviceFresh,
+    loopBackend: serviceFresh ? "service-heartbeat" : pidRunning ? "process-pid" : "none",
+    loopIntervalSeconds: null,
+    decisionBackend: service?.decisionBackend || "adaptive-sequential-rest",
+    priceBackend: service?.priceBackend || "binance-bookTicker-websocket",
+    priceConnected: service?.priceConnected === true,
+    subscribedSymbols: Array.isArray(service?.subscribedSymbols) ? service.subscribedSymbols : [],
+    lastPriceEventAt: service?.lastPriceEventAt || null,
+    lastProtectionAt: service?.lastProtectionAt || null,
+    nextDecisionAt: service?.nextDecisionAt || null,
+    decisionCycles: safeNumber(service?.decisionCycles),
+    protectionCycles: safeNumber(service?.protectionCycles),
+    protectionActions: safeNumber(service?.protectionActions),
+    consecutiveDecisionFailures: safeNumber(service?.consecutiveDecisionFailures),
+    lastDecisionError: service?.lastDecisionError || null,
+    serviceHeartbeatAgeSeconds: serviceAgeMs === null ? null : Math.round(serviceAgeMs / 1_000),
     loopLastReportAt: reportGeneratedAt,
     loopReportAgeSeconds: reportAgeMs === null ? null : Math.round(reportAgeMs / 1000),
-    loopStaleAfterSeconds: LOOP_STALE_SECONDS,
+    loopStaleAfterSeconds: SERVICE_STALE_SECONDS,
     runtimeDir: RUNTIME_DIR
   };
 }
 
+let supervisorLaunchPending = false;
+
+function ensureMonitorSupervisor() {
+  if (!AUTO_START_MONITOR_SERVICE || supervisorLaunchPending || loopStatus().loopRunning) return;
+  supervisorLaunchPending = true;
+  const supervisor = spawn(process.execPath, [MONITOR_SUPERVISOR_PATH], {
+    cwd: ROOT_DIR,
+    detached: true,
+    env: { ...process.env, SIGNAL_RUNTIME_DIR: RUNTIME_DIR },
+    stdio: "ignore",
+    windowsHide: true
+  });
+  supervisor.unref();
+  const clearPending = () => {
+    supervisorLaunchPending = false;
+  };
+  supervisor.once("error", clearPending);
+  setTimeout(clearPending, 1_000).unref();
+}
+
 function reportHeader(report) {
+  const displayedMessages = Array.isArray(report?.messageFeed) ? report.messageFeed.length : 0;
+  const totalMessages = Number.isFinite(Number(report?.messageFeedStats?.total))
+    ? Number(report.messageFeedStats.total)
+    : Number.isFinite(Number(report?.sourceCounts?.uniqueStories))
+      ? Number(report.sourceCounts.uniqueStories)
+      : displayedMessages;
+  const messageLimit = Number.isFinite(Number(report?.messageFeedStats?.limit))
+    ? Number(report.messageFeedStats.limit)
+    : displayedMessages;
   return {
     version: report?.version || null,
     generatedAt: report?.generatedAt || null,
     mode: report?.mode || "paper-alert-only",
-    layer: report?.layer || "unified-high-frequency",
+    layer: report?.layer || "event-driven-hybrid",
+    binanceTradingRules: report?.binanceTradingRules || null,
     sourceCounts: report?.sourceCounts || {},
+    messageFeedStats: {
+      total: totalMessages,
+      displayed: displayedMessages,
+      limit: messageLimit
+    },
     uiCounts: {
       actionable: Array.isArray(report?.actionableSignals) ? report.actionableSignals.length : 0,
       watch: Array.isArray(report?.watchlist) ? report.watchlist.length : 0,
-      messages: Array.isArray(report?.messageFeed) ? report.messageFeed.length : 0,
+      messages: totalMessages,
+      messagesDisplayed: displayedMessages,
       models: Array.isArray(report?.modelCalculations) ? report.modelCalculations.length : 0
     }
   };
@@ -725,43 +802,95 @@ function compactRelatedEvents(events) {
   }));
 }
 
+function sampleTimeline(values, maximumPoints) {
+  const items = Array.isArray(values) ? values : [];
+  if (items.length <= maximumPoints) return items;
+  return Array.from({ length: maximumPoints }, (_, index) =>
+    items[Math.round((index * (items.length - 1)) / (maximumPoints - 1))]
+  );
+}
+
 function compactPositionForDashboard(position) {
   const keep = [
     "id", "symbol", "side", "openedAt", "closedAt", "candidateMode", "riskProfile", "leverage",
     "currentPrice", "entry", "signalEntryPrice", "exitReferencePrice", "exitPrice", "takeProfit", "stopLoss",
+    "originalTakeProfit", "originalStopLoss", "initialMaxLossAmount", "dynamicProtection",
     "winRate", "expectancyPct", "eventImpactScore", "unrealizedPnl", "netPnl", "unrealizedReturnPct",
     "realizedPnl", "realizedReturnPct", "closeReason", "quantity", "modelSuggestedLeverage", "notional",
     "marginRequired", "entryFee", "estimatedExitFee", "estimatedExitSlippageCost", "fundingPnl",
     "fundingSettlements", "exitFee", "entrySlippageCost", "exitSlippageCost", "exitEvaluation",
-    "exitConfirmationCount"
+    "exitConfirmationCount", "deRiskConfirmationCount", "adaptiveDeRiskCount", "lastAdaptiveDeRiskAt",
+    "lastAdaptiveDeRiskReason", "marginConcentrationCapRatio", "marginConcentrationCapped",
+    "leverageRuleExact", "leverageRuleSource", "exchangeRule", "exchangeRuleValidated",
+    "quantityAdjustedToExchangeStep", "dynamicTakeProfitPartialCount", "holdingObservations"
   ];
   const result = Object.fromEntries(keep.map((key) => [key, position?.[key]]));
+  result.holdingObservations = sampleTimeline(position?.holdingObservations, 240).map((item) => ({
+    time: item?.time,
+    price: safeNumber(item?.price)
+  }));
+  if (position?.dynamicProtection) {
+    result.dynamicProtection = {
+      ...position.dynamicProtection,
+      adjustmentHistory: sampleTimeline(position.dynamicProtection.adjustmentHistory, 120).map((item) => ({
+        time: item?.time,
+        price: safeNumber(item?.price),
+        priceR: safeNumber(item?.priceR),
+        mfeR: safeNumber(item?.mfeR),
+        stage: item?.stage || null,
+        previousStopLoss: safeNumber(item?.previousStopLoss),
+        stopLoss: safeNumber(item?.stopLoss),
+        previousTakeProfit: safeNumber(item?.previousTakeProfit),
+        takeProfit: safeNumber(item?.takeProfit),
+        profitProtection: safeNumber(item?.profitProtection)
+      }))
+    };
+  }
   result.relatedEvents = compactRelatedEvents(position?.relatedEvents);
   return result;
 }
 
+function activeDemoPositionPreview() {
+  const preview = readJson(DEMO_POSITION_PREVIEW_PATH, null);
+  const expiresAt = Date.parse(preview?.expiresAt || "");
+  return preview?.position?.id && Number.isFinite(expiresAt) && expiresAt > Date.now()
+    ? preview
+    : null;
+}
+
 function compactAccountForDashboard(account) {
+  const demoPreview = activeDemoPositionPreview();
+  const sourcePositions = { ...(account?.positions || {}) };
+  if (demoPreview) sourcePositions[demoPreview.position.id] = demoPreview.position;
   const positions = Object.fromEntries(
-    Object.entries(account?.positions || {}).map(([id, position]) => [id, compactPositionForDashboard(position)])
+    Object.entries(sourcePositions).map(([id, position]) => [id, compactPositionForDashboard(position)])
   );
+  const publicReview = publicPostTradeReview(account);
+  const demoPnl = demoPreview
+    ? safeNumber(demoPreview.position.netPnl, demoPreview.position.unrealizedPnl)
+    : 0;
+  const demoMargin = demoPreview ? safeNumber(demoPreview.position.marginRequired) : 0;
   return {
     sessionId: account?.sessionId || null,
     isActive: account?.isActive === true,
     startedAt: account?.startedAt || null,
+    stoppedAt: account?.stoppedAt || null,
     createdAt: account?.createdAt || null,
-    updatedAt: account?.updatedAt || null,
+    updatedAt: demoPreview?.updatedAt || account?.updatedAt || null,
     startingCapital: safeNumber(account?.startingCapital),
     realizedPnl: safeNumber(account?.realizedPnl),
-    unrealizedPnl: safeNumber(account?.unrealizedPnl),
+    unrealizedPnl: safeNumber(account?.unrealizedPnl) + demoPnl,
     tradingFees: safeNumber(account?.tradingFees),
     slippageCost: safeNumber(account?.slippageCost),
     fundingPnl: safeNumber(account?.fundingPnl),
-    equity: safeNumber(account?.equity),
-    marginUsed: safeNumber(account?.marginUsed),
-    availableEquity: safeNumber(account?.availableEquity),
+    equity: safeNumber(account?.equity) + demoPnl,
+    marginUsed: safeNumber(account?.marginUsed) + demoMargin,
+    availableEquity: Math.max(0, safeNumber(account?.availableEquity) + demoPnl - demoMargin),
     positions,
     tradeHistory: (Array.isArray(account?.tradeHistory) ? account.tradeHistory : []).map(compactPositionForDashboard),
-    summary: account?.summary || null
+    summary: account?.summary || null,
+    postTradeReviewConfig: publicReview.config || null,
+    postTradeReview: publicReview.review || null
   };
 }
 
@@ -795,6 +924,7 @@ function pageData(view) {
     return {
       report: {
         ...header,
+        signalOutcomeDataset: report.signalOutcomeDataset || null,
         modelCalculations: report.modelCalculations || []
       }
     };
@@ -836,7 +966,7 @@ function compactAccountForSummary(account) {
   };
 }
 
-function publicPostTradeReview(account) {
+function publicPostTradeReview(account, archive = tradeHistoryStats(RUNTIME_DIR)) {
   const review = account?.postTradeReview || {};
   const latest = review.latestReview || null;
   const trades = (Array.isArray(latest?.trades) ? latest.trades : []).slice(-20).map((trade) => ({
@@ -867,12 +997,37 @@ function publicPostTradeReview(account) {
       exitWeightVersion: safeNumber(review.exitWeightVersion),
       currentDirectionWeights: review.currentDirectionWeights || {},
       currentExitWeights: review.currentExitWeights || {},
+      previousDirectionWeights: review.previousDirectionWeights || null,
+      previousExitWeights: review.previousExitWeights || null,
       latestReview: latest ? { ...latest, trades } : null
     },
     closedTrades: Math.max(
+      safeNumber(archive?.totalRecords),
       Array.isArray(account?.tradeHistory) ? account.tradeHistory.length : 0,
       safeNumber(account?.lifetimeClosedTrades)
-    )
+    ),
+    historyDatabase: {
+      totalRecords: safeNumber(archive?.totalRecords),
+      totalBytes: safeNumber(archive?.totalBytes),
+      shards: Array.isArray(archive?.files) ? archive.files.length : 0,
+      modelWindowLimit: MODEL_TRADE_HISTORY_LIMIT,
+      updatedAt: archive?.updatedAt || null
+    }
+  };
+}
+
+function runDashboardArchivedReview(account, now = new Date().toISOString()) {
+  const archive = appendTradeHistoryRecords(RUNTIME_DIR, account.tradeHistory);
+  const config = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
+  const reviewed = safeNumber(account.postTradeReview?.reviewedTradeCount);
+  const due = config.enabled && archive.totalRecords - reviewed >= config.reviewEveryTrades;
+  return {
+    archive,
+    result: maybeRunPostTradeReview(account, DEFAULT_DIRECTION_MODEL_WEIGHTS, now, {
+      totalClosedTrades: archive.totalRecords,
+      trades: due ? loadTradeHistoryRecords(RUNTIME_DIR, { limit: MODEL_TRADE_HISTORY_LIMIT }) : account.tradeHistory,
+      exitDecisionTrades: account.exitDecisionHistory
+    })
   };
 }
 
@@ -1058,7 +1213,56 @@ const server = http.createServer(async (request, response) => {
   }
   if (url.pathname === "/api/post-trade-review" && request.method === "GET") {
     const { account } = readAccountBundle();
-    sendJson(response, publicPostTradeReview(account));
+    sendJson(response, publicPostTradeReview(account, tradeHistoryStats(RUNTIME_DIR)));
+    return;
+  }
+  if (url.pathname === "/api/trade-history" && request.method === "GET") {
+    try {
+      const result = await withAccountLock(() => {
+        const { account } = readAccountBundle();
+        appendTradeHistoryRecords(RUNTIME_DIR, account.tradeHistory);
+        return queryTradeHistory(RUNTIME_DIR, {
+          page: url.searchParams.get("page"),
+          pageSize: url.searchParams.get("pageSize")
+        });
+      });
+      sendJson(response, result);
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+    return;
+  }
+  if (url.pathname === "/api/trade-history/delete" && request.method === "POST") {
+    try {
+      const body = await readRequestJson(request);
+      const result = await withAccountLock(() => {
+        const { account } = readAccountBundle();
+        appendTradeHistoryRecords(RUNTIME_DIR, account.tradeHistory);
+        const deletion = deleteTradeHistoryRecords(RUNTIME_DIR, body.ids);
+        const deletedIds = new Set((Array.isArray(body.ids) ? body.ids : []).map(String));
+        account.tradeHistory = (account.tradeHistory || []).filter(
+          (trade) => !deletedIds.has(String(trade.id))
+        );
+        account.exitDecisionHistory = (account.exitDecisionHistory || []).filter(
+          (event) => !deletedIds.has(String(event.positionId))
+        );
+        account.capitalRotationHistory = (account.capitalRotationHistory || []).filter(
+          (event) => !deletedIds.has(String(event.positionId))
+        );
+        if (account.postTradeReview) {
+          account.postTradeReview.reviewedTradeCount = Math.min(
+            safeNumber(account.postTradeReview.reviewedTradeCount),
+            safeNumber(deletion.totalRecords)
+          );
+        }
+        account.updatedAt = new Date().toISOString();
+        writeJson(ACCOUNT_STATE_PATH, account);
+        return deletion;
+      });
+      sendJson(response, result);
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 409);
+    }
     return;
   }
   if (url.pathname === "/api/post-trade-review/config" && request.method === "POST") {
@@ -1070,7 +1274,7 @@ const server = http.createServer(async (request, response) => {
           ...account.postTradeReviewConfig,
           ...body
         });
-        const reviewResult = maybeRunPostTradeReview(account, DEFAULT_DIRECTION_MODEL_WEIGHTS);
+        const { result: reviewResult } = runDashboardArchivedReview(account);
         account.updatedAt = new Date().toISOString();
         writeJson(ACCOUNT_STATE_PATH, account);
         return {
@@ -1169,41 +1373,62 @@ const server = http.createServer(async (request, response) => {
           writeJson(ACCOUNT_CONFIG_PATH, config);
         }
         if (!account.isActive) {
-          account.sessionId = randomUUID();
+          const startsNewSession = !account.startedAt;
+          if (startsNewSession) account.sessionId = randomUUID();
           account.isActive = true;
-          account.startedAt = now;
+          account.startedAt = account.startedAt || now;
+          account.stoppedAt = null;
           account.updatedAt = now;
-          account.equityCurve = [
-            {
-              time: now,
-              equity: account.equity,
-              returnPct: account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0,
-              realizedPnl: account.realizedPnl,
-              unrealizedPnl: account.unrealizedPnl
-            }
-          ];
-          account.summary = {
-            ...(account.summary || {}),
-            startTime: now,
-            endTime: now,
-            startingCapital: account.startingCapital,
-            latestEquity: account.equity,
-            finalReturnPct: account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0,
-            maxReturnPct: account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0,
-            maxDrawdownPct: 0,
-            sharpeRatio: 0,
-            closedTrades: Array.isArray(account.tradeHistory) ? account.tradeHistory.length : 0,
-            openPositions: Object.keys(account.positions || {}).length
-          };
-          account.lastRun = {
-            generatedAt: now,
-            openedPositions: [],
-            closedPositions: []
-          };
+          if (startsNewSession) {
+            account.equityCurve = [
+              {
+                time: now,
+                equity: account.equity,
+                returnPct: account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0,
+                realizedPnl: account.realizedPnl,
+                unrealizedPnl: account.unrealizedPnl
+              }
+            ];
+            account.summary = {
+              ...(account.summary || {}),
+              startTime: now,
+              endTime: now,
+              startingCapital: account.startingCapital,
+              latestEquity: account.equity,
+              finalReturnPct: account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0,
+              maxReturnPct: account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0,
+              maxDrawdownPct: 0,
+              sharpeRatio: 0,
+              closedTrades: Array.isArray(account.tradeHistory) ? account.tradeHistory.length : 0,
+              openPositions: Object.keys(account.positions || {}).length
+            };
+            account.lastRun = {
+              generatedAt: now,
+              openedPositions: [],
+              closedPositions: []
+            };
+          }
         }
         account.configSnapshot = config;
         writeJson(ACCOUNT_STATE_PATH, account);
         return { config, account };
+      });
+      sendJson(response, { config, account });
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 409);
+    }
+    return;
+  }
+  if (url.pathname === "/api/account/stop" && request.method === "POST") {
+    try {
+      const { config, account } = await withAccountLock(() => {
+        const current = readAccountBundle();
+        const now = new Date().toISOString();
+        current.account.isActive = false;
+        current.account.stoppedAt = now;
+        current.account.updatedAt = now;
+        writeJson(ACCOUNT_STATE_PATH, current.account);
+        return current;
       });
       sendJson(response, { config, account });
     } catch (error) {
@@ -1232,4 +1457,9 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`Dashboard: http://127.0.0.1:${PORT}`);
+  ensureMonitorSupervisor();
 });
+
+const serviceEnsureTimer = setInterval(ensureMonitorSupervisor, SERVICE_ENSURE_INTERVAL_MS);
+serviceEnsureTimer.unref();
+server.once("close", () => clearInterval(serviceEnsureTimer));

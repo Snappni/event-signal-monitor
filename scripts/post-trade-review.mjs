@@ -211,7 +211,7 @@ function validationMetrics(trades, weights) {
 function eligibleExitTrade(trade) {
   const signals = trade?.exitFactorSnapshot?.signals;
   return Boolean(
-    trade?.status === "closed" &&
+    ["closed", "exit_decision"].includes(trade?.status) &&
       signals &&
       typeof signals === "object" &&
       typeof trade?.exitCounterfactual?.beneficial === "boolean" &&
@@ -451,7 +451,10 @@ export function buildPostTradeReview(trades, currentDirectionWeights, configValu
   const eligibleTrades = allClosedTrades.filter(eligibleTrade).sort((left, right) =>
     String(left.closedAt || "").localeCompare(String(right.closedAt || ""))
   );
-  const eligibleExitTrades = allClosedTrades.filter(eligibleExitTrade).sort((left, right) =>
+  const eligibleExitTrades = [
+    ...allClosedTrades,
+    ...(Array.isArray(options.exitDecisionTrades) ? options.exitDecisionTrades : [])
+  ].filter(eligibleExitTrade).sort((left, right) =>
     String(left.exitCounterfactual?.evaluatedAt || left.closedAt || "").localeCompare(
       String(right.exitCounterfactual?.evaluatedAt || right.closedAt || "")
     )
@@ -582,16 +585,22 @@ export function buildPostTradeReview(trades, currentDirectionWeights, configValu
   return review;
 }
 
-export function maybeRunPostTradeReview(account, defaultDirectionWeights, now = new Date().toISOString()) {
+export function maybeRunPostTradeReview(
+  account,
+  defaultDirectionWeights,
+  now = new Date().toISOString(),
+  options = {}
+) {
   const config = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
   const state = normalizePostTradeReviewState(account.postTradeReview, defaultDirectionWeights, account.sessionId);
   account.postTradeReviewConfig = config;
   account.postTradeReview = state;
-  const trades = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
-  const totalClosedTrades = Math.max(
-    trades.length,
-    Math.round(safeNumber(account.lifetimeClosedTrades, trades.length))
-  );
+  const retainedTrades = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+  const trades = Array.isArray(options.trades) ? options.trades : retainedTrades;
+  const explicitTotal = Number(options.totalClosedTrades);
+  const totalClosedTrades = Number.isFinite(explicitTotal)
+    ? Math.max(trades.length, Math.round(explicitTotal))
+    : Math.max(trades.length, Math.round(safeNumber(account.lifetimeClosedTrades, trades.length)));
   const newTradeCount = Math.max(0, totalClosedTrades - state.reviewedTradeCount);
   if (!config.enabled || newTradeCount < config.reviewEveryTrades) {
     return { account, review: null, newTradeCount };
@@ -601,7 +610,10 @@ export function maybeRunPostTradeReview(account, defaultDirectionWeights, now = 
     now,
     batchTradeCount: newTradeCount,
     totalClosedTrades,
-    currentExitWeights: state.currentExitWeights
+    currentExitWeights: state.currentExitWeights,
+    exitDecisionTrades: Array.isArray(options.exitDecisionTrades)
+      ? options.exitDecisionTrades
+      : account.exitDecisionHistory
   });
   state.reviewedTradeCount = totalClosedTrades;
   state.completedReviews += 1;
