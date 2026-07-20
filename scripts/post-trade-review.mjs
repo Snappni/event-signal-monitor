@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import {
+  DEFAULT_EXIT_MODEL_WEIGHTS,
+  EXIT_FACTOR_KEYS,
+  normalizeExitWeights
+} from "./adaptive-position-exit.mjs";
 
 export const DIRECTION_FACTOR_KEYS = Object.freeze([
   "trend",
@@ -120,7 +125,10 @@ export function createPostTradeReviewState(defaultDirectionWeights, sessionId = 
     completedReviews: 0,
     currentDirectionWeights: weights,
     previousDirectionWeights: null,
+    currentExitWeights: normalizeExitWeights(DEFAULT_EXIT_MODEL_WEIGHTS),
+    previousExitWeights: null,
     weightVersion: 1,
+    exitWeightVersion: 1,
     latestReview: null,
     reviewHistory: [],
     lastPromotionAt: null,
@@ -139,7 +147,12 @@ export function normalizePostTradeReviewState(value, defaultDirectionWeights, se
   state.previousDirectionWeights = value.previousDirectionWeights
     ? normalizeDirectionWeights(value.previousDirectionWeights, defaultDirectionWeights)
     : null;
+  state.currentExitWeights = normalizeExitWeights(value.currentExitWeights, DEFAULT_EXIT_MODEL_WEIGHTS);
+  state.previousExitWeights = value.previousExitWeights
+    ? normalizeExitWeights(value.previousExitWeights, DEFAULT_EXIT_MODEL_WEIGHTS)
+    : null;
   state.weightVersion = Math.max(1, Math.round(safeNumber(value.weightVersion, 1)));
+  state.exitWeightVersion = Math.max(1, Math.round(safeNumber(value.exitWeightVersion, 1)));
   state.latestReview = value.latestReview && typeof value.latestReview === "object" ? value.latestReview : null;
   state.reviewHistory = Array.isArray(value.reviewHistory) ? value.reviewHistory.slice(-20) : [];
   state.lastPromotionAt = value.lastPromotionAt || null;
@@ -193,6 +206,81 @@ function validationMetrics(trades, weights) {
     accuracy: correct / trades.length,
     meanSignedMargin: mean(margins)
   };
+}
+
+function eligibleExitTrade(trade) {
+  const signals = trade?.exitFactorSnapshot?.signals;
+  return Boolean(
+    ["closed", "exit_decision"].includes(trade?.status) &&
+      signals &&
+      typeof signals === "object" &&
+      typeof trade?.exitCounterfactual?.beneficial === "boolean" &&
+      EXIT_FACTOR_KEYS.some((key) => Number.isFinite(Number(signals[key])))
+  );
+}
+
+function exitValidationMetrics(trades, weights) {
+  if (!trades.length) return { samples: 0, accuracy: 0, meanSignedMargin: 0 };
+  let correct = 0;
+  const margins = [];
+  for (const trade of trades) {
+    const label = trade.exitCounterfactual.beneficial ? 1 : -1;
+    const signals = trade.exitFactorSnapshot.signals || {};
+    const score = EXIT_FACTOR_KEYS.reduce(
+      (sum, key) => sum + safeNumber(signals[key]) * safeNumber(weights[key]),
+      0
+    );
+    const centeredScore = score - safeNumber(trade.exitFactorSnapshot.threshold, 0.68);
+    if ((centeredScore >= 0 ? 1 : -1) === label) correct += 1;
+    margins.push(label * centeredScore);
+  }
+  return {
+    samples: trades.length,
+    accuracy: correct / trades.length,
+    meanSignedMargin: mean(margins)
+  };
+}
+
+function exitFactorStatistics(trades, currentWeights) {
+  return EXIT_FACTOR_KEYS.map((key) => {
+    const values = trades.map((trade) => safeNumber(trade.exitFactorSnapshot?.signals?.[key]));
+    const labels = trades.map((trade) => (trade.exitCounterfactual?.beneficial ? 1 : -1));
+    return {
+      factor: key,
+      samples: trades.length,
+      activeSamples: values.filter((value) => Math.abs(value) > 1e-9).length,
+      currentWeight: safeNumber(currentWeights[key]),
+      meanSignal: mean(values),
+      directionAssociation: mean(values.map((value, index) => value * labels[index])),
+      counterfactualCorrelation: pearson(
+        values,
+        trades.map((trade) => safeNumber(trade.exitCounterfactual?.avoidedReturnPct))
+      )
+    };
+  });
+}
+
+function proposeExitWeights(trainingTrades, currentWeights, config) {
+  const statistics = exitFactorStatistics(trainingTrades, currentWeights);
+  const evidenceShrinkage = trainingTrades.length / (trainingTrades.length + 40);
+  const provisional = {};
+  for (const item of statistics) {
+    const rawChange = clamp(
+      item.directionAssociation * evidenceShrinkage,
+      -config.maxWeightChangePct,
+      config.maxWeightChangePct
+    );
+    provisional[item.factor] = item.currentWeight * (1 + rawChange);
+    item.suggestedChangePct = rawChange;
+  }
+  const candidate = normalizeExitWeights(provisional, currentWeights);
+  for (const item of statistics) {
+    item.candidateWeight = candidate[item.factor];
+    item.normalizedChangePct = item.currentWeight
+      ? candidate[item.factor] / item.currentWeight - 1
+      : 0;
+  }
+  return { candidate, statistics };
 }
 
 function factorStatistics(trades, currentWeights) {
@@ -334,6 +422,17 @@ function explainTrade(trade, weights) {
       mathDirection: round(safeNumber(trade.decisionCalculation?.direction?.mathDirection)),
       mathWeight: round(safeNumber(trade.decisionCalculation?.direction?.mathWeight))
     },
+    exitDecision: trade.exitFactorSnapshot
+      ? {
+          exitScore: round(safeNumber(trade.exitFactorSnapshot.exitScore)),
+          threshold: round(safeNumber(trade.exitFactorSnapshot.threshold)),
+          signals: Object.fromEntries(
+            EXIT_FACTOR_KEYS.map((key) => [key, round(safeNumber(trade.exitFactorSnapshot.signals?.[key]))])
+          ),
+          weights: normalizeExitWeights(trade.exitFactorSnapshot.weights, DEFAULT_EXIT_MODEL_WEIGHTS)
+        }
+      : null,
+    exitCounterfactual: trade.exitCounterfactual || null,
     factorContributions: factorContributions.map((item) => ({
       ...item,
       signal: round(item.signal),
@@ -347,30 +446,52 @@ function explainTrade(trade, weights) {
 export function buildPostTradeReview(trades, currentDirectionWeights, configValue, options = {}) {
   const config = normalizePostTradeReviewConfig(configValue);
   const weights = normalizeDirectionWeights(currentDirectionWeights, currentDirectionWeights);
+  const exitWeights = normalizeExitWeights(options.currentExitWeights, DEFAULT_EXIT_MODEL_WEIGHTS);
   const allClosedTrades = Array.isArray(trades) ? trades.filter((trade) => trade?.status === "closed") : [];
   const eligibleTrades = allClosedTrades.filter(eligibleTrade).sort((left, right) =>
     String(left.closedAt || "").localeCompare(String(right.closedAt || ""))
+  );
+  const eligibleExitTrades = [
+    ...allClosedTrades,
+    ...(Array.isArray(options.exitDecisionTrades) ? options.exitDecisionTrades : [])
+  ].filter(eligibleExitTrade).sort((left, right) =>
+    String(left.exitCounterfactual?.evaluatedAt || left.closedAt || "").localeCompare(
+      String(right.exitCounterfactual?.evaluatedAt || right.closedAt || "")
+    )
   );
   const reviewId = `review-${randomUUID()}`;
   const review = {
     id: reviewId,
     generatedAt: options.now || new Date().toISOString(),
     status: "insufficient_data",
-    totalClosedTrades: allClosedTrades.length,
+    totalClosedTrades: Math.max(
+      allClosedTrades.length,
+      Math.round(safeNumber(options.totalClosedTrades, allClosedTrades.length))
+    ),
+    retainedClosedTrades: allClosedTrades.length,
     eligibleTrades: eligibleTrades.length,
     excludedTrades: allClosedTrades.length - eligibleTrades.length,
     batchTradeCount: safeNumber(options.batchTradeCount, allClosedTrades.length),
     currentDirectionWeights: weights,
     candidateDirectionWeights: null,
+    directionPromotionEligible: false,
     factorStatistics: factorStatistics(eligibleTrades, weights),
     qualityFactorStatistics: qualityFactorStatistics(eligibleTrades),
     validation: null,
+    currentExitWeights: exitWeights,
+    candidateExitWeights: null,
+    exitEligibleTrades: eligibleExitTrades.length,
+    exitFactorStatistics: exitFactorStatistics(eligibleExitTrades, exitWeights),
+    exitValidation: null,
+    exitPromotionEligible: false,
+    exitPromotionBlockers: [],
     promotionEligible: false,
     promotionBlockers: [],
     applied: false,
     limitations: [
       "Only trades with an entry-time factor snapshot are eligible.",
       "Attribution estimates predictive association, not causal effect.",
+      "Exit-factor validation uses delayed post-exit counterfactual prices; it still cannot observe the path of an actually unclosed position.",
       "Executed trades contain selection bias; rejected-opportunity replay remains a separate evidence source."
     ],
     trades: eligibleTrades.slice(-Math.max(config.reviewEveryTrades, 20)).map((trade) => explainTrade(trade, weights))
@@ -378,83 +499,135 @@ export function buildPostTradeReview(trades, currentDirectionWeights, configValu
 
   if (eligibleTrades.length < config.minimumProposalTrades) {
     review.promotionBlockers.push("minimum_proposal_trades");
-    return review;
+  } else {
+    const validationSize = Math.max(5, Math.min(Math.ceil(eligibleTrades.length * 0.3), 40));
+    const trainingTrades = eligibleTrades.slice(0, -validationSize);
+    const validationTrades = eligibleTrades.slice(-validationSize);
+    if (trainingTrades.length < 10 || validationTrades.length < 5) {
+      if (trainingTrades.length < 10) review.promotionBlockers.push("minimum_training_samples");
+      if (validationTrades.length < 5) review.promotionBlockers.push("minimum_validation_samples");
+    } else {
+      const proposal = proposeWeights(trainingTrades, weights, config);
+      const champion = validationMetrics(validationTrades, weights);
+      const challenger = validationMetrics(validationTrades, proposal.candidate);
+      const accuracyDelta = challenger.accuracy - champion.accuracy;
+      const marginDelta = challenger.meanSignedMargin - champion.meanSignedMargin;
+      review.directionPromotionEligible =
+        eligibleTrades.length >= config.minimumPromotionTrades &&
+        validationTrades.length >= 10 &&
+        accuracyDelta >= 0.03 &&
+        marginDelta > 0;
+      review.candidateDirectionWeights = proposal.candidate;
+      review.factorStatistics = proposal.statistics.map((item) =>
+        Object.fromEntries(Object.entries(item).map(([key, value]) => [key, typeof value === "number" ? round(value) : value]))
+      );
+      review.validation = {
+        chronologicalSplit: true,
+        trainingSamples: trainingTrades.length,
+        validationSamples: validationTrades.length,
+        champion: { samples: champion.samples, accuracy: round(champion.accuracy), meanSignedMargin: round(champion.meanSignedMargin) },
+        challenger: { samples: challenger.samples, accuracy: round(challenger.accuracy), meanSignedMargin: round(challenger.meanSignedMargin) },
+        accuracyDelta: round(accuracyDelta),
+        meanSignedMarginDelta: round(marginDelta)
+      };
+      if (eligibleTrades.length < config.minimumPromotionTrades) review.promotionBlockers.push("minimum_promotion_trades");
+      if (validationTrades.length < 10) review.promotionBlockers.push("minimum_validation_samples");
+      if (accuracyDelta < 0.03) review.promotionBlockers.push("accuracy_delta");
+      if (marginDelta <= 0) review.promotionBlockers.push("mean_signed_margin_delta");
+    }
   }
 
-  const validationSize = Math.max(5, Math.min(Math.ceil(eligibleTrades.length * 0.3), 40));
-  const trainingTrades = eligibleTrades.slice(0, -validationSize);
-  const validationTrades = eligibleTrades.slice(-validationSize);
-  if (trainingTrades.length < 10 || validationTrades.length < 5) {
-    if (trainingTrades.length < 10) review.promotionBlockers.push("minimum_training_samples");
-    if (validationTrades.length < 5) review.promotionBlockers.push("minimum_validation_samples");
-    return review;
+  if (eligibleExitTrades.length < config.minimumProposalTrades) {
+    review.exitPromotionBlockers.push("minimum_exit_proposal_trades");
+  } else {
+    const validationSize = Math.max(5, Math.min(Math.ceil(eligibleExitTrades.length * 0.3), 40));
+    const trainingTrades = eligibleExitTrades.slice(0, -validationSize);
+    const validationTrades = eligibleExitTrades.slice(-validationSize);
+    if (trainingTrades.length < 10 || validationTrades.length < 5) {
+      if (trainingTrades.length < 10) review.exitPromotionBlockers.push("minimum_exit_training_samples");
+      if (validationTrades.length < 5) review.exitPromotionBlockers.push("minimum_exit_validation_samples");
+    } else {
+      const proposal = proposeExitWeights(trainingTrades, exitWeights, config);
+      const champion = exitValidationMetrics(validationTrades, exitWeights);
+      const challenger = exitValidationMetrics(validationTrades, proposal.candidate);
+      const accuracyDelta = challenger.accuracy - champion.accuracy;
+      const marginDelta = challenger.meanSignedMargin - champion.meanSignedMargin;
+      review.exitPromotionEligible =
+        eligibleExitTrades.length >= config.minimumPromotionTrades &&
+        validationTrades.length >= 10 &&
+        accuracyDelta >= 0.03 &&
+        marginDelta > 0;
+      review.candidateExitWeights = proposal.candidate;
+      review.exitFactorStatistics = proposal.statistics.map((item) =>
+        Object.fromEntries(Object.entries(item).map(([key, value]) => [key, typeof value === "number" ? round(value) : value]))
+      );
+      review.exitValidation = {
+        chronologicalSplit: true,
+        trainingSamples: trainingTrades.length,
+        validationSamples: validationTrades.length,
+        champion: { samples: champion.samples, accuracy: round(champion.accuracy), meanSignedMargin: round(champion.meanSignedMargin) },
+        challenger: { samples: challenger.samples, accuracy: round(challenger.accuracy), meanSignedMargin: round(challenger.meanSignedMargin) },
+        accuracyDelta: round(accuracyDelta),
+        meanSignedMarginDelta: round(marginDelta)
+      };
+      if (eligibleExitTrades.length < config.minimumPromotionTrades) review.exitPromotionBlockers.push("minimum_exit_promotion_trades");
+      if (validationTrades.length < 10) review.exitPromotionBlockers.push("minimum_exit_validation_samples");
+      if (accuracyDelta < 0.03) review.exitPromotionBlockers.push("exit_accuracy_delta");
+      if (marginDelta <= 0) review.exitPromotionBlockers.push("exit_mean_signed_margin_delta");
+    }
   }
-
-  const proposal = proposeWeights(trainingTrades, weights, config);
-  const champion = validationMetrics(validationTrades, weights);
-  const challenger = validationMetrics(validationTrades, proposal.candidate);
-  const accuracyDelta = challenger.accuracy - champion.accuracy;
-  const marginDelta = challenger.meanSignedMargin - champion.meanSignedMargin;
-  const promotionEligible =
-    eligibleTrades.length >= config.minimumPromotionTrades &&
-    validationTrades.length >= 10 &&
-    accuracyDelta >= 0.03 &&
-    marginDelta > 0;
-
-  review.status = promotionEligible ? "validated_candidate" : "shadow_candidate";
-  review.candidateDirectionWeights = proposal.candidate;
-  review.factorStatistics = proposal.statistics.map((item) =>
-    Object.fromEntries(Object.entries(item).map(([key, value]) => [key, typeof value === "number" ? round(value) : value]))
-  );
-  review.validation = {
-    chronologicalSplit: true,
-    trainingSamples: trainingTrades.length,
-    validationSamples: validationTrades.length,
-    champion: {
-      samples: champion.samples,
-      accuracy: round(champion.accuracy),
-      meanSignedMargin: round(champion.meanSignedMargin)
-    },
-    challenger: {
-      samples: challenger.samples,
-      accuracy: round(challenger.accuracy),
-      meanSignedMargin: round(challenger.meanSignedMargin)
-    },
-    accuracyDelta: round(accuracyDelta),
-    meanSignedMarginDelta: round(marginDelta)
-  };
-  if (eligibleTrades.length < config.minimumPromotionTrades) review.promotionBlockers.push("minimum_promotion_trades");
-  if (validationTrades.length < 10) review.promotionBlockers.push("minimum_validation_samples");
-  if (accuracyDelta < 0.03) review.promotionBlockers.push("accuracy_delta");
-  if (marginDelta <= 0) review.promotionBlockers.push("mean_signed_margin_delta");
-  review.promotionEligible = promotionEligible;
+  review.promotionEligible = review.directionPromotionEligible || review.exitPromotionEligible;
+  review.status = review.promotionEligible
+    ? "validated_candidate"
+    : review.candidateDirectionWeights || review.candidateExitWeights
+      ? "shadow_candidate"
+      : "insufficient_data";
   return review;
 }
 
-export function maybeRunPostTradeReview(account, defaultDirectionWeights, now = new Date().toISOString()) {
+export function maybeRunPostTradeReview(
+  account,
+  defaultDirectionWeights,
+  now = new Date().toISOString(),
+  options = {}
+) {
   const config = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
   const state = normalizePostTradeReviewState(account.postTradeReview, defaultDirectionWeights, account.sessionId);
   account.postTradeReviewConfig = config;
   account.postTradeReview = state;
-  const trades = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
-  const newTradeCount = Math.max(0, trades.length - state.reviewedTradeCount);
+  const retainedTrades = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+  const trades = Array.isArray(options.trades) ? options.trades : retainedTrades;
+  const explicitTotal = Number(options.totalClosedTrades);
+  const totalClosedTrades = Number.isFinite(explicitTotal)
+    ? Math.max(trades.length, Math.round(explicitTotal))
+    : Math.max(trades.length, Math.round(safeNumber(account.lifetimeClosedTrades, trades.length)));
+  const newTradeCount = Math.max(0, totalClosedTrades - state.reviewedTradeCount);
   if (!config.enabled || newTradeCount < config.reviewEveryTrades) {
     return { account, review: null, newTradeCount };
   }
 
   const review = buildPostTradeReview(trades, state.currentDirectionWeights, config, {
     now,
-    batchTradeCount: newTradeCount
+    batchTradeCount: newTradeCount,
+    totalClosedTrades,
+    currentExitWeights: state.currentExitWeights,
+    exitDecisionTrades: Array.isArray(options.exitDecisionTrades)
+      ? options.exitDecisionTrades
+      : account.exitDecisionHistory
   });
-  state.reviewedTradeCount = trades.length;
+  state.reviewedTradeCount = totalClosedTrades;
   state.completedReviews += 1;
   if (config.autoApplyValidatedWeights && review.promotionEligible) {
-    state.previousDirectionWeights = state.currentDirectionWeights;
-    state.currentDirectionWeights = normalizeDirectionWeights(
-      review.candidateDirectionWeights,
-      state.currentDirectionWeights
-    );
-    state.weightVersion += 1;
+    if (review.directionPromotionEligible) {
+      state.previousDirectionWeights = state.currentDirectionWeights;
+      state.currentDirectionWeights = normalizeDirectionWeights(review.candidateDirectionWeights, state.currentDirectionWeights);
+      state.weightVersion += 1;
+    }
+    if (review.exitPromotionEligible) {
+      state.previousExitWeights = state.currentExitWeights;
+      state.currentExitWeights = normalizeExitWeights(review.candidateExitWeights, state.currentExitWeights);
+      state.exitWeightVersion += 1;
+    }
     state.lastPromotionAt = now;
     review.status = "promoted";
     review.applied = true;
@@ -467,12 +640,19 @@ export function maybeRunPostTradeReview(account, defaultDirectionWeights, now = 
 export function applyLatestReviewCandidate(account, defaultDirectionWeights, now = new Date().toISOString()) {
   const state = normalizePostTradeReviewState(account.postTradeReview, defaultDirectionWeights, account.sessionId);
   const review = state.latestReview;
-  if (!review?.promotionEligible || !review?.candidateDirectionWeights) {
+  if (!review?.promotionEligible) {
     throw new Error("当前没有通过样本外验证、可晋升的候选权重");
   }
-  state.previousDirectionWeights = state.currentDirectionWeights;
-  state.currentDirectionWeights = normalizeDirectionWeights(review.candidateDirectionWeights, state.currentDirectionWeights);
-  state.weightVersion += 1;
+  if (review.directionPromotionEligible || (review.directionPromotionEligible == null && review.candidateDirectionWeights)) {
+    state.previousDirectionWeights = state.currentDirectionWeights;
+    state.currentDirectionWeights = normalizeDirectionWeights(review.candidateDirectionWeights, state.currentDirectionWeights);
+    state.weightVersion += 1;
+  }
+  if (review.exitPromotionEligible) {
+    state.previousExitWeights = state.currentExitWeights;
+    state.currentExitWeights = normalizeExitWeights(review.candidateExitWeights, state.currentExitWeights);
+    state.exitWeightVersion += 1;
+  }
   state.lastPromotionAt = now;
   review.status = "promoted";
   review.applied = true;
@@ -482,11 +662,19 @@ export function applyLatestReviewCandidate(account, defaultDirectionWeights, now
 
 export function rollbackPostTradeReviewWeights(account, defaultDirectionWeights, now = new Date().toISOString()) {
   const state = normalizePostTradeReviewState(account.postTradeReview, defaultDirectionWeights, account.sessionId);
-  if (!state.previousDirectionWeights) throw new Error("当前没有可回滚的上一版权重");
-  const current = state.currentDirectionWeights;
-  state.currentDirectionWeights = state.previousDirectionWeights;
-  state.previousDirectionWeights = current;
-  state.weightVersion += 1;
+  if (!state.previousDirectionWeights && !state.previousExitWeights) throw new Error("当前没有可回滚的上一版权重");
+  if (state.previousDirectionWeights) {
+    const current = state.currentDirectionWeights;
+    state.currentDirectionWeights = state.previousDirectionWeights;
+    state.previousDirectionWeights = current;
+    state.weightVersion += 1;
+  }
+  if (state.previousExitWeights) {
+    const current = state.currentExitWeights;
+    state.currentExitWeights = state.previousExitWeights;
+    state.previousExitWeights = current;
+    state.exitWeightVersion += 1;
+  }
   state.lastRollbackAt = now;
   account.postTradeReview = state;
   return account;

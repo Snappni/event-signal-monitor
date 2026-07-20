@@ -1,3 +1,5 @@
+import "./beijing-clock.js";
+
 const $ = (selector) => document.querySelector(selector);
 const summaryCharts = new Map();
 
@@ -21,6 +23,23 @@ function money(value, currency) {
 
 function pct(value, digits = 2) {
   return `${(safeNumber(value) * 100).toFixed(digits)}%`;
+}
+
+function fmtTimestamp(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  const formatted = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).format(date);
+  return `${formatted}（北京时间 UTC+8）`;
 }
 
 function metric(label, value) {
@@ -336,7 +355,7 @@ function renderTrades(trades, currency) {
   $("#recentTrades").innerHTML = rows.length ? rows.map((trade) => `
     <div class="summary-trade-row">
       <strong>${escapeHtml(trade.symbol || "-")} ${escapeHtml(String(trade.side || "").toUpperCase())}</strong>
-      <span>${escapeHtml(new Date(trade.closedAt).toLocaleString("zh-CN", { hour12: false }))}</span>
+      <span>${escapeHtml(fmtTimestamp(trade.closedAt))}</span>
       <span>${escapeHtml(trade.closeReason || "-")}</span>
       <strong class="${safeNumber(trade.realizedPnl) >= 0 ? "positive" : "negative"}">${escapeHtml(money(trade.realizedPnl, currency))}</strong>
     </div>`).join("") : '<div class="empty">暂无已平仓交易。</div>';
@@ -360,8 +379,8 @@ async function loadSummary() {
     const currency = data.config?.quoteCurrency || "USDT";
     const analytics = analyzeAccount(account, summary);
     $("#summaryMetrics").innerHTML = [
-      metric("开始时间", summary.startTime ? new Date(summary.startTime).toLocaleString("zh-CN", { hour12: false }) : "-"),
-      metric("截止时间", summary.endTime ? new Date(summary.endTime).toLocaleString("zh-CN", { hour12: false }) : "-"),
+      metric("开始时间", fmtTimestamp(summary.startTime)),
+      metric("截止时间", fmtTimestamp(summary.endTime)),
       metric("最终收益率", pct(summary.finalReturnPct)),
       metric("最大收益率", pct(summary.maxReturnPct)),
       metric("最大回撤", pct(summary.maxDrawdownPct ?? analytics.maxDrawdown)),
@@ -390,8 +409,8 @@ async function loadSummary() {
       metric("当前权益", money(account.equity, currency))
     ].join("");
     renderTrades(analytics.trades, currency);
-    $("#summaryUpdatedAt").textContent = new Date().toLocaleString("zh-CN", { hour12: false });
-    $("#subtitle").textContent = `账户更新 ${account.updatedAt || "-"}`;
+    $("#summaryUpdatedAt").textContent = fmtTimestamp(new Date());
+    $("#subtitle").textContent = `账户更新 ${fmtTimestamp(account.updatedAt)}`;
     await nextPaint();
     setProgress(100, "总结已完成", startedAt);
   } catch (error) {

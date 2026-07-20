@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { evaluateAdaptiveEntryGate } from "./adaptive-entry-gate.mjs";
+import {
+  buildTradeCalibration,
+  calibrateCandidateWinRate,
+  evaluateAdaptiveEntryGate
+} from "./adaptive-entry-gate.mjs";
 
 const shared = {
   expectancyPct: 0.003,
@@ -59,5 +63,50 @@ const negativeEv = evaluateAdaptiveEntryGate({
   winRate: 0.9
 });
 assert.equal(negativeEv.passesGate, false);
+
+const tradeCalibration = buildTradeCalibration([
+  ...Array.from({ length: 12 }, (_, index) => ({
+    status: "closed",
+    candidateMode: "math_only",
+    regime: "hmm_bear",
+    winRate: 0.7,
+    realizedPnl: index < 2 ? 1 : -1
+  })),
+  ...Array.from({ length: 20 }, (_, index) => ({
+    status: "closed",
+    candidateMode: "event_impact",
+    regime: "hmm_range",
+    winRate: 0.68,
+    realizedPnl: index < 10 ? 1 : -1
+  }))
+]);
+assert.equal(tradeCalibration.samples, 32);
+assert.equal(tradeCalibration.byMode.math_only.wins, 2);
+const weakMode = calibrateCandidateWinRate({
+  winRate: 0.7,
+  calibration: tradeCalibration,
+  candidateMode: "math_only",
+  regime: "hmm_bear"
+});
+const strongerMode = calibrateCandidateWinRate({
+  winRate: 0.7,
+  calibration: tradeCalibration,
+  candidateMode: "event_impact",
+  regime: "hmm_range"
+});
+assert.ok(weakMode.calibratedWinRate < strongerMode.calibratedWinRate);
+assert.ok(weakMode.appliedCorrection > 0.1);
+assert.equal(
+  calibrateCandidateWinRate({ winRate: 0.62, calibration: { samples: 0 } }).calibratedWinRate,
+  0.62
+);
+assert.equal(
+  calibrateCandidateWinRate({
+    winRate: 0.55,
+    calibration: { samples: 30, wins: 24, avgPredictedWinRate: 0.6 }
+  }).calibratedWinRate,
+  0.55,
+  "small samples must not boost an apparently underconfident model"
+);
 
 console.log("adaptive entry gate tests passed");

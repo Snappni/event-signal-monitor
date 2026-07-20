@@ -8,12 +8,29 @@
   </head>
   <body>
     <header class="topbar">
-      <div class="brand"><div class="brand-mark" aria-hidden="true">ES</div><div><span class="eyebrow">POST-TRADE REVIEW</span><h1>交易链路与模型迭代</h1><p id="subtitle">只用具备开仓因子快照的已平仓交易</p></div></div>
-      <div class="toolbar"><a class="toolbar-link" href="/">主监控</a><a class="toolbar-link" href="/summary.html">账户总结</a><button id="refreshReview" type="button">刷新复盘</button></div>
+      <div class="brand"><div class="brand-mark" aria-hidden="true">ES</div><div><span class="eyebrow">SIGNAL OPERATIONS</span><h1>事件信号监控引擎</h1><p id="subtitle">交易归因与模型治理</p></div></div>
+      <nav class="toolbar" aria-label="主导航">
+        <span class="nav-caption">分析工作台</span>
+        <a class="toolbar-link" href="/"><span aria-hidden="true">⌂</span>实时监控</a>
+        <a class="toolbar-link" href="/summary.html"><span aria-hidden="true">⌁</span>账户总结</a>
+        <a class="toolbar-link" href="/signals.html"><span aria-hidden="true">⌁</span>信号复盘</a>
+        <a class="toolbar-link" href="/messages.html"><span aria-hidden="true">◫</span>消息情报</a>
+        <a class="toolbar-link" href="/models.html"><span aria-hidden="true">∿</span>模型计算</a>
+        <a class="toolbar-link" href="/logs.html"><span aria-hidden="true">≡</span>运行日志</a>
+        <a class="toolbar-link active" href="/review.html" aria-current="page"><span aria-hidden="true">↻</span>迭代复盘</a>
+        <div class="nav-footer">
+          <span class="environment-state"><i></i>模拟环境</span>
+          <button id="refreshReview" type="button">刷新复盘</button>
+        </div>
+      </nav>
     </header>
     <main class="focused-page">
+      <section class="page-heading">
+        <div><span class="eyebrow">POST-TRADE REVIEW</span><h2>交易链路与模型迭代</h2><p>以时间外验证决定候选权重是否具备晋升资格</p></div>
+        <span class="context-state">影子验证</span>
+      </section>
       <section class="panel post-trade-review-workbench">
-        <div class="review-heading"><div><strong>迭代控制</strong><span>候选方向权重必须通过后段时间样本验证后才能应用</span></div><span id="reviewStatus" class="review-status">读取中</span></div>
+        <div class="review-heading"><div><strong>迭代控制</strong><span>候选方向权重必须通过后段时间样本验证后才能应用</span></div><div class="review-heading-actions"><button id="historyDatabaseButton" type="button">历史数据库</button><span id="reviewStatus" class="review-status">读取中</span></div></div>
         <form id="reviewForm" class="review-config-form">
           <label><span>每完成多少笔交易复盘</span><input id="reviewEveryTrades" type="number" min="5" max="500" step="1" value="20" /></label>
           <label class="review-checkbox"><input id="reviewAutoApply" type="checkbox" /><span>验证通过后自动应用候选权重（仅模拟账户）</span></label>
@@ -22,8 +39,16 @@
         <p id="reviewDecision" class="review-note">读取模型迭代判定中。</p>
       </section>
       <section class="panel"><div class="section-title"><h2>复盘概览</h2><span id="reviewUpdatedAt">-</span></div><div id="reviewOverview" class="review-overview"></div></section>
+      <section id="historyDatabasePanel" class="panel history-database-panel" hidden>
+        <div class="section-title"><div><h2>历史仓位数据库</h2><span id="historyDatabaseMeta">读取中</span></div><div class="history-database-actions"><label><input id="historySelectAll" type="checkbox" /> 全选当前页</label><button id="historyDeleteSelected" type="button" disabled>删除所选</button></div></div>
+        <p class="review-note">按平仓月份分片保存全部已完结仓位；自动模型迭代每次最多读取最近 20,000 笔，避免长期运行耗尽内存。删除只移除明确勾选的记录，不重算账户权益，也不会自动回滚已应用的模型权重。</p>
+        <div class="history-table-head"><span></span><span>标的 / 方向</span><span>开仓 → 平仓</span><span>结果</span><span>盈亏</span><span>杠杆</span></div>
+        <div id="historyDatabaseRows" class="history-database-rows"></div>
+        <div class="history-pagination"><button id="historyPreviousPage" type="button">上一页</button><span id="historyPageStatus">第 1 / 1 页</span><button id="historyNextPage" type="button">下一页</button></div>
+      </section>
       <section class="panel"><div class="section-title"><h2>训练 / 验证</h2><span>严格按时间顺序切分</span></div><div id="validationMetrics" class="review-validation"></div></section>
       <section class="panel"><div class="section-title"><h2>因子归因与候选权重</h2><span>关联不等于因果</span></div><div id="factorRows"></div></section>
+      <section class="panel"><div class="section-title"><h2>退出规则归因与候选权重</h2><span id="exitReviewDecision">等待延迟反事实样本</span></div><div id="exitValidationMetrics" class="review-card-grid"></div><div id="exitFactorRows"></div></section>
       <section class="panel"><div class="section-title"><h2>最近交易完整链路</h2><span>最多显示 20 笔</span></div><div id="reviewTrades"></div></section>
       <p class="page-disclaimer">无证据表明历史样本中胜出的权重一定提高未来盈利；自动应用仅作用于模拟账户。</p>
     </main>

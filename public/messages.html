@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>消息情报 | 事件信号监控引擎</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark" aria-hidden="true">ES</div><div><span class="eyebrow">SIGNAL OPERATIONS</span><h1>事件信号监控引擎</h1><p id="subtitle">读取实时消息</p></div></div>
+      <nav class="toolbar" aria-label="主导航">
+        <span class="nav-caption">分析工作台</span>
+        <a class="toolbar-link" href="/"><span aria-hidden="true">⌂</span>实时监控</a>
+        <a class="toolbar-link" href="/summary.html"><span aria-hidden="true">⌁</span>账户总结</a>
+        <a class="toolbar-link" href="/signals.html"><span aria-hidden="true">⌁</span>信号复盘</a>
+        <a class="toolbar-link active" href="/messages.html" aria-current="page"><span aria-hidden="true">◫</span>消息情报</a>
+        <a class="toolbar-link" href="/models.html"><span aria-hidden="true">∿</span>模型计算</a>
+        <a class="toolbar-link" href="/logs.html"><span aria-hidden="true">≡</span>运行日志</a>
+        <a class="toolbar-link" href="/review.html"><span aria-hidden="true">↻</span>迭代复盘</a>
+        <div class="nav-footer"><span class="environment-state"><i></i>模拟环境</span><button id="refreshButton" type="button">刷新消息</button></div>
+      </nav>
+    </header>
+    <main class="detail-page">
+      <section class="page-heading">
+        <div><span class="eyebrow">NEWS INTELLIGENCE</span><h2>消息情报中心</h2><p>聚合新闻、热榜、预测市场与交易所事件，并显示时效分析</p></div>
+        <span class="live-state"><i></i>来源监控中</span>
+      </section>
+      <section class="summary-grid detail-summary" aria-label="消息摘要">
+        <div class="metric"><span>去重消息总数</span><strong id="messageValue">0</strong><small id="messageDisplayCount" class="metric-note">当前展示 0 条</small></div>
+        <div class="metric"><span>告警数量</span><strong id="warningCount">0</strong></div>
+        <div class="metric detail-metric-wide"><span>来源与合并状态</span><strong id="sourceCounts" class="metric-detail">-</strong></div>
+      </section>
+      <section class="grid-two detail-grid-two">
+        <section class="panel detail-panel">
+          <div class="section-title"><h2>消息面</h2><span id="pageDataTime">-</span></div>
+          <form id="messageAggregatorForm" class="message-aggregator-form" autocomplete="off">
+            <div class="message-aggregator-field wide-field">
+              <label for="messageFilterKeywords">保留关键词（逗号或换行分隔，留空使用内置市场词表）</label>
+              <textarea id="messageFilterKeywords" name="filterKeywords" rows="4" wrap="soft" spellcheck="false" placeholder="比特币,加密货币,美联储&#10;bitcoin,crypto,fed"></textarea>
+              <span class="built-in-source-note">RSS 与国内外热榜来源已内置固定，保存时会重新验证全部来源。</span>
+            </div>
+            <label class="message-aggregator-toggle"><input id="messageAggregatorEnabled" type="checkbox" checked /> 启用聚合采集</label>
+            <button id="messageAggregatorConnectButton" type="submit">验证来源并保存关键词</button>
+            <div id="messageAggregatorStatus" class="message-aggregator-status" aria-live="polite">读取中</div>
+          </form>
+          <div id="messages" class="list detail-scroll"></div>
+        </section>
+        <section class="panel detail-panel warning-panel">
+          <div class="section-title"><h2>运行告警</h2><span>连接与证据边界</span></div>
+          <div id="warnings" class="list compact detail-scroll"></div>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

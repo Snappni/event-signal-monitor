@@ -22,9 +22,88 @@ function regimePenalty(regime) {
 }
 
 function candidateModePenalty(candidateMode) {
-  if (candidateMode === "math_only") return 0.012;
-  if (candidateMode === "event_math") return 0.006;
+  if (candidateMode === "math_only") return 0.03;
+  if (candidateMode === "event_math") return 0.015;
   return 0;
+}
+
+function calibrationBucket(trades) {
+  const usable = trades.filter(
+    (trade) => Number.isFinite(Number(trade?.winRate)) && Number.isFinite(Number(trade?.realizedPnl))
+  );
+  const samples = usable.length;
+  const wins = usable.filter((trade) => Number(trade.realizedPnl) > 0).length;
+  return {
+    samples,
+    wins,
+    losses: samples - wins,
+    avgPredictedWinRate: samples
+      ? usable.reduce((sum, trade) => sum + clamp(safeNumber(trade.winRate, 0.5), 0, 1), 0) / samples
+      : 0
+  };
+}
+
+export function buildTradeCalibration(trades = []) {
+  const usable = Array.isArray(trades)
+    ? trades.filter((trade) => trade?.status === "closed" || trade?.closedAt)
+    : [];
+  const byMode = {};
+  const byRegime = {};
+  for (const trade of usable) {
+    const mode = String(trade?.candidateMode || "unknown");
+    const regime = String(trade?.regime || "unknown").toLowerCase();
+    (byMode[mode] ||= []).push(trade);
+    (byRegime[regime] ||= []).push(trade);
+  }
+  return {
+    ...calibrationBucket(usable),
+    byMode: Object.fromEntries(Object.entries(byMode).map(([key, value]) => [key, calibrationBucket(value)])),
+    byRegime: Object.fromEntries(Object.entries(byRegime).map(([key, value]) => [key, calibrationBucket(value)])),
+    source: "paper_trade_history"
+  };
+}
+
+function overconfidenceCorrection(bucket) {
+  const samples = Math.max(0, safeNumber(bucket?.samples));
+  if (samples < 5) return null;
+  const empiricalWinRate = (safeNumber(bucket?.wins) + 2) / (samples + 4);
+  const averagePredictedWinRate = clamp(safeNumber(bucket?.avgPredictedWinRate, 0.5), 0, 1);
+  const reliability = samples / (samples + 30);
+  return {
+    samples,
+    empiricalWinRate,
+    averagePredictedWinRate,
+    reliability,
+    correction: (averagePredictedWinRate - empiricalWinRate) * reliability
+  };
+}
+
+export function calibrateCandidateWinRate(value = {}) {
+  const rawWinRate = clamp(safeNumber(value.winRate, 0.5), 0.05, 0.95);
+  const calibration = value.calibration && typeof value.calibration === "object" ? value.calibration : {};
+  const global = overconfidenceCorrection(calibration);
+  const mode = overconfidenceCorrection(calibration.byMode?.[value.candidateMode]);
+  const normalizedRegime = String(value.regime || "unknown").toLowerCase();
+  const regime = overconfidenceCorrection(calibration.byRegime?.[normalizedRegime]);
+  const contextual = [mode, regime].filter(Boolean);
+  const contextualCorrection = contextual.length
+    ? contextual.reduce((sum, item) => sum + item.correction * item.samples, 0) /
+      contextual.reduce((sum, item) => sum + item.samples, 0)
+    : null;
+  const blendedCorrection = contextualCorrection == null
+    ? safeNumber(global?.correction)
+    : global
+      ? global.correction * 0.35 + contextualCorrection * 0.65
+      : contextualCorrection;
+  const appliedCorrection = clamp(blendedCorrection, 0, 0.18);
+  return {
+    rawWinRate,
+    calibratedWinRate: clamp(rawWinRate - appliedCorrection, 0.35, 0.86),
+    appliedCorrection,
+    global,
+    mode,
+    regime
+  };
 }
 
 export function evaluateAdaptiveEntryGate(value = {}) {
@@ -49,7 +128,7 @@ export function evaluateAdaptiveEntryGate(value = {}) {
   const averagePredictedWinRate = safeNumber(calibration.avgPredictedWinRate, winRate);
   const sampleUncertaintyMargin = 0.07 / Math.sqrt(1 + calibrationSamples / 20);
   const calibrationErrorMargin = calibrationSamples >= 10 && empiricalWinRate != null
-    ? clamp(Math.abs(empiricalWinRate - averagePredictedWinRate) * 0.5, 0, 0.06)
+    ? clamp(Math.max(0, averagePredictedWinRate - empiricalWinRate) * 0.25, 0, 0.05)
     : 0;
   const profileMargin = riskProfile === "aggressive" ? 0.025 : 0.045;
   const marketRegimeMargin = regimePenalty(value.regime);
