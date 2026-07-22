@@ -779,6 +779,7 @@ function reportHeader(report) {
     generatedAt: report?.generatedAt || null,
     mode: report?.mode || "paper-alert-only",
     layer: report?.layer || "event-driven-hybrid",
+    marketSession: report?.marketSession || null,
     binanceTradingRules: report?.binanceTradingRules || null,
     sourceCounts: report?.sourceCounts || {},
     messageFeedStats: {

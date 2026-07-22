@@ -61,6 +61,7 @@ import {
   loadTradeHistoryRecords,
   tradeHistoryStats
 } from "./trade-history-store.mjs";
+import { classifyMarketSession, limitSessionEntryCandidates } from "./market-session-policy.mjs";
 
 const RUNTIME_DIR = path.resolve(
   process.env.SIGNAL_RUNTIME_DIR || path.resolve(".runtime", "event-signal-monitor")
@@ -80,7 +81,7 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.16.0";
+const MONITOR_VERSION = "0.17.0";
 const RUN_LAYER = "event-driven-hybrid";
 const LAYER_REPORT_PATH = REPORT_PATH;
 const MESSAGE_FEED_LIMIT = 200;
@@ -97,6 +98,10 @@ const SERVICE_IDLE_DECISION_DELAY_MS = toPositiveInt(
   30_000
 );
 const SERVICE_MAX_BACKOFF_MS = toPositiveInt(process.env.SIGNAL_MAX_DECISION_BACKOFF_MS, 120_000);
+const SERVICE_DECISION_CYCLE_TIMEOUT_MS = toPositiveInt(
+  process.env.SIGNAL_DECISION_CYCLE_TIMEOUT_MS,
+  120_000
+);
 const PRICE_EVENT_COALESCE_MS = toPositiveInt(process.env.SIGNAL_PRICE_EVENT_COALESCE_MS, 100);
 const DEFAULT_SYMBOLS = [
   "BTCUSDT",
@@ -2139,11 +2144,13 @@ function buildCandidate(
   accountConfig,
   weightVersion = 1,
   calibration = {},
-  tradingRulesBySymbol = {}
+  tradingRulesBySymbol = {},
+  sessionContext = null
 ) {
   if (!market.latest || !Number.isFinite(market.latest)) return null;
 
   const normalizedAccountConfig = normalizeAccountConfig(accountConfig);
+  const sessionPolicy = sessionContext?.policy || null;
   const eventScoreNorm = clamp(eventAggregate.score / 100, 0, 1);
   const hasEventContext = eventAggregate.score > 0 && Array.isArray(eventAggregate.events) && eventAggregate.events.length > 0;
   const highImpactEvent = hasEventContext && eventAggregate.score >= 70 && Math.abs(eventAggregate.direction) >= 0.2;
@@ -2251,7 +2258,12 @@ function buildCandidate(
     calibration
   });
   const expectancyClass = expectancyR >= MIN_HIGH_EXPECTANCY_R ? "high" : "normal";
-  const { passesGate } = gateResult;
+  const adaptiveWinRateThreshold = clamp(
+    gateResult.adaptiveWinRateThreshold + safeNumber(sessionPolicy?.entryThresholdAdd),
+    0.35,
+    0.95
+  );
+  const passesGate = gateResult.passesGate && winRate >= adaptiveWinRateThreshold;
   const tradingRule = tradingRulesBySymbol[market.symbol] || null;
   const entry = tradingRule
     ? alignToStep(market.latest, tradingRule.tickSize, "nearest")
@@ -2267,7 +2279,7 @@ function buildCandidate(
     : rawTakeProfit;
   const kelly = clamp((rewardRiskRatio * winRate - (1 - winRate)) / rewardRiskRatio, 0, 0.35);
   const fractionalKelly = kelly * 0.2;
-  const maxRiskPct = highImpactEvent ? 0.008 : 0.005;
+  const maxRiskPct = (highImpactEvent ? 0.008 : 0.005) * safeNumber(sessionPolicy?.riskMultiplier, 1);
   const positionRiskPct = clamp(Math.min(fractionalKelly, maxRiskPct), 0, maxRiskPct);
   const accountControl = buildAccountControl({
     accountConfig,
@@ -2300,7 +2312,7 @@ function buildCandidate(
     expectancyPct,
     expectancyR,
     expectancyClass,
-    adaptiveWinRateThreshold: gateResult.adaptiveWinRateThreshold,
+    adaptiveWinRateThreshold,
     breakEvenWinRate: gateResult.breakEvenWinRate,
     rewardRiskRatio,
     riskPct,
@@ -2309,6 +2321,7 @@ function buildCandidate(
     accountControl,
     highImpactEvent,
     eventImpactScore: Math.round(eventAggregate.score),
+    marketSession: sessionContext,
     combinedDirection,
     mathSignal: market.mathSignal,
     eventDirection,
@@ -2545,7 +2558,13 @@ function normalizeCappedWeights(values, maxWeight) {
   return total > 0 ? weights.map((value) => value / total) : weights;
 }
 
-function applyMarkowitzSizing(candidates, marketBySymbol, accountConfig, tradingRulesBySymbol = {}) {
+function applyMarkowitzSizing(
+  candidates,
+  marketBySymbol,
+  accountConfig,
+  tradingRulesBySymbol = {},
+  sessionContext = null
+) {
   if (!candidates.length) {
     return {
       candidates,
@@ -2604,7 +2623,8 @@ function applyMarkowitzSizing(candidates, marketBySymbol, accountConfig, trading
       1.35
     );
     const originalRiskPct = candidate.positionRiskPct;
-    const riskCap = candidate.highImpactEvent ? 0.008 : 0.005;
+    const riskCap = (candidate.highImpactEvent ? 0.008 : 0.005) *
+      safeNumber(sessionContext?.policy?.riskMultiplier, 1);
     const adjustedPositionRiskPct = clamp(originalRiskPct * allocationMultiplier, 0, riskCap);
     const market = marketBySymbol[candidate.symbol];
     const accountControl = buildAccountControl({
@@ -3778,10 +3798,22 @@ function runArchivedPostTradeReview(account, newlyClosedTrades, now) {
   });
 }
 
-function updatePaperAccountForEntryState(account, actionableSignals, allCandidates, marketBySymbol) {
+function updatePaperAccountForEntryState(
+  account,
+  actionableSignals,
+  allCandidates,
+  marketBySymbol,
+  maxConcurrentPositions = Number.POSITIVE_INFINITY
+) {
+  const openSymbols = Object.values(account.positions || {}).map((position) => position.symbol);
+  const sessionLimitedSignals = limitSessionEntryCandidates(
+    actionableSignals,
+    openSymbols,
+    maxConcurrentPositions
+  );
   return updatePaperAccount(
     account,
-    account.isActive ? actionableSignals : [],
+    account.isActive ? sessionLimitedSignals : [],
     allCandidates,
     marketBySymbol
   );
@@ -4217,6 +4249,7 @@ async function main() {
   } finally {
     releaseInitialAccountLock();
   }
+  const currentMarketSession = classifyMarketSession(new Date());
   const warnings = [
     "仅模拟告警：脚本不会发送实盘订单。",
     "无证据表明新闻聚合、大模型推理或 Polymarket 赔率本身能稳定盈利。"
@@ -4348,11 +4381,18 @@ async function main() {
         accountConfig,
         reviewWeightVersion,
         entryCalibration,
-        tradingRulesBySymbol
+        tradingRulesBySymbol,
+        currentMarketSession
       )
     )
     .filter(Boolean);
-  const markowitzResult = applyMarkowitzSizing(rawCandidates, marketBySymbol, accountConfig, tradingRulesBySymbol);
+  const markowitzResult = applyMarkowitzSizing(
+    rawCandidates,
+    marketBySymbol,
+    accountConfig,
+    tradingRulesBySymbol,
+    currentMarketSession
+  );
   const candidates = markowitzResult.candidates.sort((a, b) => b.expectancyR - a.expectancyR);
   const actionableSignals = candidates.filter((candidate) => candidate.status === "passed").slice(0, 5);
   const watchlist = candidates.filter((candidate) => candidate.status !== "passed").slice(0, 8);
@@ -4366,7 +4406,13 @@ async function main() {
     const sameAccountSession =
       sameAccountConfig(accountConfig, finalAccountConfig) && accountSessionId === latestPaperAccount.sessionId;
     updatedPaperAccount = sameAccountSession
-      ? updatePaperAccountForEntryState(latestPaperAccount, actionableSignals, candidates, marketBySymbol)
+      ? updatePaperAccountForEntryState(
+        latestPaperAccount,
+        actionableSignals,
+        candidates,
+        marketBySymbol,
+        currentMarketSession.policy.maxConcurrentPositions
+      )
       : latestPaperAccount;
     state.directionWeights = updatedPaperAccount.postTradeReview?.currentDirectionWeights || state.directionWeights;
     writeJson(ACCOUNT_STATE_PATH, updatedPaperAccount);
@@ -4382,6 +4428,7 @@ async function main() {
     generatedAt: state.updatedAt,
     mode: "paper-alert-only",
     layer: RUN_LAYER,
+    marketSession: currentMarketSession,
     simulatedAccount: finalAccountConfig,
     binanceTradingRules: {
       marketType: tradingRulesResult?.marketType || accountConfig.marketType,
@@ -4528,6 +4575,22 @@ async function run() {
     throw error;
   } finally {
     releaseLock();
+  }
+}
+
+async function runDecisionCycleWithTimeout() {
+  let timeout;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error(`decision cycle exceeded ${SERVICE_DECISION_CYCLE_TIMEOUT_MS}ms`);
+      error.code = "DECISION_CYCLE_TIMEOUT";
+      reject(error);
+    }, SERVICE_DECISION_CYCLE_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([run(), timeoutPromise]);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -4758,12 +4821,18 @@ async function runService() {
       const cycleStartedMs = Date.now();
       serviceState.lastDecisionStartedAt = new Date(cycleStartedMs).toISOString();
       try {
-        await run();
+        await runDecisionCycleWithTimeout();
         serviceState.decisionCycles += 1;
         serviceState.consecutiveDecisionFailures = 0;
         serviceState.lastDecisionError = null;
         serviceState.lastDecisionCompletedAt = new Date().toISOString();
       } catch (error) {
+        if (error?.code === "DECISION_CYCLE_TIMEOUT") {
+          appendRuntimeLog(
+            `[${new Date().toISOString()}] watchdog: ${error.message}; exiting for systemd restart`
+          );
+          throw error;
+        }
         serviceState.consecutiveDecisionFailures += 1;
         serviceState.lastDecisionError = error instanceof Error ? error.message : String(error);
       }

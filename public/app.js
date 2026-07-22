@@ -339,6 +339,13 @@ function renderSummary() {
   setText("#subtitle", `${report.mode || "paper-alert-only"} | ${fmtTimestamp(report.generatedAt)}`);
   setText("#pageDataTime", fmtTimestamp(report.generatedAt));
   setText("#layerValue", "事件驱动 + 自适应轮询");
+  const session = report.marketSession || {};
+  const sessionPolicy = session.policy || {};
+  const sessionLabel = sessionPolicy.label || "时段未知";
+  setText(
+    "#sessionValue",
+    `${sessionLabel}${session.overlap ? " · 交会" : ""}${sessionPolicy.strategy ? ` · ${sessionPolicy.strategy}` : ""}`
+  );
   setText("#actionableValue", uiCounts.actionable ?? actionable.length);
   setText("#watchValue", uiCounts.watch ?? watchlist.length);
   setText("#messageValue", Number.isFinite(messageTotal) ? messageTotal : messages.length);
