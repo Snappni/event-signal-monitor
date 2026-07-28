@@ -15,8 +15,10 @@ function syntheticTrade(index, won = index % 3 !== 0) {
     higherTimeframeTrend: label * 0.7,
     momentum: -label,
     rsi: 0,
+    volume: label * 0.4,
     funding: label * 0.15,
     openInterest: label * 0.25,
+    orderFlow: label * 0.7,
     geometricBrownianMotion: label * 0.5,
     hiddenMarkovModel: label * 0.8
   };

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   appendTradeHistoryRecords,
+  compactArchivedTrade,
   deleteTradeHistoryRecords,
   loadTradeHistoryRecords,
   queryTradeHistory,
@@ -29,6 +30,18 @@ const trade = (id, closedAt, realizedPnl) => ({
   realizedPnl,
   realizedReturnPct: realizedPnl / 100,
   winRate: 0.6,
+  maxFavorableExcursionPct: 0.04,
+  maxAdverseExcursionPct: -0.01,
+  decisionCalculation: {
+    direction: {
+      combinedDirection: 0.7,
+      eventDirection: 0.4,
+      eventWeight: 0.3,
+      mathDirection: 0.8,
+      mathWeight: 0.7
+    },
+    oversized: "x".repeat(100_000)
+  },
   factorSnapshot: { direction: { contributions: { trend: 0.2 } } },
   holdingObservations: Array.from({ length: 10_000 }, (_, index) => ({ index })),
   calculation: { oversized: "x".repeat(100_000) }
@@ -57,6 +70,13 @@ try {
   assert.equal(firstPage.records[1].exitCounterfactual.status, "evaluated");
   assert.equal(Object.hasOwn(firstPage.records[0], "holdingObservations"), false);
   assert.equal(Object.hasOwn(firstPage.records[0], "calculation"), false);
+  assert.equal(firstPage.records[0].holdingObservationCount, 10_000);
+  assert.equal(firstPage.records[0].decisionCalculation.direction.combinedDirection, 0.7);
+  assert.equal(Object.hasOwn(firstPage.records[0].decisionCalculation, "oversized"), false);
+
+  const compact = compactArchivedTrade(rows[0]);
+  assert.ok(JSON.stringify(compact).length < 10_000, "paper account history row must stay compact");
+  assert.equal(Object.hasOwn(compact, "holdingObservations"), false);
 
   const secondPage = queryTradeHistory(runtimeDir, { page: 2, pageSize: 2 });
   assert.deepEqual(secondPage.records.map((item) => item.id), ["trade-a"]);

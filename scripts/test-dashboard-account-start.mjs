@@ -29,6 +29,7 @@ fs.writeFileSync(
   }),
   "utf8"
 );
+fs.writeFileSync(path.join(runtimeDir, "fast-loop.log"), "initial log line\n", "utf8");
 
 function getFreePort() {
   return new Promise((resolve, reject) => {
@@ -108,7 +109,7 @@ try {
     reviewScriptResponse.text(),
     clockScriptResponse.text()
   ]);
-  for (const id of ["accountCapital", "accountMarketType", "accountMaxLeverage", "accountRiskProfile", "accountTakerFeePct", "accountSlippagePct", "accountFundingIntervalHours", "startAccountButton", "saveAccountButton", "resetAccountButton", "summaryButton"]) {
+  for (const id of ["accountCapital", "accountMarketType", "accountMaxLeverage", "accountRiskProfile", "accountTakerFeePct", "accountSlippagePct", "accountFundingIntervalHours", "startAccountButton", "saveAccountButton", "resetAccountButton", "summaryButton", "closeAllPositionsButton"]) {
     assert.ok(indexHtml.includes(`id="${id}"`), `missing main-page control ${id}`);
   }
   assert.ok(signalsHtml.includes('id="signals"'), "missing signals-page list");
@@ -134,7 +135,7 @@ try {
   for (const id of ["reviewEveryTrades", "reviewAutoApply", "applyCandidate", "rollbackWeights", "refreshReview", "reviewDecision", "historyDatabaseButton", "historyDatabasePanel", "historySelectAll", "historyDeleteSelected", "historyDatabaseRows"]) {
     assert.ok(reviewHtml.includes(`id="${id}"`), `missing review-page control ${id}`);
   }
-  for (const binding of ["messageAggregatorForm", "accountForm", "resetAccountButton", "startAccountButton", "summaryButton", "accountMarketType"]) {
+  for (const binding of ["messageAggregatorForm", "accountForm", "resetAccountButton", "startAccountButton", "summaryButton", "accountMarketType", "closeAllPositionsButton"]) {
     assert.ok(appScript.includes(`$("#${binding}")`), `missing main-page event binding ${binding}`);
   }
   assert.ok(summaryScript.includes('$("#refreshSummary").addEventListener("click", loadSummary)'));
@@ -143,7 +144,8 @@ try {
   }
   assert.ok(clockScript.includes('timeZone: "Asia/Shanghai"'), "live clock must force Beijing timezone");
   assert.ok(clockScript.includes('second: "2-digit"'), "live clock must render seconds");
-  assert.ok(clockScript.includes("setInterval(updateClock, 1_000)"), "live clock must update every second independently of data polling");
+  assert.ok(clockScript.includes("1_000 - (Date.now() % 1_000)"), "live clock must self-align to each second");
+  assert.ok(clockScript.includes('document.addEventListener("visibilitychange"'), "live clock must catch up after tab throttling");
   assert.ok(clockScript.includes('clock.id = CLOCK_ID'), "live clock must expose one stable DOM target");
   for (const binding of ["reviewForm", "applyCandidate", "rollbackWeights", "refreshReview", "historyDatabaseButton", "historySelectAll", "historyDeleteSelected"]) {
     assert.ok(reviewScript.includes(`$("#${binding}").addEventListener`), `missing review-page event binding ${binding}`);
@@ -173,6 +175,8 @@ try {
   assert.ok(appScript.includes("leverageInput.dataset.futuresValue"), "market switching must preserve the futures leverage draft");
   assert.ok(appScript.includes('timeZone: "Asia/Shanghai"'), "dashboard timestamps must use Beijing time explicitly");
   assert.ok(appScript.includes("北京时间 UTC+8"), "dashboard timestamps must label their timezone");
+  assert.ok(appScript.includes('setInterval(() => refreshLog().catch(showError), 1_000)'), "log page must poll incremental updates every second");
+  assert.ok(appScript.includes('? 1_000\n      : 3_000'), "overview must refresh once per second");
   assert.ok(appScript.includes("信号结果观察中（最长 72 小时，非仓位）"), "tracked signals must expose their bounded observation window");
   assert.ok(appScript.includes("清晰视图时间：北京时间 UTC+8"), "clean log view must label converted timestamps");
   assert.ok(summaryScript.includes('timeZone: "Asia/Shanghai"'));
@@ -190,6 +194,10 @@ try {
   assert.equal(serviceStatus.loopMode, "event-driven-hybrid");
   assert.equal(serviceStatus.loopIntervalSeconds, null);
   assert.equal(serviceStatus.priceBackend, "binance-bookTicker-websocket");
+  assert.equal(serviceStatus.orderFlowBackend, "binance-aggTrade-depth5-websocket");
+  assert.equal(serviceStatus.orderFlowConnected, false);
+  assert.equal(serviceStatus.orderFlowDepthConnected, false);
+  assert.equal(serviceStatus.orderFlowTradeConnected, false);
   const [overviewText, signalsText, messagesText, modelsText, logsText] = await Promise.all(
     pageResponses.map((response) => response.text())
   );
@@ -198,6 +206,21 @@ try {
   assert.ok(messagesText.includes("MESSAGE_ONLY_") && !messagesText.includes("MODEL_ONLY_"));
   assert.ok(modelsText.includes("MODEL_ONLY_") && !modelsText.includes("MESSAGE_ONLY_"));
   assert.ok(!logsText.includes("MESSAGE_ONLY_") && !logsText.includes("MODEL_ONLY_"));
+  const initialLog = JSON.parse(logsText).log;
+  assert.equal(initialLog.text, "initial log line\n");
+  assert.equal(initialLog.reset, true);
+  fs.appendFileSync(path.join(runtimeDir, "fast-loop.log"), "incremental log line\n", "utf8");
+  const incrementalLog = await (
+    await fetch(`${baseUrl}/api/log?cursor=${initialLog.cursor}&bytes=80000`)
+  ).json();
+  assert.equal(incrementalLog.text, "incremental log line\n", "log endpoint must return only appended bytes");
+  assert.equal(incrementalLog.reset, false);
+  fs.writeFileSync(path.join(runtimeDir, "fast-loop.log"), "rotated log\n", "utf8");
+  const rotatedLog = await (
+    await fetch(`${baseUrl}/api/log?cursor=${incrementalLog.cursor}&bytes=80000`)
+  ).json();
+  assert.equal(rotatedLog.text, "rotated log\n", "log endpoint must recover after truncation or rotation");
+  assert.equal(rotatedLog.reset, true);
   const messagesPayload = JSON.parse(messagesText);
   assert.equal(messagesPayload.report.uiCounts.messages, 182, "message count must expose the deduplicated total before truncation");
   assert.equal(messagesPayload.report.uiCounts.messagesDisplayed, 1);
@@ -396,6 +419,66 @@ try {
   const rollbackResponse = await fetch(`${baseUrl}/api/post-trade-review/rollback`, { method: "POST" });
   assert.equal(applyResponse.status, 409);
   assert.equal(rollbackResponse.status, 409);
+
+  const manualAccount = (await (await fetch(`${baseUrl}/api/account`)).json()).account;
+  manualAccount.isActive = true;
+  manualAccount.positions = {
+    "manual-long": {
+      id: "manual-long",
+      symbol: "BTCUSDT",
+      side: "long",
+      entry: 100,
+      currentPrice: 110,
+      quantity: 2,
+      initialQuantity: 2,
+      notional: 200,
+      initialNotional: 200,
+      marginRequired: 100,
+      initialMarginRequired: 100,
+      entryFee: 0.2,
+      entrySlippageCost: 0.1,
+      feeRate: 0.001,
+      slippageRate: 0.001,
+      fundingPnl: 0,
+      openedAt: new Date().toISOString()
+    },
+    "manual-short": {
+      id: "manual-short",
+      symbol: "ETHUSDT",
+      side: "short",
+      entry: 50,
+      currentPrice: 45,
+      quantity: 3,
+      initialQuantity: 3,
+      notional: 150,
+      initialNotional: 150,
+      marginRequired: 75,
+      initialMarginRequired: 75,
+      entryFee: 0.15,
+      entrySlippageCost: 0.08,
+      feeRate: 0.001,
+      slippageRate: 0.001,
+      fundingPnl: 0,
+      openedAt: new Date().toISOString()
+    }
+  };
+  manualAccount.marginUsed = 175;
+  fs.writeFileSync(path.join(runtimeDir, "paper-account.json"), JSON.stringify(manualAccount), "utf8");
+  const closeAllResponse = await fetch(`${baseUrl}/api/account/close-all`, { method: "POST" });
+  assert.equal(closeAllResponse.status, 200);
+  const closeAll = await closeAllResponse.json();
+  assert.equal(closeAll.closeResult.closedCount, 2);
+  assert.equal(closeAll.closeResult.failedCount, 0);
+  assert.equal(Object.keys(closeAll.account.positions).length, 0);
+  assert.equal(closeAll.account.isActive, true, "manual close-all must not pause future paper entries");
+  assert.deepEqual(
+    closeAll.account.tradeHistory.slice(-2).map((trade) => trade.closeReason),
+    ["MANUAL_CLOSE_ALL", "MANUAL_CLOSE_ALL"]
+  );
+  assert.equal(closeAll.account.marginUsed, 0);
+  assert.equal(closeAll.account.unrealizedPnl, 0);
+  const noPositionsResponse = await fetch(`${baseUrl}/api/account/close-all`, { method: "POST" });
+  assert.equal(noPositionsResponse.status, 409);
 
   console.log("dashboard controls and account actions test passed");
 } finally {

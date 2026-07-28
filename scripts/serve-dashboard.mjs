@@ -21,11 +21,13 @@ import {
 } from "./post-trade-review.mjs";
 import {
   appendTradeHistoryRecords,
+  compactArchivedTrade,
   deleteTradeHistoryRecords,
   loadTradeHistoryRecords,
   queryTradeHistory,
   tradeHistoryStats
 } from "./trade-history-store.mjs";
+import { closePaperPosition } from "./paper-position-settlement.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -82,6 +84,23 @@ const CONTENT_TYPES = {
 function readJson(filePath, fallback = null) {
   try {
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+const reportCache = new Map();
+
+function readCachedReport(filePath, fallback = null) {
+  try {
+    const stat = fs.statSync(filePath);
+    const cached = reportCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.bytes === stat.size) {
+      return cached.value;
+    }
+    const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    reportCache.set(filePath, { mtimeMs: stat.mtimeMs, bytes: stat.size, value });
+    return value;
   } catch {
     return fallback;
   }
@@ -509,6 +528,7 @@ function createPaperAccount(config, now = new Date().toISOString()) {
     availableEquity: normalized.initialCapital,
     positions: {},
     tradeHistory: [],
+    tradeHistorySchemaVersion: 2,
     lifetimeClosedTrades: 0,
     lifetimeWinningTrades: 0,
     postTradeReviewConfig: normalizePostTradeReviewConfig(),
@@ -572,6 +592,10 @@ function readAccountBundle() {
         position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
     }
     account.tradeHistory = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+    if (safeNumber(account.tradeHistorySchemaVersion) !== 2) {
+      account.tradeHistory = account.tradeHistory.map((trade) => compactArchivedTrade(trade));
+      account.tradeHistorySchemaVersion = 2;
+    }
     account.lifetimeClosedTrades = Math.max(
       account.tradeHistory.length,
       Math.round(safeNumber(account.lifetimeClosedTrades, account.tradeHistory.length))
@@ -680,18 +704,37 @@ function reportPath(layer) {
   return path.join(RUNTIME_DIR, "latest-report.json");
 }
 
-function readTail(filePath, maxBytes = 80_000) {
+function readLogChunk(filePath, cursor = null, maxBytes = 80_000) {
+  let fd = null;
   try {
-    const stat = fs.statSync(filePath);
-    const start = Math.max(0, stat.size - maxBytes);
+    fd = fs.openSync(filePath, "r");
+    const stat = fs.fstatSync(fd);
+    const parsedCursor = Number(cursor);
+    const hasCursor = cursor !== null && cursor !== "" && Number.isInteger(parsedCursor) && parsedCursor >= 0;
+    let start = hasCursor ? parsedCursor : Math.max(0, stat.size - maxBytes);
+    let reset = !hasCursor;
+    if (start > stat.size || stat.size - start > maxBytes) {
+      start = Math.max(0, stat.size - maxBytes);
+      reset = true;
+    }
     const length = stat.size - start;
-    const fd = fs.openSync(filePath, "r");
-    const buffer = Buffer.alloc(length);
-    fs.readSync(fd, buffer, 0, length, start);
-    fs.closeSync(fd);
-    return buffer.toString("utf8");
+    let buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, start);
+    buffer = buffer.subarray(0, bytesRead);
+    let text = buffer.toString("utf8");
+    if (reset && start > 0) {
+      const firstLineEnd = text.indexOf("\n");
+      if (firstLineEnd >= 0) text = text.slice(firstLineEnd + 1);
+    }
+    return { text, cursor: stat.size, reset };
   } catch {
-    return "";
+    return { text: "", cursor: 0, reset: true };
+  } finally {
+    try {
+      if (fd !== null) fs.closeSync(fd);
+    } catch {
+      // A failed close must not break the log viewer.
+    }
   }
 }
 
@@ -712,7 +755,7 @@ function loopStatus(latestReportOverride = null) {
   const serviceHeartbeatMs = Date.parse(service?.heartbeatAt || "");
   const serviceAgeMs = Number.isFinite(serviceHeartbeatMs) ? Math.max(0, Date.now() - serviceHeartbeatMs) : null;
   const serviceFresh = serviceAgeMs !== null && serviceAgeMs <= SERVICE_STALE_SECONDS * 1_000;
-  const latestReport = latestReportOverride || readJson(path.join(RUNTIME_DIR, "latest-report.json"), null);
+  const latestReport = latestReportOverride || readCachedReport(path.join(RUNTIME_DIR, "latest-report.json"), null);
   const reportGeneratedAt = latestReport?.generatedAt || null;
   const reportTimestamp = Date.parse(reportGeneratedAt || "");
   const reportAgeMs = Number.isFinite(reportTimestamp) ? Math.max(0, Date.now() - reportTimestamp) : null;
@@ -726,9 +769,15 @@ function loopStatus(latestReportOverride = null) {
     loopIntervalSeconds: null,
     decisionBackend: service?.decisionBackend || "adaptive-sequential-rest",
     priceBackend: service?.priceBackend || "binance-bookTicker-websocket",
+    orderFlowBackend: service?.orderFlowBackend || "binance-aggTrade-depth5-websocket",
     priceConnected: service?.priceConnected === true,
+    orderFlowConnected: service?.orderFlowConnected === true,
+    orderFlowDepthConnected: service?.orderFlowDepthConnected === true,
+    orderFlowTradeConnected: service?.orderFlowTradeConnected === true,
     subscribedSymbols: Array.isArray(service?.subscribedSymbols) ? service.subscribedSymbols : [],
+    orderFlowSymbols: Array.isArray(service?.orderFlowSymbols) ? service.orderFlowSymbols : [],
     lastPriceEventAt: service?.lastPriceEventAt || null,
+    lastOrderFlowEventAt: service?.lastOrderFlowEventAt || null,
     lastProtectionAt: service?.lastProtectionAt || null,
     nextDecisionAt: service?.nextDecisionAt || null,
     decisionCycles: safeNumber(service?.decisionCycles),
@@ -779,6 +828,7 @@ function reportHeader(report) {
     generatedAt: report?.generatedAt || null,
     mode: report?.mode || "paper-alert-only",
     layer: report?.layer || "event-driven-hybrid",
+    marketSession: report?.marketSession || null,
     binanceTradingRules: report?.binanceTradingRules || null,
     sourceCounts: report?.sourceCounts || {},
     messageFeedStats: {
@@ -895,7 +945,7 @@ function compactAccountForDashboard(account) {
 }
 
 function pageData(view) {
-  const report = readJson(reportPath("latest"), null);
+  const report = readCachedReport(reportPath("latest"), null);
   if (!report) return null;
   const header = reportHeader(report);
   if (view === "signals") {
@@ -933,7 +983,7 @@ function pageData(view) {
     return {
       report: header,
       status: loopStatus(report),
-      log: { text: readTail(path.join(RUNTIME_DIR, "fast-loop.log"), 80_000) }
+      log: readLogChunk(path.join(RUNTIME_DIR, "fast-loop.log"), null, 80_000)
     };
   }
   const { config, account } = readAccountBundle();
@@ -1031,6 +1081,66 @@ function runDashboardArchivedReview(account, now = new Date().toISOString()) {
   };
 }
 
+function closeAllPaperPositions(account, now = new Date().toISOString()) {
+  const closed = [];
+  const failed = [];
+  for (const [positionId, position] of Object.entries(account.positions || {})) {
+    const referencePrice = safeNumber(position.currentPrice, safeNumber(position.entry));
+    if (!(referencePrice > 0)) {
+      failed.push({ id: positionId, symbol: position.symbol || positionId, reason: "INVALID_PRICE" });
+      continue;
+    }
+    const item = closePaperPosition(account, positionId, referencePrice, "MANUAL_CLOSE_ALL", now);
+    if (item) closed.push(item);
+    else failed.push({ id: positionId, symbol: position.symbol || positionId, reason: "SETTLEMENT_FAILED" });
+  }
+  if (!closed.length) return { closed, failed };
+
+  const remaining = Object.values(account.positions || {});
+  account.unrealizedPnl = remaining.reduce((sum, position) => sum + safeNumber(position.unrealizedPnl), 0);
+  account.marginUsed = remaining.reduce((sum, position) => sum + safeNumber(position.marginRequired), 0);
+  account.equity = safeNumber(account.startingCapital) + safeNumber(account.realizedPnl) + account.unrealizedPnl;
+  account.availableEquity = Math.max(0, account.equity - account.marginUsed);
+  account.updatedAt = now;
+  const equityPoint = {
+    time: now,
+    equity: account.equity,
+    returnPct: account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0,
+    realizedPnl: safeNumber(account.realizedPnl),
+    unrealizedPnl: account.unrealizedPnl
+  };
+  account.equityCurve = [...(account.equityCurve || []), equityPoint].slice(-5_000);
+  const closedTrades = Math.max(safeNumber(account.lifetimeClosedTrades), (account.tradeHistory || []).length);
+  const wins = Math.min(closedTrades, safeNumber(account.lifetimeWinningTrades));
+  account.summary = {
+    ...(account.summary || {}),
+    endTime: now,
+    latestEquity: account.equity,
+    finalReturnPct: equityPoint.returnPct,
+    closedTrades,
+    wins,
+    losses: closedTrades - wins,
+    winRate: closedTrades ? wins / closedTrades : 0,
+    openPositions: remaining.length,
+    realizedPnl: safeNumber(account.realizedPnl),
+    unrealizedPnl: account.unrealizedPnl,
+    tradingFees: safeNumber(account.tradingFees),
+    slippageCost: safeNumber(account.slippageCost),
+    fundingPnl: safeNumber(account.fundingPnl),
+    marginUsed: account.marginUsed,
+    availableEquity: account.availableEquity
+  };
+  account.lastRun = {
+    generatedAt: now,
+    openedPositions: [],
+    closedPositions: closed,
+    manualCloseAll: true
+  };
+  const { result: reviewResult } = runDashboardArchivedReview(account, now);
+  account.lastRun.postTradeReview = reviewResult.review;
+  return { closed, failed };
+}
+
 function sendStatic(response, requestPath) {
   const relativePath = requestPath === "/" ? "index.html" : requestPath.replace(/^\/+/, "");
   const filePath = path.resolve(PUBLIC_DIR, relativePath);
@@ -1058,7 +1168,7 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname === "/api/report") {
     const layer = url.searchParams.get("layer") || "latest";
     const filePath = reportPath(layer);
-    const report = readJson(filePath, null);
+    const report = readCachedReport(filePath, null);
     if (!report) {
       sendJson(response, { error: "report_not_found", filePath }, 404);
       return;
@@ -1436,16 +1546,49 @@ const server = http.createServer(async (request, response) => {
     }
     return;
   }
+  if (url.pathname === "/api/account/close-all" && request.method === "POST") {
+    try {
+      const result = await withAccountLock(() => {
+        const { config, account } = readAccountBundle();
+        if (!Object.keys(account.positions || {}).length) {
+          const error = new Error("当前没有可平仓的模拟仓位。");
+          error.code = "NO_OPEN_POSITIONS";
+          throw error;
+        }
+        const settlement = closeAllPaperPositions(account);
+        writeJson(ACCOUNT_STATE_PATH, account);
+        return {
+          config,
+          account,
+          closeResult: {
+            closedCount: settlement.closed.length,
+            failedCount: settlement.failed.length,
+            failed: settlement.failed
+          }
+        };
+      });
+      sendJson(response, result);
+    } catch (error) {
+      sendJson(
+        response,
+        { error: error instanceof Error ? error.message : String(error), errorCode: error?.code || "CLOSE_ALL_FAILED" },
+        error?.code === "NO_OPEN_POSITIONS" ? 409 : 500
+      );
+    }
+    return;
+  }
   if (url.pathname === "/api/account/summary") {
     const { config, account } = readAccountBundle();
     sendJson(response, { config, summary: account.summary || null, account: compactAccountForSummary(account) });
     return;
   }
   if (url.pathname === "/api/log") {
-    const maxBytes = Math.min(Number(url.searchParams.get("bytes") || 80_000), 500_000);
-    sendJson(response, {
-      text: readTail(path.join(RUNTIME_DIR, "fast-loop.log"), maxBytes)
-    });
+    const requestedBytes = Number(url.searchParams.get("bytes") || 80_000);
+    const maxBytes = Math.max(1_024, Math.min(Number.isFinite(requestedBytes) ? requestedBytes : 80_000, 500_000));
+    sendJson(
+      response,
+      readLogChunk(path.join(RUNTIME_DIR, "fast-loop.log"), url.searchParams.get("cursor"), maxBytes)
+    );
     return;
   }
   if (url.pathname === "/api/status") {

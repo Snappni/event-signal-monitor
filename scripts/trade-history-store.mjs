@@ -62,12 +62,16 @@ function writeShard(filePath, rows) {
 }
 
 export function compactArchivedTrade(trade) {
+  const direction = trade?.decisionCalculation?.direction;
   return {
     id: trade?.id || null,
     sessionId: trade?.sessionId || null,
+    signalId: trade?.signalId || null,
     status: "closed",
+    costModelVersion: safeNumber(trade?.costModelVersion, 1),
     symbol: trade?.symbol || null,
     side: trade?.side || null,
+    accountMarketType: trade?.accountMarketType || null,
     candidateMode: trade?.candidateMode || null,
     riskProfile: trade?.riskProfile || null,
     openedAt: trade?.openedAt || null,
@@ -81,16 +85,26 @@ export function compactArchivedTrade(trade) {
     originalStopLoss: safeNumber(trade?.originalStopLoss, safeNumber(trade?.stopLoss)),
     quantity: safeNumber(trade?.quantity),
     leverage: safeNumber(trade?.leverage),
+    modelSuggestedLeverage: safeNumber(trade?.modelSuggestedLeverage),
+    leverageCapped: trade?.leverageCapped === true,
     notional: safeNumber(trade?.notional),
     marginRequired: safeNumber(trade?.marginRequired),
+    initialNotional: safeNumber(trade?.initialNotional, safeNumber(trade?.notional)),
+    initialMarginRequired: safeNumber(trade?.initialMarginRequired, safeNumber(trade?.marginRequired)),
+    initialQuantity: safeNumber(trade?.initialQuantity, safeNumber(trade?.quantity)),
+    maxLossAmount: safeNumber(trade?.maxLossAmount),
+    initialMaxLossAmount: safeNumber(trade?.initialMaxLossAmount, safeNumber(trade?.maxLossAmount)),
     grossTradingPnl: safeNumber(trade?.grossTradingPnl),
     realizedPnl: safeNumber(trade?.realizedPnl),
     realizedReturnPct: safeNumber(trade?.realizedReturnPct),
     entryFee: safeNumber(trade?.entryFee),
     exitFee: safeNumber(trade?.exitFee),
+    feeRate: safeNumber(trade?.feeRate),
     entrySlippageCost: safeNumber(trade?.entrySlippageCost),
     exitSlippageCost: safeNumber(trade?.exitSlippageCost),
+    slippageRate: safeNumber(trade?.slippageRate),
     fundingPnl: safeNumber(trade?.fundingPnl),
+    fundingIntervalHours: safeNumber(trade?.fundingIntervalHours),
     winRate: safeNumber(trade?.winRate),
     adaptiveWinRateThreshold: safeNumber(trade?.adaptiveWinRateThreshold),
     breakEvenWinRate: safeNumber(trade?.breakEvenWinRate),
@@ -101,6 +115,22 @@ export function compactArchivedTrade(trade) {
     mathSignal: safeNumber(trade?.mathSignal),
     eventDirection: safeNumber(trade?.eventDirection),
     regime: trade?.regime || null,
+    maxFavorableExcursionPct: safeNumber(trade?.maxFavorableExcursionPct),
+    maxAdverseExcursionPct: safeNumber(trade?.maxAdverseExcursionPct),
+    holdingObservationCount: Array.isArray(trade?.holdingObservations)
+      ? trade.holdingObservations.length
+      : safeNumber(trade?.holdingObservationCount),
+    decisionCalculation: direction
+      ? {
+          direction: {
+            combinedDirection: safeNumber(direction.combinedDirection),
+            eventDirection: safeNumber(direction.eventDirection),
+            eventWeight: safeNumber(direction.eventWeight),
+            mathDirection: safeNumber(direction.mathDirection),
+            mathWeight: safeNumber(direction.mathWeight)
+          }
+        }
+      : null,
     factorSnapshot: trade?.factorSnapshot || null,
     exitFactorSnapshot: trade?.exitFactorSnapshot || null,
     exitCounterfactual: trade?.exitCounterfactual || null,

@@ -11,7 +11,7 @@ let historyPage = 1;
 let historyData = null;
 const selectedHistoryIds = new Set();
 
-const labels = { eventImpact: "事件影响", trend: "15分钟趋势", higherTimeframeTrend: "1小时趋势", momentum: "动量", rsi: "RSI反转", funding: "资金费率", openInterest: "未平仓量", geometricBrownianMotion: "GBM方向", hiddenMarkovModel: "HMM状态", signalReversal: "信号反转", netExpectancyDecay: "净EV失效", eventDecay: "事件衰减", timeDecay: "自适应时间衰减", capitalEfficiency: "资金效率", profitProtection: "盈利保护" };
+const labels = { eventImpact: "事件影响", trend: "15分钟趋势", higherTimeframeTrend: "1小时趋势", momentum: "动量", rsi: "RSI反转", volume: "成交量确认", funding: "资金费率", openInterest: "未平仓量", orderFlow: "订单流", geometricBrownianMotion: "GBM方向", hiddenMarkovModel: "HMM状态", signalReversal: "信号反转", netExpectancyDecay: "净EV失效", eventDecay: "事件衰减", timeDecay: "自适应时间衰减", capitalEfficiency: "资金效率", profitProtection: "盈利保护" };
 const list = (value) => Array.isArray(value) ? value : [];
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const pct = (value, digits = 2) => `${(number(value) * 100).toFixed(digits)}%`;

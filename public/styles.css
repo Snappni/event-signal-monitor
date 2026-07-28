@@ -158,6 +158,17 @@ button:disabled {
   color: #6de2bc;
 }
 
+.danger-action {
+  border-color: #71383f;
+  background: #351a1f;
+  color: #ff8b96;
+}
+
+.danger-action:hover:not(:disabled) {
+  border-color: #a54a54;
+  background: #4a2027;
+}
+
 .segmented {
   display: inline-flex;
   padding: 3px;
@@ -1008,6 +1019,12 @@ main {
 .position-toolbar > strong {
   color: #c7d1dd;
   font-size: 13px;
+}
+
+.position-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .position-tabs button {
@@ -2182,6 +2199,16 @@ main,
   .page-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .position-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .position-toolbar-actions {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .section-title h2 {

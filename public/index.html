@@ -43,6 +43,10 @@
           <strong id="layerValue">-</strong>
         </div>
         <div class="metric">
+          <span>当前交易时段</span>
+          <strong id="sessionValue">-</strong>
+        </div>
+        <div class="metric">
           <span>开仓候选</span>
           <strong id="actionableValue">0</strong>
         </div>
@@ -117,13 +121,16 @@
         </div>
         <div class="position-toolbar">
           <strong>模拟持仓记录</strong>
-          <div class="segmented position-tabs" role="tablist" aria-label="持仓状态">
-            <button class="active" data-position-view="open" type="button">
-              未平仓 <span id="openPositionCount">0</span>
-            </button>
-            <button data-position-view="closed" type="button">
-              已平仓 <span id="closedPositionCount">0</span>
-            </button>
+          <div class="position-toolbar-actions">
+            <button id="closeAllPositionsButton" class="danger-action" type="button" disabled>一键平仓</button>
+            <div class="segmented position-tabs" role="tablist" aria-label="持仓状态">
+              <button class="active" data-position-view="open" type="button">
+                未平仓 <span id="openPositionCount">0</span>
+              </button>
+              <button data-position-view="closed" type="button">
+                已平仓 <span id="closedPositionCount">0</span>
+              </button>
+            </div>
           </div>
         </div>
         <div id="accountPositions" class="position-list"></div>

@@ -58,9 +58,13 @@ import {
 } from "./binance-trading-rules.mjs";
 import {
   appendTradeHistoryRecords,
+  compactArchivedTrade,
   loadTradeHistoryRecords,
   tradeHistoryStats
 } from "./trade-history-store.mjs";
+import { createMarketMicrostructure } from "./market-microstructure.mjs";
+import { closePaperPosition } from "./paper-position-settlement.mjs";
+import { classifyMarketSession, limitSessionEntryCandidates } from "./market-session-policy.mjs";
 
 const RUNTIME_DIR = path.resolve(
   process.env.SIGNAL_RUNTIME_DIR || path.resolve(".runtime", "event-signal-monitor")
@@ -80,7 +84,7 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.16.0";
+const MONITOR_VERSION = "0.17.0";
 const RUN_LAYER = "event-driven-hybrid";
 const LAYER_REPORT_PATH = REPORT_PATH;
 const MESSAGE_FEED_LIMIT = 200;
@@ -98,6 +102,7 @@ const SERVICE_IDLE_DECISION_DELAY_MS = toPositiveInt(
 );
 const SERVICE_MAX_BACKOFF_MS = toPositiveInt(process.env.SIGNAL_MAX_DECISION_BACKOFF_MS, 120_000);
 const PRICE_EVENT_COALESCE_MS = toPositiveInt(process.env.SIGNAL_PRICE_EVENT_COALESCE_MS, 100);
+const ORDER_FLOW_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_ORDER_FLOW_SYMBOL_LIMIT, 12);
 const DEFAULT_SYMBOLS = [
   "BTCUSDT",
   "ETHUSDT",
@@ -124,6 +129,7 @@ const SYMBOLS = (process.env.SIGNAL_MONITOR_SYMBOLS || DEFAULT_SYMBOLS.join(",")
   .split(",")
   .map((symbol) => symbol.trim().toUpperCase())
   .filter(Boolean);
+const marketMicrostructure = createMarketMicrostructure();
 
 const SYMBOL_ALIASES = {
   BTCUSDT: ["BTC", "BITCOIN", "WBTC"],
@@ -459,6 +465,7 @@ function createPaperAccount(accountConfig, now = new Date().toISOString()) {
     availableEquity: config.initialCapital,
     positions: {},
     tradeHistory: [],
+    tradeHistorySchemaVersion: 2,
     capitalRotationHistory: [],
     exitDecisionHistory: [],
     lifetimeClosedTrades: 0,
@@ -509,6 +516,10 @@ function readPaperAccount(accountConfig) {
       position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
   }
   account.tradeHistory = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+  if (safeNumber(account.tradeHistorySchemaVersion) !== 2) {
+    account.tradeHistory = account.tradeHistory.map((trade) => compactArchivedTrade(trade));
+    account.tradeHistorySchemaVersion = 2;
+  }
   account.lifetimeClosedTrades = Math.max(
     account.tradeHistory.length,
     Math.round(safeNumber(account.lifetimeClosedTrades, account.tradeHistory.length))
@@ -902,7 +913,11 @@ function parseBinanceKline(row) {
     high: safeNumber(row[2]),
     low: safeNumber(row[3]),
     close: safeNumber(row[4]),
-    volume: safeNumber(row[5])
+    volume: safeNumber(row[5]),
+    quoteVolume: safeNumber(row[7]),
+    tradeCount: safeNumber(row[8]),
+    takerBuyVolume: safeNumber(row[9]),
+    takerBuyQuoteVolume: safeNumber(row[10])
   };
 }
 
@@ -913,7 +928,8 @@ function parseOkxCandle(row) {
     high: safeNumber(row[2]),
     low: safeNumber(row[3]),
     close: safeNumber(row[4]),
-    volume: safeNumber(row[5])
+    volume: safeNumber(row[5]),
+    quoteVolume: safeNumber(row[7])
   };
 }
 
@@ -1993,6 +2009,7 @@ function analyzeMarket(
   fundingRate,
   openInterest,
   previousOpenInterest,
+  microstructureSnapshot,
   directionWeightsValue = DIRECTION_MODEL_WEIGHTS
 ) {
   const directionWeights = normalizeDirectionWeights(directionWeightsValue, DIRECTION_MODEL_WEIGHTS);
@@ -2013,6 +2030,27 @@ function analyzeMarket(
   const roc15m = closes15m.length >= 5 ? latest / closes15m.at(-5) - 1 : 0;
   const roc1h = closes1h.length >= 5 ? latest / closes1h.at(-5) - 1 : 0;
   const rsi14 = rsi(closes15m);
+  const closedVolumes15m = candles15m.slice(0, -1).map((candle) => safeNumber(candle.volume)).filter((value) => value > 0);
+  const latestClosedVolume15m = closedVolumes15m.at(-1) || 0;
+  const averageVolume15m = mean(closedVolumes15m.slice(-21, -1));
+  const volumeExpansion = averageVolume15m > 0
+    ? clamp(latestClosedVolume15m / averageVolume15m, 0, 5)
+    : 1;
+  const closedRoc15m = closes15m.length >= 6 ? closes15m.at(-2) / closes15m.at(-6) - 1 : roc15m;
+  const volumeSignal = clamp(Math.sign(closedRoc15m) * (volumeExpansion - 1) / 2, -0.35, 0.35);
+  const orderFlowAvailable = microstructureSnapshot?.available === true;
+  const orderFlowSignal = orderFlowAvailable
+    ? clamp(safeNumber(microstructureSnapshot.signal), -1, 1)
+    : 0;
+  const effectiveDirectionWeights = { ...directionWeights };
+  if (!orderFlowAvailable && effectiveDirectionWeights.orderFlow > 0) {
+    const activeWeight = 1 - effectiveDirectionWeights.orderFlow;
+    for (const key of Object.keys(effectiveDirectionWeights)) {
+      effectiveDirectionWeights[key] = key === "orderFlow"
+        ? 0
+        : effectiveDirectionWeights[key] / activeWeight;
+    }
+  }
   const oiChange =
     previousOpenInterest && previousOpenInterest.value > 0
       ? openInterest / previousOpenInterest.value - 1
@@ -2029,14 +2067,16 @@ function analyzeMarket(
   const garch = estimateGarch11(returns);
   const hiddenMarkov = analyzeHiddenMarkovRegime(returns);
   const directionalSignal = clamp(
-    trendSignal * directionWeights.trend +
-      htfTrendSignal * directionWeights.higherTimeframeTrend +
-      momentumSignal * directionWeights.momentum +
-      rsiSignal * directionWeights.rsi +
-      fundingSignal * directionWeights.funding +
-      oiSignal * directionWeights.openInterest +
-      gbm.signal * directionWeights.geometricBrownianMotion +
-      hiddenMarkov.signal * directionWeights.hiddenMarkovModel,
+    trendSignal * effectiveDirectionWeights.trend +
+      htfTrendSignal * effectiveDirectionWeights.higherTimeframeTrend +
+      momentumSignal * effectiveDirectionWeights.momentum +
+      rsiSignal * effectiveDirectionWeights.rsi +
+      volumeSignal * effectiveDirectionWeights.volume +
+      fundingSignal * effectiveDirectionWeights.funding +
+      oiSignal * effectiveDirectionWeights.openInterest +
+      orderFlowSignal * effectiveDirectionWeights.orderFlow +
+      gbm.signal * effectiveDirectionWeights.geometricBrownianMotion +
+      hiddenMarkov.signal * effectiveDirectionWeights.hiddenMarkovModel,
     -1,
     1
   );
@@ -2066,8 +2106,13 @@ function analyzeMarket(
     trendSignal,
     htfTrendSignal,
     momentumSignal,
+    volumeSignal,
+    volumeExpansion,
     fundingSignal,
     oiSignal,
+    orderFlowSignal,
+    orderFlowAvailable,
+    microstructure: microstructureSnapshot || null,
     volatilityRegimeScore,
     gbm,
     garch,
@@ -2078,9 +2123,9 @@ function analyzeMarket(
     returns15m: returns.slice(-96),
     mathBreakdown: {
       formula:
-        "directionalSignal = sum(directionFactor*currentReviewWeight); mathSignal = directionalSignal*(0.65 + 0.35*GARCH_stability)",
+        "directionalSignal = sum(price/volume/funding/OI/orderFlow/modelFactor*currentReviewWeight); stale order flow is excluded and remaining weights are renormalized; mathSignal = directionalSignal*(0.65 + 0.35*GARCH_stability)",
       decisionWeights: {
-        ...directionWeights,
+        ...effectiveDirectionWeights,
         garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
         markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT
       },
@@ -2094,9 +2139,28 @@ function analyzeMarket(
         roc15m,
         roc1h,
         rsi14,
+        latestClosedVolume15m,
+        averageVolume15m,
+        volumeExpansion,
+        closedRoc15m,
         fundingRate,
         openInterest,
         oiChange,
+        orderFlowAvailable,
+        orderFlowSignal,
+        tradeImbalance5s: safeNumber(microstructureSnapshot?.flow5s?.imbalance),
+        tradeImbalance30s: safeNumber(microstructureSnapshot?.flow30s?.imbalance),
+        cumulativeVolumeDelta30s: safeNumber(microstructureSnapshot?.cumulativeVolumeDelta30s),
+        volumeRateRatio: safeNumber(microstructureSnapshot?.volumeRateRatio),
+        orderFlowTradeConfidence: safeNumber(microstructureSnapshot?.tradeConfidence),
+        orderBookImbalance: safeNumber(microstructureSnapshot?.orderBookImbalance),
+        bookFlowImbalance5s: safeNumber(microstructureSnapshot?.bookFlow5s?.imbalance),
+        bookFlowImbalance30s: safeNumber(microstructureSnapshot?.bookFlow30s?.imbalance),
+        bookFlowConfidence: safeNumber(microstructureSnapshot?.bookFlowConfidence),
+        spreadBps: safeNumber(microstructureSnapshot?.spreadBps),
+        bidDepthQuote: safeNumber(microstructureSnapshot?.bidDepthQuote),
+        askDepthQuote: safeNumber(microstructureSnapshot?.askDepthQuote),
+        microPriceBiasBps: safeNumber(microstructureSnapshot?.microPriceBiasBps),
         realizedVol,
         shortVol,
         volatilityExpansion
@@ -2106,8 +2170,10 @@ function analyzeMarket(
         htfTrendSignal,
         momentumSignal,
         rsiSignal,
+        volumeSignal,
         fundingSignal,
         oiSignal,
+        orderFlowSignal,
         volatilityRegimeScore,
         gbmSignal: gbm.signal,
         garchStabilityScore: garch.stabilityScore,
@@ -2115,14 +2181,16 @@ function analyzeMarket(
         directionalSignal
       },
       weightedTerms: {
-        trend: trendSignal * directionWeights.trend,
-        htfTrend: htfTrendSignal * directionWeights.higherTimeframeTrend,
-        momentum: momentumSignal * directionWeights.momentum,
-        rsi: rsiSignal * directionWeights.rsi,
-        funding: fundingSignal * directionWeights.funding,
-        openInterest: oiSignal * directionWeights.openInterest,
-        geometricBrownianMotion: gbm.signal * directionWeights.geometricBrownianMotion,
-        hiddenMarkovModel: hiddenMarkov.signal * directionWeights.hiddenMarkovModel
+        trend: trendSignal * effectiveDirectionWeights.trend,
+        htfTrend: htfTrendSignal * effectiveDirectionWeights.higherTimeframeTrend,
+        momentum: momentumSignal * effectiveDirectionWeights.momentum,
+        rsi: rsiSignal * effectiveDirectionWeights.rsi,
+        volume: volumeSignal * effectiveDirectionWeights.volume,
+        funding: fundingSignal * effectiveDirectionWeights.funding,
+        openInterest: oiSignal * effectiveDirectionWeights.openInterest,
+        orderFlow: orderFlowSignal * effectiveDirectionWeights.orderFlow,
+        geometricBrownianMotion: gbm.signal * effectiveDirectionWeights.geometricBrownianMotion,
+        hiddenMarkovModel: hiddenMarkov.signal * effectiveDirectionWeights.hiddenMarkovModel
       },
       models: { gbm, garch, hiddenMarkov },
       result: mathSignal,
@@ -2139,11 +2207,13 @@ function buildCandidate(
   accountConfig,
   weightVersion = 1,
   calibration = {},
-  tradingRulesBySymbol = {}
+  tradingRulesBySymbol = {},
+  sessionContext = null
 ) {
   if (!market.latest || !Number.isFinite(market.latest)) return null;
 
   const normalizedAccountConfig = normalizeAccountConfig(accountConfig);
+  const sessionPolicy = sessionContext?.policy || null;
   const eventScoreNorm = clamp(eventAggregate.score / 100, 0, 1);
   const hasEventContext = eventAggregate.score > 0 && Array.isArray(eventAggregate.events) && eventAggregate.events.length > 0;
   const highImpactEvent = hasEventContext && eventAggregate.score >= 70 && Math.abs(eventAggregate.direction) >= 0.2;
@@ -2166,9 +2236,11 @@ function buildCandidate(
     eventImpact: eventScoreNorm,
     trend: Math.abs(market.trendSignal),
     momentum: Math.abs(market.momentumSignal),
+    volume: clamp(market.volumeExpansion / 2, 0, 1),
     volatilityRegime: Math.max(market.volatilityRegimeScore, -0.1),
     funding: Math.abs(market.fundingSignal),
     openInterest: Math.abs(market.oiSignal),
+    orderFlow: Math.abs(market.orderFlowSignal),
     liquidity: 0.5,
     gbm: Math.abs(market.gbm.signal),
     garch: market.garch.stabilityScore,
@@ -2251,7 +2323,12 @@ function buildCandidate(
     calibration
   });
   const expectancyClass = expectancyR >= MIN_HIGH_EXPECTANCY_R ? "high" : "normal";
-  const { passesGate } = gateResult;
+  const adaptiveWinRateThreshold = clamp(
+    gateResult.adaptiveWinRateThreshold + safeNumber(sessionPolicy?.entryThresholdAdd),
+    0.35,
+    0.95
+  );
+  const passesGate = gateResult.passesGate && winRate >= adaptiveWinRateThreshold;
   const tradingRule = tradingRulesBySymbol[market.symbol] || null;
   const entry = tradingRule
     ? alignToStep(market.latest, tradingRule.tickSize, "nearest")
@@ -2267,7 +2344,7 @@ function buildCandidate(
     : rawTakeProfit;
   const kelly = clamp((rewardRiskRatio * winRate - (1 - winRate)) / rewardRiskRatio, 0, 0.35);
   const fractionalKelly = kelly * 0.2;
-  const maxRiskPct = highImpactEvent ? 0.008 : 0.005;
+  const maxRiskPct = (highImpactEvent ? 0.008 : 0.005) * safeNumber(sessionPolicy?.riskMultiplier, 1);
   const positionRiskPct = clamp(Math.min(fractionalKelly, maxRiskPct), 0, maxRiskPct);
   const accountControl = buildAccountControl({
     accountConfig,
@@ -2300,7 +2377,7 @@ function buildCandidate(
     expectancyPct,
     expectancyR,
     expectancyClass,
-    adaptiveWinRateThreshold: gateResult.adaptiveWinRateThreshold,
+    adaptiveWinRateThreshold,
     breakEvenWinRate: gateResult.breakEvenWinRate,
     rewardRiskRatio,
     riskPct,
@@ -2309,6 +2386,7 @@ function buildCandidate(
     accountControl,
     highImpactEvent,
     eventImpactScore: Math.round(eventAggregate.score),
+    marketSession: sessionContext,
     combinedDirection,
     mathSignal: market.mathSignal,
     eventDirection,
@@ -2324,8 +2402,10 @@ function buildCandidate(
         higherTimeframeTrend: market.htfTrendSignal,
         momentum: market.momentumSignal,
         rsi: market.mathBreakdown?.components?.rsiSignal || 0,
+        volume: market.volumeSignal,
         funding: market.fundingSignal,
         openInterest: market.oiSignal,
+        orderFlow: market.orderFlowSignal,
         geometricBrownianMotion: market.gbm.signal,
         hiddenMarkovModel: market.hiddenMarkov.signal
       },
@@ -2334,8 +2414,10 @@ function buildCandidate(
         higherTimeframeTrend: market.mathBreakdown?.decisionWeights?.higherTimeframeTrend,
         momentum: market.mathBreakdown?.decisionWeights?.momentum,
         rsi: market.mathBreakdown?.decisionWeights?.rsi,
+        volume: market.mathBreakdown?.decisionWeights?.volume,
         funding: market.mathBreakdown?.decisionWeights?.funding,
         openInterest: market.mathBreakdown?.decisionWeights?.openInterest,
+        orderFlow: market.mathBreakdown?.decisionWeights?.orderFlow,
         geometricBrownianMotion: market.mathBreakdown?.decisionWeights?.geometricBrownianMotion,
         hiddenMarkovModel: market.mathBreakdown?.decisionWeights?.hiddenMarkovModel
       },
@@ -2393,6 +2475,7 @@ function buildCandidate(
         takeProfit,
         stopLoss
       },
+      marketSession: sessionContext,
       expectancy: {
         formula:
           "EV% = P(win)*rewardPct - (1-P(win))*riskPct - 2*(takerFeeRate + slippageRate); funding is settled separately if a funding timestamp is crossed",
@@ -2545,7 +2628,13 @@ function normalizeCappedWeights(values, maxWeight) {
   return total > 0 ? weights.map((value) => value / total) : weights;
 }
 
-function applyMarkowitzSizing(candidates, marketBySymbol, accountConfig, tradingRulesBySymbol = {}) {
+function applyMarkowitzSizing(
+  candidates,
+  marketBySymbol,
+  accountConfig,
+  tradingRulesBySymbol = {},
+  sessionContext = null
+) {
   if (!candidates.length) {
     return {
       candidates,
@@ -2604,7 +2693,8 @@ function applyMarkowitzSizing(candidates, marketBySymbol, accountConfig, trading
       1.35
     );
     const originalRiskPct = candidate.positionRiskPct;
-    const riskCap = candidate.highImpactEvent ? 0.008 : 0.005;
+    const riskCap = (candidate.highImpactEvent ? 0.008 : 0.005) *
+      safeNumber(sessionContext?.policy?.riskMultiplier, 1);
     const adjustedPositionRiskPct = clamp(originalRiskPct * allocationMultiplier, 0, riskCap);
     const market = marketBySymbol[candidate.symbol];
     const accountControl = buildAccountControl({
@@ -3116,107 +3206,6 @@ function partiallyClosePaperPosition(account, positionId, price, fraction, repla
   }
   account.exitDecisionHistory = [...(account.exitDecisionHistory || []), event].slice(-500);
   return event;
-}
-
-function closePaperPosition(account, positionId, price, reason, now) {
-  const position = account.positions[positionId];
-  if (!position) return null;
-  const exitPrice = adverseExecutionPrice(
-    price,
-    position.side,
-    "exit",
-    safeNumber(position.slippageRate)
-  );
-  const exitNotional = Math.abs(position.quantity * exitPrice);
-  const exitFee = exitNotional * safeNumber(position.feeRate);
-  const exitSlippageCost = Math.abs(exitPrice - price) * position.quantity;
-  const remainingGrossTradingPnl = positionGrossPnl(position, exitPrice);
-  const closeSettlementPnl = remainingGrossTradingPnl - exitFee;
-  const remainingRealizedPnl =
-    remainingGrossTradingPnl -
-    safeNumber(position.entryFee) -
-    exitFee +
-    safeNumber(position.fundingPnl);
-  const totalQuantity = safeNumber(position.partialClosedQuantity) + safeNumber(position.quantity);
-  const weightedExitPrice = totalQuantity > 0
-    ? (safeNumber(position.partialExitPriceQuantitySum) + exitPrice * safeNumber(position.quantity)) / totalQuantity
-    : exitPrice;
-  const grossTradingPnl = safeNumber(position.partialGrossTradingPnl) + remainingGrossTradingPnl;
-  const realizedPnl = safeNumber(position.partialRealizedPnl) + remainingRealizedPnl;
-  const totalEntryFee = safeNumber(position.partialEntryFee) + safeNumber(position.entryFee);
-  const totalExitFee = safeNumber(position.partialExitFee) + exitFee;
-  const totalEntrySlippageCost = safeNumber(position.partialEntrySlippageCost) + safeNumber(position.entrySlippageCost);
-  const totalExitSlippageCost = safeNumber(position.partialExitSlippageCost) + exitSlippageCost;
-  const totalFundingPnl = safeNumber(position.partialFundingPnl) + safeNumber(position.fundingPnl);
-  const initialMarginRequired = safeNumber(position.initialMarginRequired, position.marginRequired);
-  const closed = {
-    ...position,
-    sessionId: account.sessionId,
-    status: "closed",
-    notional: safeNumber(position.initialNotional, position.notional),
-    marginRequired: initialMarginRequired,
-    quantity: safeNumber(position.initialQuantity, totalQuantity),
-    exitReferencePrice: price,
-    exitPrice: weightedExitPrice,
-    entryFee: totalEntryFee,
-    exitFee: totalExitFee,
-    entrySlippageCost: totalEntrySlippageCost,
-    exitSlippageCost: totalExitSlippageCost,
-    fundingPnl: totalFundingPnl,
-    grossTradingPnl,
-    closedAt: now,
-    closeReason: reason,
-    exitFactorSnapshot: position.exitEvaluation
-      ? {
-          version: position.exitEvaluation.version,
-          evaluatedAt: position.exitEvaluation.evaluatedAt,
-          signals: position.exitEvaluation.signals,
-          weights: position.exitEvaluation.weights,
-          exitScore: position.exitEvaluation.exitScore,
-          threshold: position.exitEvaluation.threshold,
-          diagnostics: position.exitEvaluation.diagnostics
-        }
-      : null,
-    realizedPnl,
-    realizedReturnPct: initialMarginRequired > 0 ? realizedPnl / initialMarginRequired : 0,
-    accountReturnPct: account.startingCapital > 0 ? realizedPnl / account.startingCapital : 0
-  };
-  if (
-    ["ADAPTIVE_EXIT", "MAX_HOLDING_TIME", "CAPITAL_ROTATION", "DYNAMIC_SL", "TP_EXTENSION"].includes(reason) &&
-    position.exitEvaluation
-  ) {
-    const horizonHours = safeNumber(position.exitEvaluation.counterfactualHorizonHours, 4);
-    closed.exitCounterfactual = {
-      status: "pending",
-      horizonHours,
-      dueAt: new Date(new Date(now).getTime() + horizonHours * 3_600_000).toISOString(),
-      evaluatedAt: null,
-      referenceExitPrice: exitPrice,
-      replacementSymbol: position.capitalRotationReplacement?.symbol || null,
-      replacementSide: position.capitalRotationReplacement?.side || null,
-      replacementReferencePrice: position.capitalRotationReplacement?.entry || null,
-      counterfactualPrice: null,
-      counterfactualReturnPct: null,
-      avoidedReturnPct: null,
-      beneficial: null
-    };
-  }
-  account.realizedPnl = safeNumber(account.realizedPnl) + closeSettlementPnl;
-  account.tradingFees = safeNumber(account.tradingFees) + exitFee;
-  account.slippageCost = safeNumber(account.slippageCost) + exitSlippageCost;
-  account.lifetimeClosedTrades = Math.max(
-    safeNumber(account.lifetimeClosedTrades),
-    Array.isArray(account.tradeHistory) ? account.tradeHistory.length : 0
-  ) + 1;
-  if (realizedPnl > 0) {
-    account.lifetimeWinningTrades = Math.max(
-      safeNumber(account.lifetimeWinningTrades),
-      (account.tradeHistory || []).filter((trade) => safeNumber(trade.realizedPnl) > 0).length
-    ) + 1;
-  }
-  delete account.positions[positionId];
-  account.tradeHistory = [...(account.tradeHistory || []), closed].slice(-500);
-  return closed;
 }
 
 function closeTriggeredPaperPositions(account, marketBySymbol, candidatesBySymbol, now, changedSymbols = null) {
@@ -3778,10 +3767,22 @@ function runArchivedPostTradeReview(account, newlyClosedTrades, now) {
   });
 }
 
-function updatePaperAccountForEntryState(account, actionableSignals, allCandidates, marketBySymbol) {
+function updatePaperAccountForEntryState(
+  account,
+  actionableSignals,
+  allCandidates,
+  marketBySymbol,
+  maxConcurrentPositions = Number.POSITIVE_INFINITY
+) {
+  const openSymbols = Object.values(account.positions || {}).map((position) => position.symbol);
+  const sessionLimitedSignals = limitSessionEntryCandidates(
+    actionableSignals,
+    openSymbols,
+    maxConcurrentPositions
+  );
   return updatePaperAccount(
     account,
-    account.isActive ? actionableSignals : [],
+    account.isActive ? sessionLimitedSignals : [],
     allCandidates,
     marketBySymbol
   );
@@ -3992,6 +3993,7 @@ async function mapWithConcurrency(items, limit, mapper) {
 }
 
 async function analyzeSymbol(symbol, state) {
+  const microstructureSnapshot = marketMicrostructure.snapshot(symbol);
   const [candles15m, candles1h, fundingRate, openInterest] = await Promise.all([
     fetchCandles(symbol, "15m", 120),
     fetchCandles(symbol, "1h", 120),
@@ -4009,6 +4011,7 @@ async function analyzeSymbol(symbol, state) {
     safeNumber(fundingRate),
     safeNumber(openInterest),
     previousOpenInterest,
+    microstructureSnapshot,
     state.directionWeights || DIRECTION_MODEL_WEIGHTS
   );
   state.openInterest = state.openInterest || {};
@@ -4217,6 +4220,7 @@ async function main() {
   } finally {
     releaseInitialAccountLock();
   }
+  const currentMarketSession = classifyMarketSession(new Date());
   const warnings = [
     "仅模拟告警：脚本不会发送实盘订单。",
     "无证据表明新闻聚合、大模型推理或 Polymarket 赔率本身能稳定盈利。"
@@ -4348,11 +4352,18 @@ async function main() {
         accountConfig,
         reviewWeightVersion,
         entryCalibration,
-        tradingRulesBySymbol
+        tradingRulesBySymbol,
+        currentMarketSession
       )
     )
     .filter(Boolean);
-  const markowitzResult = applyMarkowitzSizing(rawCandidates, marketBySymbol, accountConfig, tradingRulesBySymbol);
+  const markowitzResult = applyMarkowitzSizing(
+    rawCandidates,
+    marketBySymbol,
+    accountConfig,
+    tradingRulesBySymbol,
+    currentMarketSession
+  );
   const candidates = markowitzResult.candidates.sort((a, b) => b.expectancyR - a.expectancyR);
   const actionableSignals = candidates.filter((candidate) => candidate.status === "passed").slice(0, 5);
   const watchlist = candidates.filter((candidate) => candidate.status !== "passed").slice(0, 8);
@@ -4366,7 +4377,13 @@ async function main() {
     const sameAccountSession =
       sameAccountConfig(accountConfig, finalAccountConfig) && accountSessionId === latestPaperAccount.sessionId;
     updatedPaperAccount = sameAccountSession
-      ? updatePaperAccountForEntryState(latestPaperAccount, actionableSignals, candidates, marketBySymbol)
+      ? updatePaperAccountForEntryState(
+        latestPaperAccount,
+        actionableSignals,
+        candidates,
+        marketBySymbol,
+        currentMarketSession.policy.maxConcurrentPositions
+      )
       : latestPaperAccount;
     state.directionWeights = updatedPaperAccount.postTradeReview?.currentDirectionWeights || state.directionWeights;
     writeJson(ACCOUNT_STATE_PATH, updatedPaperAccount);
@@ -4382,6 +4399,7 @@ async function main() {
     generatedAt: state.updatedAt,
     mode: "paper-alert-only",
     layer: RUN_LAYER,
+    marketSession: currentMarketSession,
     simulatedAccount: finalAccountConfig,
     binanceTradingRules: {
       marketType: tradingRulesResult?.marketType || accountConfig.marketType,
@@ -4416,6 +4434,8 @@ async function main() {
         "ATR",
         "RSI",
         "15m/1h ROC",
+        "15m 成交量确认",
+        "实时主动成交、CVD 与五档盘口",
         "资金费率",
         "OI 变化",
         "GBM",
@@ -4550,6 +4570,27 @@ function openPositionStreamConfig() {
   };
 }
 
+function marketStreamConfig() {
+  const positions = openPositionStreamConfig();
+  const report = readJsonIfExists(REPORT_PATH, {});
+  const rankedCandidates = [
+    ...(Array.isArray(report?.actionableSignals) ? report.actionableSignals : []),
+    ...(Array.isArray(report?.watchlist) ? report.watchlist : [])
+  ].map((candidate) => candidate?.symbol).filter(Boolean);
+  const positionSymbols = [...positions.symbols];
+  const remainingCapacity = Math.max(0, ORDER_FLOW_SYMBOL_LIMIT - positionSymbols.length);
+  const candidateSymbols = [...new Set(rankedCandidates)]
+    .filter((symbol) => !positionSymbols.includes(symbol))
+    .slice(0, remainingCapacity);
+  const orderFlowSymbols = [...positionSymbols, ...candidateSymbols];
+  return {
+    ...positions,
+    protectionSymbols: positionSymbols,
+    orderFlowSymbols,
+    symbols: [...new Set([...positionSymbols, ...orderFlowSymbols])].sort()
+  };
+}
+
 async function runPriceProtectionCycle(prices, serviceState) {
   if (!prices.size) return;
   const releaseAccountLock = await acquireAccountLock();
@@ -4628,9 +4669,15 @@ async function runService() {
     heartbeatAt: null,
     decisionBackend: "adaptive-sequential-rest",
     priceBackend: "binance-bookTicker-websocket",
+    orderFlowBackend: "binance-aggTrade-depth5-websocket",
     priceConnected: false,
+    orderFlowConnected: false,
+    orderFlowDepthConnected: false,
+    orderFlowTradeConnected: false,
     subscribedSymbols: [],
+    orderFlowSymbols: [],
     lastPriceEventAt: null,
+    lastOrderFlowEventAt: null,
     lastProtectionAt: null,
     protectionCycles: 0,
     protectionActions: 0,
@@ -4642,8 +4689,11 @@ async function runService() {
     lastDecisionError: null
   };
   let stopping = false;
-  let socket = null;
-  let socketKey = "";
+  let quoteSocket = null;
+  let tradeSocket = null;
+  let streamKey = "";
+  let socketMarketType = null;
+  let activeStream = null;
   let reconnectTimer = null;
   let protectionTimer = null;
   let protectionBusy = false;
@@ -4654,19 +4704,46 @@ async function runService() {
     writeJson(SERVICE_STATUS_PATH, serviceState);
   };
 
-  const closeSocket = () => {
+  const socketReady = (socket) => socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState);
+
+  const updateConnections = () => {
+    const quoteOpen = quoteSocket?.readyState === WebSocket.OPEN;
+    const tradeOpen = tradeSocket?.readyState === WebSocket.OPEN;
+    const hasProtection = Boolean(activeStream?.protectionSymbols?.length);
+    const hasOrderFlow = Boolean(activeStream?.orderFlowSymbols?.length);
+    serviceState.priceConnected = hasProtection && quoteOpen;
+    serviceState.orderFlowDepthConnected = hasOrderFlow && quoteOpen;
+    serviceState.orderFlowTradeConnected = hasOrderFlow && tradeOpen;
+    serviceState.orderFlowConnected =
+      serviceState.orderFlowDepthConnected && serviceState.orderFlowTradeConnected;
+  };
+
+  const disposeSocket = (socket) => {
+    if (!socket) return;
+    socket.removeAllListeners();
+    socket.on("error", () => {});
+    if (socket.readyState === WebSocket.OPEN) socket.close();
+    else socket.terminate();
+  };
+
+  const closeSockets = () => {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = null;
-    if (socket) {
-      const closingSocket = socket;
-      closingSocket.removeAllListeners();
-      closingSocket.on("error", () => {});
-      if (closingSocket.readyState === WebSocket.OPEN) closingSocket.close();
-      else closingSocket.terminate();
-    }
-    socket = null;
-    socketKey = "";
-    serviceState.priceConnected = false;
+    disposeSocket(quoteSocket);
+    disposeSocket(tradeSocket);
+    quoteSocket = null;
+    tradeSocket = null;
+    streamKey = "";
+    activeStream = null;
+    updateConnections();
+  };
+
+  const scheduleReconnect = () => {
+    if (stopping || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      ensurePriceStream(true);
+    }, 1_000);
   };
 
   const flushProtection = async () => {
@@ -4690,37 +4767,79 @@ async function runService() {
   };
 
   const ensurePriceStream = (force = false) => {
-    const stream = openPositionStreamConfig();
+    const stream = marketStreamConfig();
     serviceState.subscribedSymbols = stream.symbols;
+    serviceState.orderFlowSymbols = stream.orderFlowSymbols;
     if (!stream.symbols.length) {
-      closeSocket();
+      closeSockets();
       return;
     }
-    const names = stream.symbols.map((symbol) => `${symbol.toLowerCase()}@bookTicker`).join("/");
-    const base = stream.marketType === "spot"
-      ? "wss://stream.binance.com:9443/stream?streams="
-      : "wss://fstream.binance.com/stream?streams=";
-    const nextKey = `${stream.marketType}:${names}`;
-    if (!force && socketKey === nextKey && socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState)) {
+    const quoteNames = [
+      ...stream.protectionSymbols.map((symbol) => `${symbol.toLowerCase()}@bookTicker`),
+      ...stream.orderFlowSymbols.map((symbol) => `${symbol.toLowerCase()}@depth5@100ms`)
+    ].join("/");
+    const tradeNames = stream.orderFlowSymbols
+      .map((symbol) => `${symbol.toLowerCase()}@aggTrade`)
+      .join("/");
+    const spotBase = "wss://stream.binance.com:9443/stream?streams=";
+    const quoteBase = stream.marketType === "spot"
+      ? spotBase
+      : "wss://fstream.binance.com/public/stream?streams=";
+    const tradeBase = stream.marketType === "spot"
+      ? spotBase
+      : "wss://fstream.binance.com/market/stream?streams=";
+    const nextKey = `${stream.marketType}:${quoteNames}:${tradeNames}`;
+    if (
+      !force &&
+      streamKey === nextKey &&
+      socketReady(quoteSocket) &&
+      (!tradeNames || socketReady(tradeSocket))
+    ) {
       return;
     }
-    closeSocket();
-    socketKey = nextKey;
-    socket = new WebSocket(`${base}${names}`, { handshakeTimeout: 8_000 });
-    socket.on("open", () => {
-      serviceState.priceConnected = true;
+    if (socketMarketType && socketMarketType !== stream.marketType) marketMicrostructure.clear();
+    closeSockets();
+    socketMarketType = stream.marketType;
+    streamKey = nextKey;
+    activeStream = stream;
+
+    const currentQuoteSocket = new WebSocket(`${quoteBase}${quoteNames}`, { handshakeTimeout: 8_000 });
+    quoteSocket = currentQuoteSocket;
+    currentQuoteSocket.on("open", () => {
+      updateConnections();
       serviceState.lastPriceError = null;
       persistStatus();
     });
-    socket.on("message", (raw) => {
+    currentQuoteSocket.on("message", (raw) => {
       try {
         const payload = JSON.parse(String(raw));
         const data = payload?.data || payload;
+        const streamName = String(payload?.stream || "");
         const symbol = String(data?.s || "").toUpperCase();
+        const eventType = String(data?.e || "");
+        if (eventType === "depthUpdate" || streamName.includes("@depth")) {
+          if (marketMicrostructure.updateBook({
+            symbol,
+            bids: data?.b || data?.bids,
+            asks: data?.a || data?.asks,
+            time: data?.E
+          })) {
+            serviceState.lastOrderFlowEventAt = new Date().toISOString();
+          }
+          return;
+        }
         const bid = safeNumber(data?.b);
         const ask = safeNumber(data?.a);
+        marketMicrostructure.updateTopQuote({
+          symbol,
+          bid,
+          bidQuantity: data?.B,
+          ask,
+          askQuantity: data?.A,
+          time: data?.E
+        });
         const price = bid > 0 && ask > 0 ? (bid + ask) / 2 : safeNumber(data?.c || data?.p);
-        if (!symbol || !(price > 0)) return;
+        if (!symbol || !(price > 0) || !stream.protectionSymbols.includes(symbol)) return;
         pendingPrices.set(symbol, price);
         serviceState.lastPriceEventAt = new Date().toISOString();
         if (!protectionTimer) protectionTimer = setTimeout(flushProtection, PRICE_EVENT_COALESCE_MS);
@@ -4728,24 +4847,57 @@ async function runService() {
         // Ignore malformed public-stream frames; the next valid quote replaces them.
       }
     });
-    socket.on("error", (error) => {
+    currentQuoteSocket.on("error", (error) => {
       serviceState.lastPriceError = error instanceof Error ? error.message : String(error);
     });
-    socket.on("close", () => {
-      serviceState.priceConnected = false;
-      socket = null;
-      if (!stopping && !reconnectTimer) {
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          ensurePriceStream(true);
-        }, 1_000);
+    currentQuoteSocket.on("close", () => {
+      if (quoteSocket === currentQuoteSocket) quoteSocket = null;
+      updateConnections();
+      scheduleReconnect();
+    });
+
+    if (!tradeNames) {
+      updateConnections();
+      return;
+    }
+    const currentTradeSocket = new WebSocket(`${tradeBase}${tradeNames}`, { handshakeTimeout: 8_000 });
+    tradeSocket = currentTradeSocket;
+    currentTradeSocket.on("open", () => {
+      updateConnections();
+      serviceState.lastOrderFlowError = null;
+      persistStatus();
+    });
+    currentTradeSocket.on("message", (raw) => {
+      try {
+        const payload = JSON.parse(String(raw));
+        const data = payload?.data || payload;
+        const symbol = String(data?.s || "").toUpperCase();
+        if (marketMicrostructure.updateTrade({
+          symbol,
+          price: data?.p,
+          quantity: data?.q,
+          buyerIsMaker: data?.m === true,
+          time: data?.T || data?.E
+        })) {
+          serviceState.lastOrderFlowEventAt = new Date().toISOString();
+        }
+      } catch {
+        // Ignore malformed market-stream frames; the next valid trade replaces them.
       }
+    });
+    currentTradeSocket.on("error", (error) => {
+      serviceState.lastOrderFlowError = error instanceof Error ? error.message : String(error);
+    });
+    currentTradeSocket.on("close", () => {
+      if (tradeSocket === currentTradeSocket) tradeSocket = null;
+      updateConnections();
+      scheduleReconnect();
     });
   };
 
   const stop = () => {
     stopping = true;
-    closeSocket();
+    closeSockets();
     if (protectionTimer) clearTimeout(protectionTimer);
   };
   process.once("SIGINT", stop);
@@ -4782,7 +4934,7 @@ async function runService() {
     }
   } finally {
     clearInterval(heartbeat);
-    closeSocket();
+    closeSockets();
     serviceState.stoppedAt = new Date().toISOString();
     serviceState.priceConnected = false;
     try {
@@ -5106,6 +5258,58 @@ function runAdvancedModelsSelfTest() {
     throw new Error("Bayesian self-test failed");
   }
 
+  const candles = Array.from({ length: 120 }, (_, index) => ({
+    time: index * 900_000,
+    open: 100 + index * 0.05,
+    high: 100.2 + index * 0.05,
+    low: 99.8 + index * 0.05,
+    close: 100.1 + index * 0.05,
+    volume: index === 118 ? 300 : 100
+  }));
+  const orderFlowSnapshot = {
+    available: true,
+    signal: 0.8,
+    flow5s: { imbalance: 0.6 },
+    flow30s: { imbalance: 0.4 },
+    cumulativeVolumeDelta30s: 20_000,
+    volumeRateRatio: 1.5,
+    orderBookImbalance: 0.3,
+    spreadBps: 0.8,
+    bidDepthQuote: 500_000,
+    askDepthQuote: 350_000,
+    microPriceBiasBps: 0.4
+  };
+  const microstructureMarket = analyzeMarket(
+    "BTCUSDT",
+    candles,
+    candles,
+    0,
+    1_000,
+    null,
+    orderFlowSnapshot,
+    DEFAULT_DIRECTION_MODEL_WEIGHTS
+  );
+  const fallbackMarket = analyzeMarket(
+    "BTCUSDT",
+    candles,
+    candles,
+    0,
+    1_000,
+    null,
+    { available: false, signal: 1 },
+    DEFAULT_DIRECTION_MODEL_WEIGHTS
+  );
+  const fallbackWeightTotal = Object.keys(DEFAULT_DIRECTION_MODEL_WEIGHTS).reduce(
+    (sum, key) => sum + safeNumber(fallbackMarket.mathBreakdown.decisionWeights[key]),
+    0
+  );
+  if (!(microstructureMarket.volumeExpansion > 2.5) || !(microstructureMarket.orderFlowSignal > 0)) {
+    throw new Error("Volume/order-flow model self-test failed");
+  }
+  if (fallbackMarket.mathBreakdown.decisionWeights.orderFlow !== 0 || Math.abs(fallbackWeightTotal - 1) > 1e-9) {
+    throw new Error("Stale order-flow fallback self-test failed");
+  }
+
   const config = normalizeAccountConfig({
     initialCapital: 1000,
     marketType: "futures",
@@ -5173,6 +5377,11 @@ function runAdvancedModelsSelfTest() {
       bayesian: {
         priorWinRate: bayesian.priorWinRate,
         posteriorWinRate: bayesian.posteriorWinRate
+      },
+      microstructure: {
+        volumeExpansion: microstructureMarket.volumeExpansion,
+        orderFlowSignal: microstructureMarket.orderFlowSignal,
+        staleOrderFlowWeight: fallbackMarket.mathBreakdown.decisionWeights.orderFlow
       },
       markowitz: markowitz.portfolio
     })

@@ -17,7 +17,11 @@ const state = {
   messageAggregatorSubmitting: false,
   accountFormDirty: false,
   postTradeReviewSubmitting: false,
-  rawLogVisible: false
+  rawLogVisible: false,
+  logCursor: null,
+  loadInFlight: false,
+  logLoadInFlight: false,
+  closeAllPositionsSubmitting: false
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -269,6 +273,8 @@ async function postJson(url, body = {}) {
 }
 
 async function loadData() {
+  if (state.loadInFlight) return;
+  state.loadInFlight = true;
   const view = location.pathname === "/messages.html"
     ? "messages"
     : location.pathname === "/models.html"
@@ -278,18 +284,55 @@ async function loadData() {
         : location.pathname === "/logs.html"
           ? "logs"
           : "overview";
-  const data = await getJson(`/api/page-data?view=${view}`);
-  state.report = data.report || {};
-  state.status = data.status || {};
-  state.log = data.log?.text || "";
-  state.account = data.account || {};
-  state.messageAggregator = data.messageAggregator || {};
-  render();
-  if ($("#messages")) {
-    loadMessageTranslations(state.report).catch(() => {
-      // Translation failure must not interrupt monitoring or report rendering.
-    });
+  try {
+    const data = await getJson(`/api/page-data?view=${view}`);
+    state.report = data.report || {};
+    state.status = data.status || {};
+    if (data.log) mergeLogChunk(data.log);
+    state.account = data.account || {};
+    state.messageAggregator = data.messageAggregator || {};
+    render();
+    if ($("#messages")) {
+      loadMessageTranslations(state.report).catch(() => {
+        // Translation failure must not interrupt monitoring or report rendering.
+      });
+    }
+  } finally {
+    state.loadInFlight = false;
   }
+}
+
+function mergeLogChunk(log) {
+  const incoming = String(log?.text || "");
+  const cursor = Number(log?.cursor);
+  if (state.logCursor === null || log?.reset === true) {
+    state.log = incoming;
+  } else if (incoming) {
+    state.log = `${state.log}${incoming}`.slice(-80_000);
+  }
+  state.logCursor = Number.isFinite(cursor) && cursor >= 0 ? cursor : null;
+}
+
+async function refreshLog() {
+  if (state.loadInFlight || state.logLoadInFlight || document.hidden) return;
+  state.logLoadInFlight = true;
+  try {
+    const cursor = Number.isFinite(state.logCursor) ? `&cursor=${state.logCursor}` : "";
+    mergeLogChunk(await getJson(`/api/log?bytes=80000${cursor}`));
+    renderLog();
+  } finally {
+    state.logLoadInFlight = false;
+  }
+}
+
+async function refreshLogStatus() {
+  if (document.hidden) return;
+  const status = await getJson("/api/status");
+  state.status = status;
+  if (status.loopLastReportAt) {
+    state.report = { ...(state.report || {}), generatedAt: status.loopLastReportAt };
+  }
+  renderSummary();
 }
 
 async function loadMessageTranslations(report) {
@@ -339,6 +382,13 @@ function renderSummary() {
   setText("#subtitle", `${report.mode || "paper-alert-only"} | ${fmtTimestamp(report.generatedAt)}`);
   setText("#pageDataTime", fmtTimestamp(report.generatedAt));
   setText("#layerValue", "事件驱动 + 自适应轮询");
+  const session = report.marketSession || {};
+  const sessionPolicy = session.policy || {};
+  const sessionLabel = sessionPolicy.label || "时段未知";
+  setText(
+    "#sessionValue",
+    `${sessionLabel}${session.overlap ? " · 交会" : ""}${sessionPolicy.strategy ? ` · ${sessionPolicy.strategy}` : ""}`
+  );
   setText("#actionableValue", uiCounts.actionable ?? actionable.length);
   setText("#watchValue", uiCounts.watch ?? watchlist.length);
   setText("#messageValue", Number.isFinite(messageTotal) ? messageTotal : messages.length);
@@ -350,15 +400,17 @@ function renderSummary() {
   );
   setText("#modelValue", uiCounts.models ?? models.length);
   const loopStatus = state.status?.loopRunning
-    ? `${state.status?.priceConnected ? "行情流已连接" : "决策服务已运行"} · ${text.running}`
+    ? `${state.status?.orderFlowConnected ? "订单流已连接" : state.status?.priceConnected ? "行情流已连接" : "决策服务已运行"} · ${text.running}`
     : `事件驱动服务 ${text.stopped}`;
   setText("#loopValue", loopStatus);
   const healthStatus = $("#healthStatus");
   if (healthStatus) {
     healthStatus.classList.toggle("stopped", !state.status?.loopRunning);
     healthStatus.lastChild.textContent = state.status?.loopRunning
-      ? state.status?.priceConnected
-        ? "行情流监控中"
+      ? state.status?.orderFlowConnected
+        ? "订单流监控中"
+        : state.status?.priceConnected
+          ? "行情流监控中"
         : "决策服务运行中"
       : "监控服务未运行";
   }
@@ -512,8 +564,10 @@ const reviewFactorLabels = {
   higherTimeframeTrend: "1小时趋势",
   momentum: "动量",
   rsi: "RSI反转",
+  volume: "成交量确认",
   funding: "资金费率",
   openInterest: "未平仓量",
+  orderFlow: "订单流",
   geometricBrownianMotion: "GBM方向",
   hiddenMarkovModel: "HMM状态",
   volatilityRegime: "波动状态",
@@ -732,6 +786,11 @@ function renderAccountPositions(account, currency) {
   );
   $("#openPositionCount").textContent = positions.length;
   $("#closedPositionCount").textContent = lifetimeClosedPositions;
+  const closeAllButton = $("#closeAllPositionsButton");
+  if (closeAllButton) {
+    closeAllButton.disabled = !positions.length || state.closeAllPositionsSubmitting;
+    closeAllButton.textContent = state.closeAllPositionsSubmitting ? "平仓处理中…" : "一键平仓";
+  }
   document.querySelectorAll("[data-position-view]").forEach((button) => {
     button.classList.toggle("active", button.dataset.positionView === state.positionView);
   });
@@ -866,7 +925,10 @@ function positionChartOption(position) {
         type: "line",
         data: observations,
         showSymbol: false,
-        smooth: 0.18,
+        // Price observations arrive from an event-driven stream with real gaps.
+        // Spline smoothing invents intermediate extrema and makes sparse data
+        // look like a synthetic heartbeat; preserve the observed path instead.
+        smooth: false,
         lineStyle: { width: 2 },
         markLine: {
           silent: true,
@@ -1024,6 +1086,7 @@ function positionRow(position, currency) {
 function closedPositionRow(position, currency) {
   const sideLabel = String(position.side || "").toUpperCase();
   const pnlType = position.realizedPnl > 0 ? "ok" : position.realizedPnl < 0 ? "danger" : "";
+  const closeReason = position.closeReason === "MANUAL_CLOSE_ALL" ? "手动一键平仓" : position.closeReason;
   const resultType = position.closeReason === "TP" ? "ok" : position.closeReason === "SL" ? "danger" : "warn";
   const titles = asArray(position.relatedEvents)
     .slice(0, 2)
@@ -1041,7 +1104,7 @@ function closedPositionRow(position, currency) {
             ${badge(`${fmtNumber(position.leverage, 0)}x`, "leverage")}
             ${badge(`胜率 ${fmtPct(position.winRate, 1)}`, "probability")}
             ${badge(`盈亏比 ${fmtNumber(riskReward, 2)}`, "ratio")}
-            ${badge(position.closeReason || text.closed, resultType)}
+            ${badge(closeReason || text.closed, resultType)}
           </div>
           <div class="row-meta">${escapeHtml(fmtTimestamp(position.openedAt))} \u2192 ${escapeHtml(fmtTimestamp(position.closedAt))}</div>
         </div>
@@ -1050,7 +1113,7 @@ function closedPositionRow(position, currency) {
       <div class="position-quick-grid">
         ${calcCell(text.entry, fmtPrice(position.entry))}
         ${calcCell(text.exitPrice, fmtPrice(position.exitPrice))}
-        ${calcCell(text.closeReason, position.closeReason || "-")}
+        ${calcCell(text.closeReason, closeReason || "-")}
         ${calcCell(text.winRate, fmtPct(position.winRate, 1))}
         ${calcCell("EV", fmtPct(position.expectancyPct, 2))}
         ${calcCell(text.impact, fmtNumber(position.eventImpactScore, 0))}
@@ -1875,6 +1938,7 @@ function localizeHmmRegime(regime) {
 function renderLog() {
   const target = $("#logView");
   if (!target) return;
+  const followTail = target.scrollTop + target.clientHeight >= target.scrollHeight - 24;
   const lines = String(state.log || "").split("\n");
   const mojibakePattern = /(鍛婅|锛氫|妯℃嫙|浜嬩欢淇|鐩戞帶|寮曟搸|鏃犺瘉鎹)/;
   const corruptedLines = lines.filter((line) => mojibakePattern.test(line)).length;
@@ -1883,6 +1947,7 @@ function renderLog() {
     .join("\n")
     .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z/g, (value) => fmtTimestamp(value));
   target.textContent = state.rawLogVisible ? state.log || text.noLog : cleanLog || text.noLog;
+  if (followTail) target.scrollTop = target.scrollHeight;
   setText(
     "#logNotice",
     corruptedLines
@@ -2040,6 +2105,30 @@ function bindEvents() {
       showError(error);
     }
   });
+  $("#closeAllPositionsButton")?.addEventListener("click", async () => {
+    const openCount = Object.keys(getAccountBundle().account.positions || {}).length;
+    if (!openCount || state.closeAllPositionsSubmitting) return;
+    if (!window.confirm(`确认按当前模拟价格平掉全部 ${openCount} 个纸面仓位？该操作不会暂停后续纸面开仓。`)) return;
+    state.closeAllPositionsSubmitting = true;
+    renderAccount();
+    try {
+      const result = await postJson("/api/account/close-all");
+      state.account = result;
+      state.positionView = "closed";
+      render();
+      const closedCount = Number(result.closeResult?.closedCount || 0);
+      const failedCount = Number(result.closeResult?.failedCount || 0);
+      $("#accountSummary")?.insertAdjacentHTML(
+        "afterbegin",
+        `<div class="notice">已手动平仓 ${closedCount} 个纸面仓位${failedCount ? `，${failedCount} 个失败并保持未平仓` : ""}。</div>`
+      );
+    } catch (error) {
+      showError(error);
+    } finally {
+      state.closeAllPositionsSubmitting = false;
+      renderAccount();
+    }
+  });
   $("#summaryButton")?.addEventListener("click", async () => {
     window.location.href = "/summary.html";
   });
@@ -2086,9 +2175,22 @@ window.addEventListener("resize", () => {
   }
 });
 loadData().catch(showError);
-const refreshIntervalMs = location.pathname === "/messages.html"
-  ? 30_000
-  : ["/", "/index.html"].includes(location.pathname)
-    ? 2_000
-    : 10_000;
-setInterval(() => loadData().catch(showError), refreshIntervalMs);
+const pagePath = location.pathname;
+if (pagePath === "/logs.html") {
+  setInterval(() => refreshLog().catch(showError), 1_000);
+  setInterval(() => refreshLogStatus().catch(showError), 5_000);
+} else {
+  const refreshIntervalMs = pagePath === "/messages.html"
+    ? 15_000
+    : ["/", "/index.html"].includes(pagePath)
+      ? 1_000
+      : 3_000;
+  setInterval(() => {
+    if (!document.hidden) loadData().catch(showError);
+  }, refreshIntervalMs);
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  const refresh = pagePath === "/logs.html" ? refreshLog : loadData;
+  refresh().catch(showError);
+});

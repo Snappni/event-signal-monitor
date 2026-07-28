@@ -10,21 +10,25 @@ export const DIRECTION_FACTOR_KEYS = Object.freeze([
   "higherTimeframeTrend",
   "momentum",
   "rsi",
+  "volume",
   "funding",
   "openInterest",
+  "orderFlow",
   "geometricBrownianMotion",
   "hiddenMarkovModel"
 ]);
 
 export const DEFAULT_DIRECTION_MODEL_WEIGHTS = Object.freeze({
-  trend: 0.24,
-  higherTimeframeTrend: 0.14,
-  momentum: 0.12,
-  rsi: 0.05,
+  trend: 0.21,
+  higherTimeframeTrend: 0.12,
+  momentum: 0.1,
+  rsi: 0.04,
+  volume: 0.04,
   funding: 0.05,
   openInterest: 0.05,
-  geometricBrownianMotion: 0.15,
-  hiddenMarkovModel: 0.2
+  orderFlow: 0.08,
+  geometricBrownianMotion: 0.13,
+  hiddenMarkovModel: 0.18
 });
 
 export const DEFAULT_POST_TRADE_REVIEW_CONFIG = Object.freeze({
@@ -185,8 +189,15 @@ function eligibleTrade(trade) {
 
 function scoreDirection(trade, weights) {
   const signals = trade.factorSnapshot.directionSignals || {};
-  return DIRECTION_FACTOR_KEYS.reduce(
-    (score, key) => score + safeNumber(signals[key]) * safeNumber(weights[key]),
+  const activeKeys = DIRECTION_FACTOR_KEYS.filter((key) =>
+    Object.hasOwn(signals, key) &&
+    Number.isFinite(Number(signals[key])) &&
+    !(key === "orderFlow" && trade.factorSnapshot?.marketInputs?.orderFlowAvailable === false)
+  );
+  const activeWeight = activeKeys.reduce((sum, key) => sum + safeNumber(weights[key]), 0);
+  if (activeWeight <= 0) return 0;
+  return activeKeys.reduce(
+    (score, key) => score + safeNumber(signals[key]) * safeNumber(weights[key]) / activeWeight,
     0
   );
 }
