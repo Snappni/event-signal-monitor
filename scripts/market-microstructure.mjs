@@ -188,6 +188,12 @@ export function createMarketMicrostructure(options = {}) {
       const askDepthQuote = asks.reduce((sum, level) => sum + level.price * level.quantity, 0);
       const depthQuote = bidDepthQuote + askDepthQuote;
       const orderBookImbalance = depthQuote > 0 ? (bidDepthQuote - askDepthQuote) / depthQuote : 0;
+      const topBidDepthQuote = finiteNumber(bestBid?.price) * finiteNumber(bestBid?.quantity);
+      const topAskDepthQuote = finiteNumber(bestAsk?.price) * finiteNumber(bestAsk?.quantity);
+      const topDepthQuote = topBidDepthQuote + topAskDepthQuote;
+      const topBookImbalance = topDepthQuote > 0
+        ? (topBidDepthQuote - topAskDepthQuote) / topDepthQuote
+        : 0;
       const midPrice = bookAvailable ? (bestBid.price + bestAsk.price) / 2 : 0;
       const spreadBps = midPrice > 0 ? ((bestAsk.price - bestBid.price) / midPrice) * 10_000 : 0;
       const topQuantity = finiteNumber(bestBid?.quantity) + finiteNumber(bestAsk?.quantity);
@@ -195,6 +201,26 @@ export function createMarketMicrostructure(options = {}) {
         ? (bestAsk.price * bestBid.quantity + bestBid.price * bestAsk.quantity) / topQuantity
         : midPrice;
       const microPriceBiasBps = midPrice > 0 ? ((microPrice - midPrice) / midPrice) * 10_000 : 0;
+      const depthSlope = (levels, descending) => {
+        if (levels.length < 2 || midPrice <= 0) return 0;
+        const weightedDistance = levels.reduce((sum, level) => {
+          const distanceBps = Math.abs(level.price - midPrice) / midPrice * 10_000;
+          return sum + distanceBps * level.price * level.quantity;
+        }, 0);
+        const quoteDepth = levels.reduce((sum, level) => sum + level.price * level.quantity, 0);
+        if (quoteDepth <= 0) return 0;
+        const averageDistance = weightedDistance / quoteDepth;
+        return (descending ? 1 : -1) * quoteDepth / Math.max(1, averageDistance);
+      };
+      const bidSlope = Math.abs(depthSlope(bids, true));
+      const askSlope = Math.abs(depthSlope(asks, false));
+      const bookSlope = bidSlope + askSlope > 0 ? (bidSlope - askSlope) / (bidSlope + askSlope) : 0;
+      const levelGapBps = (levels) => levels.slice(1).map((level, index) =>
+        midPrice > 0 ? Math.abs(level.price - levels[index].price) / midPrice * 10_000 : 0
+      );
+      const gaps = [...levelGapBps(bids), ...levelGapBps(asks)];
+      const averageGapBps = gaps.length ? gaps.reduce((sum, value) => sum + value, 0) / gaps.length : 0;
+      const liquidityVoid = bookAvailable ? clamp((averageGapBps - spreadBps) / 10, 0, 1) : 0;
       const recentRate = flow5s.totalQuoteVolume / 5;
       const baselineRate = flow30s.totalQuoteVolume / 30;
       const volumeRateRatio = baselineRate > 0 ? clamp(recentRate / baselineRate, 0, 6) : 0;
@@ -231,8 +257,11 @@ export function createMarketMicrostructure(options = {}) {
         tradeConfidence,
         bookFlowConfidence,
         orderBookImbalance,
+        topBookImbalance,
         bidDepthQuote,
         askDepthQuote,
+        bookSlope,
+        liquidityVoid,
         spreadBps,
         midPrice,
         microPrice,
@@ -248,3 +277,4 @@ export function createMarketMicrostructure(options = {}) {
     }
   };
 }
+

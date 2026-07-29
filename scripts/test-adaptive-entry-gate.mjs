@@ -36,6 +36,8 @@ const unstableTransition = evaluateAdaptiveEntryGate({
 });
 
 assert.equal(stableTrend.passesGate, true);
+assert.ok(stableTrend.probabilityLowerBound < stableTrend.winRate);
+assert.ok(stableTrend.lowerBoundExpectancyR >= 0.05);
 assert.equal(unstableTransition.passesGate, false);
 assert.ok(unstableTransition.adaptiveWinRateThreshold > stableTrend.adaptiveWinRateThreshold);
 
@@ -63,6 +65,15 @@ const negativeEv = evaluateAdaptiveEntryGate({
   winRate: 0.9
 });
 assert.equal(negativeEv.passesGate, false);
+
+const fragilePointEstimate = evaluateAdaptiveEntryGate({
+  ...shared,
+  expectancyPct: 0.0002,
+  winRate: 0.45,
+  riskProfile: "aggressive",
+  calibration: { samples: 0 }
+});
+assert.equal(fragilePointEstimate.passesGate, false, "positive point EV alone must not pass the conservative EV gate");
 
 const tradeCalibration = buildTradeCalibration([
   ...Array.from({ length: 12 }, (_, index) => ({
@@ -110,3 +121,4 @@ assert.equal(
 );
 
 console.log("adaptive entry gate tests passed");
+

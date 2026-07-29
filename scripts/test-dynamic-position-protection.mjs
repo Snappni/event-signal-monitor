@@ -58,6 +58,12 @@ for (const side of ["long", "short"]) {
   assert.ok(item.dynamicProtection.profitProtection > 0);
 }
 
+const lockedProfit = position("long");
+lockedProfit.dynamicProtection = initializeDynamicProtection(lockedProfit);
+const lockedEvaluation = evaluateDynamicPositionProtection({ position: lockedProfit, currentPrice: 116 });
+assert.ok(lockedEvaluation.nextStopR >= 0.35, "1.5R 以上必须至少锁定 0.35R");
+assert.equal(lockedEvaluation.stage, "profit_lock");
+
 const trendLong = { ...position("long"), regime: "hmm_bull_trend" };
 trendLong.dynamicProtection = initializeDynamicProtection(trendLong);
 const partial = evaluateDynamicPositionProtection({
@@ -107,3 +113,4 @@ const tickAligned = evaluateDynamicPositionProtection({ position: migrated, curr
 assert.ok(Math.abs(tickAligned.nextStopLoss * 10 - Math.round(tickAligned.nextStopLoss * 10)) < 1e-9);
 
 console.log(JSON.stringify({ passed: true, symmetricRatchet: true, singlePartialTakeProfit: true, tickAligned: true }));
+
