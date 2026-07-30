@@ -284,4 +284,3 @@ $("#historyDeleteSelected").addEventListener("click", async () => {
 });
 loadReview();
 setInterval(loadReview, 15_000);
-

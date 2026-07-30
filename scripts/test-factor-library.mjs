@@ -165,4 +165,3 @@ console.log(JSON.stringify({
   minedFactors: status.minedFactors.length,
   recordedIcSamples: status.metrics.return_1m[15].samples
 }));
-

@@ -341,7 +341,448 @@ export function createFactorLibraryStatus() {
   return {
     version: FACTOR_LIBRARY_VERSION,
     generatedAt: null,
-  …6288 tokens truncated… [Date.parse(frame.capturedAt), frame]));
+    lastFrameAt: null,
+    lastAdjustmentAt: null,
+    weightVersion: 1,
+    effectiveWeights: {},
+    pendingFrames: [],
+    metrics: {},
+    latestBySymbol: {},
+    latestFactorAvailability: {},
+    minedFactors: [],
+    mining: { enabled: false, lastRunAt: null, runCount: 0, rejectedCount: 0, validatedCount: 0, currentActivity: "idle" },
+    dataSources: {},
+    historicalBackfill: {
+      version: HISTORICAL_BACKFILL_VERSION,
+      samplingMode: null,
+      status: "not_started",
+      source: "OKX public historical candles",
+      intervalMinutes: 15,
+      lookbackMonths: 3,
+      symbols: 0,
+      frames: 0,
+      resolvedSamples: 0,
+      lastAttemptAt: null,
+      completedAt: null,
+      startAt: null,
+      endAt: null,
+      error: null
+    }
+  };
+}
+
+export function normalizeFactorLibraryStatus(value = {}) {
+  const base = createFactorLibraryStatus();
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    ...base,
+    ...raw,
+    version: FACTOR_LIBRARY_VERSION,
+    weightVersion: Math.max(1, Math.round(safeNumber(raw.weightVersion, 1))),
+    effectiveWeights: raw.effectiveWeights && typeof raw.effectiveWeights === "object" ? raw.effectiveWeights : {},
+    pendingFrames: Array.isArray(raw.pendingFrames) ? raw.pendingFrames.slice(-MAX_PENDING_FRAMES) : [],
+    metrics: raw.metrics && typeof raw.metrics === "object" ? raw.metrics : {},
+    latestBySymbol: raw.latestBySymbol && typeof raw.latestBySymbol === "object" ? raw.latestBySymbol : {},
+    latestFactorAvailability: raw.latestFactorAvailability && typeof raw.latestFactorAvailability === "object" ? raw.latestFactorAvailability : {},
+    minedFactors: Array.isArray(raw.minedFactors) ? raw.minedFactors.slice(-20) : [],
+    mining: { ...base.mining, ...(raw.mining || {}) },
+    dataSources: raw.dataSources && typeof raw.dataSources === "object" ? raw.dataSources : {},
+    historicalBackfill: { ...base.historicalBackfill, ...(raw.historicalBackfill || {}) }
+  };
+}
+
+function normalizeSignal(value, scale) {
+  return value == null ? null : clamp(value / Math.max(scale, 1e-12), -1, 1);
+}
+
+function priceVolumeCorrelation(candles) {
+  const sample = candles.slice(-30);
+  const priceReturns = returns(sample.map((item) => item.close));
+  const volumeChanges = returns(sample.map((item) => Math.max(item.quoteVolume || item.volume, 1e-9)));
+  return correlation(priceReturns, volumeChanges);
+}
+
+function factorValueMap(context) {
+  const market = context.market || {};
+  const micro = market.microstructure || {};
+  const candles1m = Array.isArray(context.candles1m) ? context.candles1m : [];
+  const candles15m = Array.isArray(context.candles15m) ? context.candles15m : [];
+  const candles1h = Array.isArray(context.candles1h) ? context.candles1h : [];
+  const derivatives = context.derivatives || {};
+  const barMinutes = Math.max(1, safeNumber(context.barMinutes, 1));
+  const barsForMinutes = (minutes) => Math.max(1, Math.round(minutes / barMinutes));
+  const closes1m = candles1m.map((item) => safeNumber(item.close)).filter((value) => value > 0);
+  const closes15m = candles15m.map((item) => safeNumber(item.close)).filter((value) => value > 0);
+  const closes1h = candles1h.map((item) => safeNumber(item.close)).filter((value) => value > 0);
+  const latest = safeNumber(market.latest, closes1m.at(-1) || closes15m.at(-1));
+  const returns1m = returns(closes1m);
+  const returns15m = returns(closes15m);
+  const recentVolume = candles1m.slice(-30).map((item) => safeNumber(item.quoteVolume || item.volume)).filter((value) => value > 0);
+  const currentVolume = recentVolume.at(-1);
+  const priceScale = Math.max(latest * Math.max(safeNumber(market.atrPct, 0.004), 0.002), 1e-9);
+  const ema5 = ema(closes1m.slice(-60), 5);
+  const ema20 = ema(closes1m.slice(-90), 20);
+  const previousEma20 = ema(closes1m.slice(-91, -1), 20);
+  const macd = macdHistogram(closes1m);
+  const currentRsi = rsi(closes1m);
+  const channel = candles1m.slice(-21, -1);
+  const channelHigh = channel.length ? Math.max(...channel.map((item) => item.high)) : null;
+  const channelLow = channel.length ? Math.min(...channel.map((item) => item.low)) : null;
+  const ranges = candles1m.slice(-30).map((item) => item.close > 0 ? (item.high - item.low) / item.close : 0).filter((value) => value > 0);
+  const currentRange = ranges.at(-1);
+  const realized = std(returns1m.slice(-30));
+  const baselineVols = [];
+  for (let end = 30; end <= returns1m.length; end += 10) baselineVols.push(std(returns1m.slice(Math.max(0, end - 30), end)));
+  const downside = returns1m.slice(-30).filter((value) => value < 0);
+  const jumpThreshold = Math.max(3 * std(returns1m.slice(-60)), 1e-9);
+  const jumpValues = returns1m.slice(-30).filter((value) => Math.abs(value) >= jumpThreshold);
+  let obv = 0;
+  const obvSeries = [];
+  for (let index = 1; index < candles1m.length; index += 1) {
+    obv += Math.sign(candles1m[index].close - candles1m[index - 1].close) * safeNumber(candles1m[index].volume);
+    obvSeries.push(obv);
+  }
+  const obvDelta = obvSeries.length > 20 ? obvSeries.at(-1) - obvSeries.at(-20) : null;
+  const obvScale = candles1m.slice(-20).reduce((sum, item) => sum + Math.abs(safeNumber(item.volume)), 0);
+  const vwapNumerator = candles1m.slice(-30).reduce((sum, item) => sum + safeNumber(item.quoteVolume), 0);
+  const vwapDenominator = candles1m.slice(-30).reduce((sum, item) => sum + safeNumber(item.volume), 0);
+  const vwap = vwapDenominator > 0 ? vwapNumerator / vwapDenominator : null;
+  const takerBuy = candles1m.slice(-10).reduce((sum, item) => sum + safeNumber(item.takerBuyQuoteVolume), 0);
+  const totalQuote = candles1m.slice(-10).reduce((sum, item) => sum + safeNumber(item.quoteVolume), 0);
+  const flow30 = micro.flow30s || {};
+  const bookFlow30 = micro.bookFlow30s || {};
+  const bookAdd = safeNumber(bookFlow30.bidAddedQuote) + safeNumber(bookFlow30.askAddedQuote);
+  const bookCancel = safeNumber(bookFlow30.bidCancelledQuote) + safeNumber(bookFlow30.askCancelledQuote);
+  const ret15 = finiteOrNull(roc(closes1m, barsForMinutes(15)) ?? roc(closes15m, 1));
+  const ret1h = finiteOrNull(roc(closes1m, barsForMinutes(60)) ?? roc(closes1h, 1));
+  const fundingZ = finiteOrNull(derivatives.fundingZScore);
+  const basis = finiteOrNull(derivatives.perpetualBasis);
+  const returnForImpact = safeNumber(roc(closes1m, 1));
+  const quoteForImpact = safeNumber(flow30.totalQuoteVolume);
+  const last15mQuote = safeNumber(candles15m.at(-2)?.quoteVolume, candles15m.at(-2)?.volume);
+  const eventDirection = safeNumber(context.eventAggregate?.direction);
+  const eventScore = clamp(safeNumber(context.eventAggregate?.score) / 100, 0, 1);
+  const eventCount = safeNumber(context.eventAggregate?.eventCount, context.eventAggregate?.events?.length || 0);
+  const sourceCount = new Set((context.eventAggregate?.events || []).map((item) => item.source).filter(Boolean)).size;
+  const sessionKey = String(context.sessionContext?.policyKey || "off_hours");
+  const sessionSignal = sessionKey.includes("overlap") ? 0.2 : sessionKey === "europe" ? 0.15 : sessionKey === "us" ? 0.1 : sessionKey === "asia" ? 0 : -0.2;
+
+  return {
+    return_1m: barMinutes === 1 ? normalizeSignal(roc(closes1m, 1), 0.003) : null,
+    return_5m: barMinutes <= 5 ? normalizeSignal(roc(closes1m, barsForMinutes(5)), 0.008) : null,
+    return_15m: normalizeSignal(ret15, 0.015),
+    return_1h: normalizeSignal(ret1h, 0.03),
+    ema_spread_5_20: latest > 0 && ema20 > 0 ? clamp((ema5 - ema20) / priceScale, -1, 1) : null,
+    ema_slope_20: latest > 0 && previousEma20 > 0 ? clamp((ema20 - previousEma20) / Math.max(priceScale * 0.25, 1e-9), -1, 1) : null,
+    macd_histogram: macd == null ? null : clamp(macd / priceScale, -1, 1),
+    adx_strength: adx(candles1m),
+    donchian_breakout: channelHigh != null && channelLow != null && channelHigh > channelLow
+      ? clamp(((latest - channelLow) / (channelHigh - channelLow) - 0.5) * 2, -1, 1)
+      : null,
+    rsi_reversal: currentRsi == null ? null : clamp((50 - currentRsi) / 25, -1, 1),
+    realized_volatility: realized > 0 ? clamp(realized / 0.02, 0, 1) : null,
+    volatility_zscore: baselineVols.length ? clamp(safeNumber(zscore(realized, baselineVols)) / 3, -1, 1) : null,
+    range_expansion: currentRange && ranges.length > 5 ? clamp(currentRange / Math.max(mean(ranges.slice(-21, -1)), 1e-9) - 1, -1, 1) : null,
+    range_compression: currentRange && ranges.length > 5 ? clamp(1 - currentRange / Math.max(mean(ranges.slice(-21, -1)), 1e-9), -1, 1) : null,
+    parkinson_volatility: parkinsonVolatility(candles1m),
+    garman_klass_volatility: garmanKlassVolatility(candles1m),
+    downside_semivolatility: downside.length ? clamp(std(downside) / 0.02, 0, 1) : 0,
+    jump_intensity: returns1m.length >= 30 ? clamp(jumpValues.length / 5, 0, 1) : null,
+    volume_zscore: currentVolume != null && recentVolume.length > 10 ? clamp(safeNumber(zscore(currentVolume, recentVolume.slice(0, -1))) / 3, -1, 1) : null,
+    volume_roc: recentVolume.length > 6 ? normalizeSignal(roc(recentVolume, 5), 1) : null,
+    obv_slope: obvDelta == null || obvScale <= 0 ? null : clamp(obvDelta / obvScale, -1, 1),
+    vwap_deviation: vwap && latest > 0 ? clamp((latest / vwap - 1) / 0.01, -1, 1) : null,
+    cumulative_volume_delta: quoteForImpact > 0 ? clamp(safeNumber(micro.cumulativeVolumeDelta30s) / quoteForImpact, -1, 1) : null,
+    aggressor_imbalance: micro.tradeAvailable ? clamp(safeNumber(flow30.imbalance), -1, 1) : finiteOrNull(derivatives.takerImbalance),
+    trade_intensity: micro.tradeAvailable ? clamp(safeNumber(flow30.tradeCount) / 50, 0, 1) : null,
+    average_trade_size: safeNumber(flow30.tradeCount) > 0 ? clamp(quoteForImpact / flow30.tradeCount / 50_000, 0, 1) : null,
+    buy_sell_volume_divergence: totalQuote > 0 ? clamp((2 * takerBuy - totalQuote) / totalQuote, -1, 1) : null,
+    price_volume_correlation: priceVolumeCorrelation(candles1m),
+    spread_bps: micro.bookAvailable ? clamp(safeNumber(micro.spreadBps) / 10, 0, 1) : null,
+    microprice_bias: micro.bookAvailable ? clamp(safeNumber(micro.microPriceBiasBps) / 3, -1, 1) : null,
+    depth_imbalance_l1: micro.bookAvailable ? finiteOrNull(micro.topBookImbalance) : null,
+    depth_imbalance_l5: micro.bookAvailable ? finiteOrNull(micro.orderBookImbalance) : null,
+    depth_imbalance_l20: finiteOrNull(derivatives.depthImbalanceL20),
+    order_flow_imbalance: micro.available ? clamp(safeNumber(micro.signal), -1, 1) : null,
+    cancellation_imbalance: micro.bookAvailable ? finiteOrNull(bookFlow30.imbalance) : null,
+    replenishment_rate: bookAdd + bookCancel > 0 ? clamp((bookAdd - bookCancel) / (bookAdd + bookCancel), -1, 1) : null,
+    book_slope: micro.bookAvailable ? finiteOrNull(micro.bookSlope) : null,
+    liquidity_void: micro.bookAvailable ? finiteOrNull(micro.liquidityVoid) : null,
+    kyle_lambda_proxy: quoteForImpact > 0 ? clamp(Math.abs(returnForImpact) / quoteForImpact * 1e9, 0, 1) : null,
+    amihud_illiquidity: last15mQuote > 0 && ret15 != null ? clamp(Math.abs(ret15) / last15mQuote * 1e9, 0, 1) : null,
+    funding_zscore: fundingZ == null ? null : clamp(fundingZ / 3, -1, 1),
+    funding_price_divergence: fundingZ == null || ret1h == null ? null : clamp(-Math.sign(fundingZ) * Math.abs(ret1h / 0.03) * Math.min(1, Math.abs(fundingZ) / 2), -1, 1),
+    open_interest_change: finiteOrNull(market.oiChange),
+    oi_price_confirmation: ret15 == null ? null : clamp(Math.sign(safeNumber(market.oiChange)) * ret15 / 0.015, -1, 1),
+    perpetual_basis: basis == null ? null : clamp(basis / 0.003, -1, 1),
+    liquidation_imbalance: finiteOrNull(derivatives.liquidationImbalance),
+    long_short_ratio: finiteOrNull(derivatives.longShortContrarian),
+    basis_volatility: finiteOrNull(derivatives.basisVolatility),
+    btc_beta_residual: finiteOrNull(context.crossAsset?.btcBetaResidual),
+    eth_btc_relative_strength: finiteOrNull(context.crossAsset?.ethBtcRelativeStrength),
+    cross_section_momentum_rank: finiteOrNull(context.crossAsset?.momentumRank),
+    correlation_regime: finiteOrNull(context.crossAsset?.btcCorrelation),
+    hmm_regime_signal: finiteOrNull(market.hiddenMarkov?.signal),
+    market_session: sessionSignal,
+    news_impact_decay: eventScore > 0 ? clamp(eventDirection * eventScore, -1, 1) : 0,
+    event_source_consensus: sourceCount > 0 ? clamp(eventDirection * Math.min(1, sourceCount / 3) * Math.min(1, eventCount / 3), -1, 1) : 0
+  };
+}
+
+function crossAssetContext(items) {
+  const bySymbol = new Map(items.map((item) => [item.market.symbol, item]));
+  const btc = bySymbol.get("BTCUSDT")?.market;
+  const eth = bySymbol.get("ETHUSDT")?.market;
+  const momentum = items.map((item) => ({ symbol: item.market.symbol, value: safeNumber(roc(item.factorContext?.candles15m?.map((candle) => candle.close) || [], 1)) }));
+  const ranked = rank(momentum.map((item) => item.value));
+  return Object.fromEntries(items.map((item) => {
+    const marketReturns = item.market.returns15m || [];
+    const btcReturns = btc?.returns15m || [];
+    const betaDenominator = correlation(btcReturns, btcReturns);
+    const beta = betaDenominator ? safeNumber(correlation(marketReturns, btcReturns)) * std(marketReturns) / Math.max(std(btcReturns), 1e-9) : 0;
+    const ownReturn = safeNumber(momentum.find((entry) => entry.symbol === item.market.symbol)?.value);
+    const btcReturn = safeNumber(momentum.find((entry) => entry.symbol === "BTCUSDT")?.value);
+    const ethReturn = safeNumber(momentum.find((entry) => entry.symbol === "ETHUSDT")?.value);
+    const rankIndex = momentum.findIndex((entry) => entry.symbol === item.market.symbol);
+    return [item.market.symbol, {
+      btcBetaResidual: clamp((ownReturn - beta * btcReturn) / 0.02, -1, 1),
+      ethBtcRelativeStrength: clamp((ownReturn - mean([btcReturn, ethReturn])) / 0.02, -1, 1),
+      momentumRank: ranked.length > 1 ? (ranked[rankIndex] - 1) / (ranked.length - 1) * 2 - 1 : 0,
+      btcCorrelation: finiteOrNull(correlation(marketReturns, btcReturns))
+    }];
+  }));
+}
+
+function minedValue(definition, values) {
+  const left = finiteOrNull(values[definition.leftId]);
+  const right = finiteOrNull(values[definition.rightId]);
+  if (left == null || right == null) return null;
+  if (definition.operator === "difference") return clamp((left - right) / 2, -1, 1);
+  if (definition.operator === "agreement") return clamp(((left + right) / 2) * (1 - Math.abs(left - right) / 2), -1, 1);
+  return clamp((left + right) / 2, -1, 1);
+}
+
+export function buildFactorSnapshots({ marketResults = [], eventsBySymbol = {}, sessionContext = null, status = null }) {
+  const normalizedStatus = normalizeFactorLibraryStatus(status);
+  const crossAsset = crossAssetContext(marketResults.filter((item) => item?.market));
+  return marketResults.filter((item) => item?.market).map((item) => {
+    const context = {
+      market: item.market,
+      ...(item.factorContext || {}),
+      eventAggregate: eventsBySymbol[item.market.symbol] || {},
+      sessionContext,
+      barMinutes: safeNumber(item.factorContext?.barMinutes, 1),
+      crossAsset: crossAsset[item.market.symbol] || {}
+    };
+    const values = factorValueMap(context);
+    for (const definition of normalizedStatus.minedFactors) values[definition.id] = minedValue(definition, values);
+    return {
+      symbol: item.market.symbol,
+      price: safeNumber(item.market.latest),
+      capturedAt: item.factorContext?.capturedAt || item.capturedAt || new Date().toISOString(),
+      values: Object.fromEntries(Object.entries(values).map(([id, value]) => [id, round(finiteOrNull(value))])),
+      sources: item.factorContext?.derivatives?.sources || {}
+    };
+  });
+}
+
+export function buildHistoricalFactorFrames({ seriesBySymbol = {}, intervalMinutes = 60, status = null, stride = 1 }) {
+  const symbols = Object.keys(seriesBySymbol).filter((symbol) => Array.isArray(seriesBySymbol[symbol]) && seriesBySymbol[symbol].length > 0);
+  if (symbols.length < MIN_CROSS_SECTION_SYMBOLS) return [];
+  const normalizedStatus = normalizeFactorLibraryStatus(status);
+  const firstSeries = seriesBySymbol[symbols[0]];
+  const commonTimes = firstSeries.map((candle) => safeNumber(candle.time)).filter((time) => time > 0);
+  const timeIndexes = Object.fromEntries(symbols.map((symbol) => [
+    symbol,
+    new Map(seriesBySymbol[symbol].map((candle, index) => [safeNumber(candle.time), index]))
+  ]));
+  const frames = [];
+  const warmup = 95;
+  for (let index = warmup; index < commonTimes.length; index += Math.max(1, Math.round(stride))) {
+    const capturedAt = new Date(commonTimes[index]).toISOString();
+    const marketResults = symbols.map((symbol) => {
+      const series = seriesBySymbol[symbol];
+      const candleIndex = timeIndexes[symbol].get(commonTimes[index]) ?? -1;
+      if (candleIndex < warmup) return null;
+      const candles = series.slice(Math.max(0, candleIndex - 119), candleIndex + 1);
+      const latest = candles.at(-1)?.close;
+      const returns15m = candles.slice(1).map((candle, offset) => {
+        const previous = candles[offset]?.close;
+        return previous > 0 ? candle.close / previous - 1 : 0;
+      });
+      return {
+        capturedAt,
+        market: {
+          symbol,
+          latest,
+          atrPct: 0.01,
+          returns15m,
+          hiddenMarkov: { signal: null },
+          microstructure: {}
+        },
+        factorContext: {
+          capturedAt,
+          barMinutes: intervalMinutes,
+          candles1m: candles,
+          candles15m: candles,
+          candles1h: candles,
+          derivatives: { sources: { historicalCandles: { available: true, updatedAt: capturedAt } } }
+        }
+      };
+    }).filter(Boolean);
+    if (marketResults.length < MIN_CROSS_SECTION_SYMBOLS) continue;
+    const snapshots = buildFactorSnapshots({ marketResults, status: normalizedStatus });
+    frames.push({
+      capturedAt,
+      intervalMinutes,
+      source: "historical_public_candles",
+      prices: Object.fromEntries(snapshots.map((snapshot) => [snapshot.symbol, snapshot.price])),
+      values: Object.fromEntries(snapshots.map((snapshot) => [snapshot.symbol, snapshot.values]))
+    });
+  }
+  return frames;
+}
+
+function cappedAllocation(items, cap) {
+  if (!items.length) return {};
+  const effectiveCap = Math.max(cap, 1 / items.length);
+  const scores = Object.fromEntries(items.map((item) => [item.id, Math.max(0, safeNumber(item.score))]));
+  if (Object.values(scores).every((value) => value <= 0)) for (const item of items) scores[item.id] = 1;
+  const result = Object.fromEntries(items.map((item) => [item.id, 0]));
+  let remaining = 1;
+  let active = items.map((item) => item.id);
+  while (active.length && remaining > 1e-12) {
+    const total = active.reduce((sum, id) => sum + scores[id], 0);
+    const proposed = active.map((id) => ({ id, weight: remaining * (total > 0 ? scores[id] / total : 1 / active.length) }));
+    const capped = proposed.filter((item) => item.weight > effectiveCap + 1e-12);
+    if (!capped.length) {
+      for (const item of proposed) result[item.id] += item.weight;
+      break;
+    }
+    for (const item of capped) {
+      result[item.id] = effectiveCap;
+      remaining -= effectiveCap;
+    }
+    const cappedIds = new Set(capped.map((item) => item.id));
+    active = active.filter((id) => !cappedIds.has(id));
+  }
+  return result;
+}
+
+function constrainedWeights(definitions, rawScores, config) {
+  const active = definitions.filter((definition) => safeNumber(rawScores[definition.id]) > 0);
+  if (!active.length) return {};
+  const grouped = new Map();
+  for (const definition of active) {
+    if (!grouped.has(definition.category)) grouped.set(definition.category, []);
+    grouped.get(definition.category).push(definition);
+  }
+  const categoryItems = [...grouped.entries()].map(([id, factors]) => ({
+    id,
+    score: factors.reduce((sum, definition) => sum + safeNumber(rawScores[definition.id]), 0)
+  }));
+  const categoryWeights = cappedAllocation(categoryItems, config.maxCategoryWeight);
+  const result = {};
+  for (const [category, factors] of grouped.entries()) {
+    const within = cappedAllocation(
+      factors.map((definition) => ({ id: definition.id, score: rawScores[definition.id] })),
+      Math.min(1, config.maxFactorWeight / Math.max(categoryWeights[category], 1e-9))
+    );
+    for (const definition of factors) result[definition.id] = categoryWeights[category] * safeNumber(within[definition.id]);
+  }
+  const total = Object.values(result).reduce((sum, value) => sum + value, 0);
+  return total > 0 ? Object.fromEntries(Object.entries(result).map(([id, value]) => [id, value / total])) : {};
+}
+
+function metricSummary(values, coverageValues, sourceValues = []) {
+  const sample = values.filter(Number.isFinite).slice(-MAX_IC_OBSERVATIONS);
+  const retainedSources = sourceValues.slice(-sample.length);
+  const average = mean(sample);
+  const deviation = std(sample);
+  return {
+    samples: sample.length,
+    meanIc: round(average),
+    icStd: round(deviation),
+    icir: round(deviation > 0 ? average / deviation : 0),
+    tStatistic: round(deviation > 0 ? average / (deviation / Math.sqrt(sample.length)) : 0),
+    coverage: round(mean(coverageValues.filter(Number.isFinite).slice(-MAX_IC_OBSERVATIONS))),
+    lastIc: round(sample.at(-1)),
+    historySamples: retainedSources.filter((source) => source === 0).length,
+    realtimeSamples: retainedSources.filter((source) => source === 1).length,
+    values: sample,
+    coverageValues: coverageValues.filter(Number.isFinite).slice(-MAX_IC_OBSERVATIONS),
+    sourceValues: retainedSources
+  };
+}
+
+function appendIc(status, factorId, horizon, ic, coverage, source = "realtime") {
+  status.metrics[factorId] = status.metrics[factorId] || {};
+  const current = status.metrics[factorId][horizon] || { values: [], coverageValues: [], sourceValues: [] };
+  const previousSources = Array.isArray(current.sourceValues) && current.sourceValues.length === (current.values || []).length
+    ? current.sourceValues
+    : (current.values || []).map(() => 1);
+  status.metrics[factorId][horizon] = metricSummary(
+    [...(current.values || []), ic],
+    [...(current.coverageValues || []), coverage],
+    [...previousSources, source === "historical" ? 0 : 1]
+  );
+}
+
+function removeHistoricalMetricObservations(status) {
+  for (const horizons of Object.values(status.metrics || {})) {
+    for (const [horizon, metric] of Object.entries(horizons || {})) {
+      const values = Array.isArray(metric?.values) ? metric.values : [];
+      const coverageValues = Array.isArray(metric?.coverageValues) ? metric.coverageValues : [];
+      const sourceValues = Array.isArray(metric?.sourceValues) && metric.sourceValues.length === values.length
+        ? metric.sourceValues
+        : values.map(() => 1);
+      const retainedIndexes = sourceValues.map((source, index) => source === 1 ? index : -1).filter((index) => index >= 0);
+      horizons[horizon] = metricSummary(
+        retainedIndexes.map((index) => values[index]),
+        retainedIndexes.map((index) => coverageValues[index]),
+        retainedIndexes.map(() => 1)
+      );
+    }
+  }
+}
+
+function resolvePendingFrames(status, snapshots, nowMs, definitions, horizons) {
+  const currentPrices = Object.fromEntries(snapshots.map((item) => [item.symbol, item.price]));
+  for (const frame of status.pendingFrames) {
+    frame.resolvedHorizons = Array.isArray(frame.resolvedHorizons) ? frame.resolvedHorizons : [];
+    const capturedMs = Date.parse(frame.capturedAt || "");
+    if (!Number.isFinite(capturedMs)) continue;
+    for (const horizon of horizons) {
+      if (frame.resolvedHorizons.includes(horizon) || nowMs - capturedMs < horizon * 60_000) continue;
+      const symbols = Object.keys(frame.prices || {}).filter((symbol) => frame.prices[symbol] > 0 && currentPrices[symbol] > 0);
+      const forwardReturns = Object.fromEntries(symbols.map((symbol) => [symbol, currentPrices[symbol] / frame.prices[symbol] - 1]));
+      for (const definition of definitions) {
+        const factorValues = [];
+        const targetReturns = [];
+        for (const symbol of symbols) {
+          const value = finiteOrNull(frame.values?.[symbol]?.[definition.id]);
+          if (value == null) continue;
+          factorValues.push(value * safeNumber(definition.orientation, 1));
+          targetReturns.push(forwardReturns[symbol]);
+        }
+        const ic = spearman(factorValues, targetReturns);
+        if (ic == null) continue;
+        appendIc(status, definition.id, horizon, ic, factorValues.length / Math.max(symbols.length, 1), "realtime");
+      }
+      frame.resolvedHorizons.push(horizon);
+    }
+  }
+  status.pendingFrames = status.pendingFrames
+    .filter((frame) => horizons.some((horizon) => !frame.resolvedHorizons?.includes(horizon)) && nowMs - Date.parse(frame.capturedAt || "") < 2 * Math.max(...horizons) * 60_000)
+    .slice(-MAX_PENDING_FRAMES);
+}
+
+function resolveHistoricalFrames(status, frames, definitions, horizons) {
+  const ordered = frames
+    .filter((frame) => Number.isFinite(Date.parse(frame.capturedAt || "")))
+    .sort((left, right) => Date.parse(left.capturedAt) - Date.parse(right.capturedAt));
+  if (!ordered.length) return 0;
+  const byTime = new Map(ordered.map((frame) => [Date.parse(frame.capturedAt), frame]));
   let resolved = 0;
   for (let index = 0; index < ordered.length; index += 1) {
     const frame = ordered[index];
@@ -742,4 +1183,3 @@ export function publicFactorLibrary(configValue, statusValue) {
     ]
   };
 }
-

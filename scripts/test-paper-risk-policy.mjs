@@ -61,4 +61,3 @@ assert.equal(stopped.allowed, false);
 assert.equal(stopped.scale, 0);
 
 console.log(JSON.stringify({ passed: true, targetDrawdownPct: 0.15, hardStopDrawdownPct: 0.2 }));
-

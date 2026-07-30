@@ -52,4 +52,3 @@ try {
 } finally {
   child.kill();
 }
-

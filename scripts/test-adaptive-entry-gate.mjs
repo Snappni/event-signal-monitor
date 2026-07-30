@@ -121,4 +121,3 @@ assert.equal(
 );
 
 console.log("adaptive entry gate tests passed");
-

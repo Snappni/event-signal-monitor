@@ -561,7 +561,555 @@ function createPaperAccount(config, now = new Date().toISOString()) {
       winRate: 0,
       openPositions: 0,
       realizedPnl: 0,
-     …5582 tokens truncated…lizedPnl;
+      unrealizedPnl: 0,
+      tradingFees: 0,
+      slippageCost: 0,
+      fundingPnl: 0,
+      marginUsed: 0,
+      availableEquity: normalized.initialCapital,
+      formula:
+        "净权益=本金+已实现现金流(含手续费与资金费)+按不利滑点和平仓手续费估算的未实现盈亏；收益率=净权益/本金-1。"
+    }
+  };
+  account.postTradeReview.sessionId = account.sessionId;
+  return account;
+}
+
+function readAccountBundle() {
+  const rawConfig = readJson(ACCOUNT_CONFIG_PATH, DEFAULT_ACCOUNT_CONFIG);
+  const config = normalizeAccountConfig(rawConfig);
+  if (!rawConfig || rawConfig.riskProfile !== config.riskProfile) {
+    writeJson(ACCOUNT_CONFIG_PATH, config);
+  }
+  let account = readJson(ACCOUNT_STATE_PATH, null);
+  if (!account) {
+    account = createPaperAccount(config);
+    writeJson(ACCOUNT_CONFIG_PATH, config);
+    writeJson(ACCOUNT_STATE_PATH, account);
+  } else {
+    if (typeof account.isActive !== "boolean") account.isActive = true;
+    if (!Object.hasOwn(account, "startedAt")) {
+      account.startedAt = account.isActive ? account.createdAt : null;
+    }
+    if (!Object.hasOwn(account, "stoppedAt")) account.stoppedAt = null;
+    account.tradingFees = safeNumber(account.tradingFees);
+    account.slippageCost = safeNumber(account.slippageCost);
+    account.fundingPnl = safeNumber(account.fundingPnl);
+    account.configSnapshot = config;
+    account.positions = account.positions || {};
+    for (const position of Object.values(account.positions)) {
+      position.riskProfile =
+        position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
+    }
+    account.tradeHistory = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+    if (safeNumber(account.tradeHistorySchemaVersion) !== 2) {
+      account.tradeHistory = account.tradeHistory.map((trade) => compactArchivedTrade(trade));
+      account.tradeHistorySchemaVersion = 2;
+    }
+    account.lifetimeClosedTrades = Math.max(
+      account.tradeHistory.length,
+      Math.round(safeNumber(account.lifetimeClosedTrades, account.tradeHistory.length))
+    );
+    const retainedWinningTrades = account.tradeHistory.filter(
+      (trade) => safeNumber(trade.realizedPnl) > 0
+    ).length;
+    account.lifetimeWinningTrades = Math.max(
+      retainedWinningTrades,
+      Math.round(safeNumber(account.lifetimeWinningTrades, retainedWinningTrades))
+    );
+    account.postTradeReviewConfig = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
+    account.postTradeReview = normalizePostTradeReviewState(
+      account.postTradeReview,
+      DEFAULT_DIRECTION_MODEL_WEIGHTS,
+      account.sessionId
+    );
+    for (const position of account.tradeHistory) {
+      position.riskProfile =
+        position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
+    }
+  }
+  return { config, account };
+}
+
+async function readRequestJson(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  if (!chunks.length) return {};
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isProcessRunning(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+async function withAccountLock(callback) {
+  fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+  const startedAt = Date.now();
+  while (true) {
+    let fd;
+    try {
+      fd = fs.openSync(ACCOUNT_LOCK_PATH, "wx");
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }), "utf8");
+      try {
+        return await callback();
+      } finally {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Ignore close failure during cleanup.
+        }
+        try {
+          fs.unlinkSync(ACCOUNT_LOCK_PATH);
+        } catch {
+          // A stale-lock cleanup may already have removed it.
+        }
+      }
+    } catch (error) {
+      if (fd) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Ignore close failure after acquisition error.
+        }
+      }
+      if (error?.code !== "EEXIST") throw error;
+      try {
+        const lock = JSON.parse(fs.readFileSync(ACCOUNT_LOCK_PATH, "utf8"));
+        const ownerPid = Number(lock?.pid);
+        if (Number.isInteger(ownerPid) && ownerPid > 0 && !isProcessRunning(ownerPid)) {
+          fs.unlinkSync(ACCOUNT_LOCK_PATH);
+          continue;
+        }
+      } catch {
+        // Fall through to age-based stale-lock cleanup.
+      }
+      try {
+        const stat = fs.statSync(ACCOUNT_LOCK_PATH);
+        if (Date.now() - stat.mtimeMs > 60_000) {
+          fs.unlinkSync(ACCOUNT_LOCK_PATH);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() - startedAt > 10_000) {
+        throw new Error("账户正在更新，请稍后重试。");
+      }
+      await sleep(100);
+    }
+  }
+}
+
+function reportPath(layer) {
+  return path.join(RUNTIME_DIR, "latest-report.json");
+}
+
+function readLogChunk(filePath, cursor = null, maxBytes = 80_000) {
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, "r");
+    const stat = fs.fstatSync(fd);
+    const parsedCursor = Number(cursor);
+    const hasCursor = cursor !== null && cursor !== "" && Number.isInteger(parsedCursor) && parsedCursor >= 0;
+    let start = hasCursor ? parsedCursor : Math.max(0, stat.size - maxBytes);
+    let reset = !hasCursor;
+    if (start > stat.size || stat.size - start > maxBytes) {
+      start = Math.max(0, stat.size - maxBytes);
+      reset = true;
+    }
+    const length = stat.size - start;
+    let buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, start);
+    buffer = buffer.subarray(0, bytesRead);
+    let text = buffer.toString("utf8");
+    if (reset && start > 0) {
+      const firstLineEnd = text.indexOf("\n");
+      if (firstLineEnd >= 0) text = text.slice(firstLineEnd + 1);
+    }
+    return { text, cursor: stat.size, reset };
+  } catch {
+    return { text: "", cursor: 0, reset: true };
+  } finally {
+    try {
+      if (fd !== null) fs.closeSync(fd);
+    } catch {
+      // A failed close must not break the log viewer.
+    }
+  }
+}
+
+function sendJson(response, value, statusCode = 200) {
+  response.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store"
+  });
+  response.end(JSON.stringify(value));
+}
+
+function loopStatus(latestReportOverride = null) {
+  const fastPidPath = path.join(RUNTIME_DIR, "fast-loop.pid");
+  const serviceStatusPath = path.join(RUNTIME_DIR, "service-status.json");
+  const fastPid = Number(fs.existsSync(fastPidPath) ? fs.readFileSync(fastPidPath, "utf8").trim() : 0);
+  const pidRunning = isProcessRunning(fastPid);
+  const service = readJson(serviceStatusPath, null);
+  const serviceHeartbeatMs = Date.parse(service?.heartbeatAt || "");
+  const serviceAgeMs = Number.isFinite(serviceHeartbeatMs) ? Math.max(0, Date.now() - serviceHeartbeatMs) : null;
+  const serviceFresh = serviceAgeMs !== null && serviceAgeMs <= SERVICE_STALE_SECONDS * 1_000;
+  const latestReport = latestReportOverride || readCachedReport(path.join(RUNTIME_DIR, "latest-report.json"), null);
+  const reportGeneratedAt = latestReport?.generatedAt || null;
+  const reportTimestamp = Date.parse(reportGeneratedAt || "");
+  const reportAgeMs = Number.isFinite(reportTimestamp) ? Math.max(0, Date.now() - reportTimestamp) : null;
+  return {
+    generatedAt: new Date().toISOString(),
+    loopMode: service?.mode || "event-driven-hybrid",
+    loopPid: fastPid || null,
+    servicePid: service?.pid || null,
+    loopRunning: pidRunning || serviceFresh,
+    loopBackend: serviceFresh ? "service-heartbeat" : pidRunning ? "process-pid" : "none",
+    loopIntervalSeconds: null,
+    decisionBackend: service?.decisionBackend || "adaptive-sequential-rest",
+    priceBackend: service?.priceBackend || "binance-bookTicker-websocket",
+    orderFlowBackend: service?.orderFlowBackend || "binance-aggTrade-depth5-websocket",
+    priceConnected: service?.priceConnected === true,
+    orderFlowConnected: service?.orderFlowConnected === true,
+    orderFlowDepthConnected: service?.orderFlowDepthConnected === true,
+    orderFlowTradeConnected: service?.orderFlowTradeConnected === true,
+    subscribedSymbols: Array.isArray(service?.subscribedSymbols) ? service.subscribedSymbols : [],
+    orderFlowSymbols: Array.isArray(service?.orderFlowSymbols) ? service.orderFlowSymbols : [],
+    lastPriceEventAt: service?.lastPriceEventAt || null,
+    lastOrderFlowEventAt: service?.lastOrderFlowEventAt || null,
+    lastProtectionAt: service?.lastProtectionAt || null,
+    nextDecisionAt: service?.nextDecisionAt || null,
+    decisionCycles: safeNumber(service?.decisionCycles),
+    protectionCycles: safeNumber(service?.protectionCycles),
+    protectionActions: safeNumber(service?.protectionActions),
+    consecutiveDecisionFailures: safeNumber(service?.consecutiveDecisionFailures),
+    lastDecisionError: service?.lastDecisionError || null,
+    serviceHeartbeatAgeSeconds: serviceAgeMs === null ? null : Math.round(serviceAgeMs / 1_000),
+    loopLastReportAt: reportGeneratedAt,
+    loopReportAgeSeconds: reportAgeMs === null ? null : Math.round(reportAgeMs / 1000),
+    loopStaleAfterSeconds: SERVICE_STALE_SECONDS,
+    runtimeDir: RUNTIME_DIR
+  };
+}
+
+let supervisorLaunchPending = false;
+
+function ensureMonitorSupervisor() {
+  if (!AUTO_START_MONITOR_SERVICE || supervisorLaunchPending || loopStatus().loopRunning) return;
+  supervisorLaunchPending = true;
+  const supervisor = spawn(process.execPath, [MONITOR_SUPERVISOR_PATH], {
+    cwd: ROOT_DIR,
+    detached: true,
+    env: { ...process.env, SIGNAL_RUNTIME_DIR: RUNTIME_DIR },
+    stdio: "ignore",
+    windowsHide: true
+  });
+  supervisor.unref();
+  const clearPending = () => {
+    supervisorLaunchPending = false;
+  };
+  supervisor.once("error", clearPending);
+  setTimeout(clearPending, 1_000).unref();
+}
+
+function reportHeader(report) {
+  const displayedMessages = Array.isArray(report?.messageFeed) ? report.messageFeed.length : 0;
+  const totalMessages = Number.isFinite(Number(report?.messageFeedStats?.total))
+    ? Number(report.messageFeedStats.total)
+    : Number.isFinite(Number(report?.sourceCounts?.uniqueStories))
+      ? Number(report.sourceCounts.uniqueStories)
+      : displayedMessages;
+  const messageLimit = Number.isFinite(Number(report?.messageFeedStats?.limit))
+    ? Number(report.messageFeedStats.limit)
+    : displayedMessages;
+  return {
+    version: report?.version || null,
+    generatedAt: report?.generatedAt || null,
+    mode: report?.mode || "paper-alert-only",
+    layer: report?.layer || "event-driven-hybrid",
+    marketSession: report?.marketSession || null,
+    binanceTradingRules: report?.binanceTradingRules || null,
+    sourceCounts: report?.sourceCounts || {},
+    messageFeedStats: {
+      total: totalMessages,
+      displayed: displayedMessages,
+      limit: messageLimit
+    },
+    uiCounts: {
+      actionable: Array.isArray(report?.actionableSignals) ? report.actionableSignals.length : 0,
+      watch: Array.isArray(report?.watchlist) ? report.watchlist.length : 0,
+      messages: totalMessages,
+      messagesDisplayed: displayedMessages,
+      models: Array.isArray(report?.modelCalculations) ? report.modelCalculations.length : 0
+    }
+  };
+}
+
+function compactRelatedEvents(events) {
+  return (Array.isArray(events) ? events : []).slice(0, 2).map((event) => ({
+    title: event?.title || event?.text || ""
+  }));
+}
+
+function sampleTimeline(values, maximumPoints) {
+  const items = Array.isArray(values) ? values : [];
+  if (items.length <= maximumPoints) return items;
+  return Array.from({ length: maximumPoints }, (_, index) =>
+    items[Math.round((index * (items.length - 1)) / (maximumPoints - 1))]
+  );
+}
+
+function compactPositionForDashboard(position) {
+  const keep = [
+    "id", "symbol", "side", "openedAt", "closedAt", "candidateMode", "riskProfile", "leverage",
+    "currentPrice", "entry", "signalEntryPrice", "exitReferencePrice", "exitPrice", "takeProfit", "stopLoss",
+    "originalTakeProfit", "originalStopLoss", "initialMaxLossAmount", "dynamicProtection",
+    "winRate", "expectancyPct", "eventImpactScore", "unrealizedPnl", "netPnl", "unrealizedReturnPct",
+    "realizedPnl", "realizedReturnPct", "closeReason", "quantity", "modelSuggestedLeverage", "notional",
+    "marginRequired", "entryFee", "estimatedExitFee", "estimatedExitSlippageCost", "fundingPnl",
+    "fundingSettlements", "exitFee", "entrySlippageCost", "exitSlippageCost", "exitEvaluation",
+    "exitConfirmationCount", "deRiskConfirmationCount", "adaptiveDeRiskCount", "lastAdaptiveDeRiskAt",
+    "lastAdaptiveDeRiskReason", "marginConcentrationCapRatio", "marginConcentrationCapped",
+    "leverageRuleExact", "leverageRuleSource", "exchangeRule", "exchangeRuleValidated",
+    "quantityAdjustedToExchangeStep", "dynamicTakeProfitPartialCount", "holdingObservations"
+  ];
+  const result = Object.fromEntries(keep.map((key) => [key, position?.[key]]));
+  result.holdingObservations = sampleTimeline(position?.holdingObservations, 240).map((item) => ({
+    time: item?.time,
+    price: safeNumber(item?.price)
+  }));
+  if (position?.dynamicProtection) {
+    result.dynamicProtection = {
+      ...position.dynamicProtection,
+      adjustmentHistory: sampleTimeline(position.dynamicProtection.adjustmentHistory, 120).map((item) => ({
+        time: item?.time,
+        price: safeNumber(item?.price),
+        priceR: safeNumber(item?.priceR),
+        mfeR: safeNumber(item?.mfeR),
+        stage: item?.stage || null,
+        previousStopLoss: safeNumber(item?.previousStopLoss),
+        stopLoss: safeNumber(item?.stopLoss),
+        previousTakeProfit: safeNumber(item?.previousTakeProfit),
+        takeProfit: safeNumber(item?.takeProfit),
+        profitProtection: safeNumber(item?.profitProtection)
+      }))
+    };
+  }
+  result.relatedEvents = compactRelatedEvents(position?.relatedEvents);
+  return result;
+}
+
+function activeDemoPositionPreview() {
+  const preview = readJson(DEMO_POSITION_PREVIEW_PATH, null);
+  const expiresAt = Date.parse(preview?.expiresAt || "");
+  return preview?.position?.id && Number.isFinite(expiresAt) && expiresAt > Date.now()
+    ? preview
+    : null;
+}
+
+function compactAccountForDashboard(account) {
+  const demoPreview = activeDemoPositionPreview();
+  const sourcePositions = { ...(account?.positions || {}) };
+  if (demoPreview) sourcePositions[demoPreview.position.id] = demoPreview.position;
+  const positions = Object.fromEntries(
+    Object.entries(sourcePositions).map(([id, position]) => [id, compactPositionForDashboard(position)])
+  );
+  const publicReview = publicPostTradeReview(account);
+  const demoPnl = demoPreview
+    ? safeNumber(demoPreview.position.netPnl, demoPreview.position.unrealizedPnl)
+    : 0;
+  const demoMargin = demoPreview ? safeNumber(demoPreview.position.marginRequired) : 0;
+  return {
+    sessionId: account?.sessionId || null,
+    isActive: account?.isActive === true,
+    startedAt: account?.startedAt || null,
+    stoppedAt: account?.stoppedAt || null,
+    createdAt: account?.createdAt || null,
+    updatedAt: demoPreview?.updatedAt || account?.updatedAt || null,
+    startingCapital: safeNumber(account?.startingCapital),
+    realizedPnl: safeNumber(account?.realizedPnl),
+    unrealizedPnl: safeNumber(account?.unrealizedPnl) + demoPnl,
+    tradingFees: safeNumber(account?.tradingFees),
+    slippageCost: safeNumber(account?.slippageCost),
+    fundingPnl: safeNumber(account?.fundingPnl),
+    equity: safeNumber(account?.equity) + demoPnl,
+    marginUsed: safeNumber(account?.marginUsed) + demoMargin,
+    availableEquity: Math.max(0, safeNumber(account?.availableEquity) + demoPnl - demoMargin),
+    positions,
+    tradeHistory: (Array.isArray(account?.tradeHistory) ? account.tradeHistory : []).map(compactPositionForDashboard),
+    summary: account?.summary || null,
+    postTradeReviewConfig: publicReview.config || null,
+    postTradeReview: publicReview.review || null
+  };
+}
+
+function pageData(view) {
+  const report = readCachedReport(reportPath("latest"), null);
+  if (!report) return null;
+  const header = reportHeader(report);
+  if (view === "signals") {
+    return {
+      report: {
+        ...header,
+        actionableSignals: report.actionableSignals || [],
+        activeSignals: report.activeSignals || [],
+        closedSignals: report.closedSignals || [],
+        watchlist: report.watchlist || []
+      },
+      status: loopStatus(report)
+    };
+  }
+  if (view === "messages") {
+    return {
+      report: {
+        ...header,
+        warnings: report.warnings || [],
+        messageFeed: report.messageFeed || []
+      },
+      messageAggregator: publicMessageAggregatorStatus()
+    };
+  }
+  if (view === "models") {
+    return {
+      report: {
+        ...header,
+        signalOutcomeDataset: report.signalOutcomeDataset || null,
+        modelCalculations: report.modelCalculations || []
+      }
+    };
+  }
+  if (view === "logs") {
+    return {
+      report: header,
+      status: loopStatus(report),
+      log: readLogChunk(path.join(RUNTIME_DIR, "fast-loop.log"), null, 80_000)
+    };
+  }
+  const { config, account } = readAccountBundle();
+  return {
+    report: header,
+    status: loopStatus(report),
+    account: { config, account: compactAccountForDashboard(account) }
+  };
+}
+
+function compactAccountForSummary(account) {
+  return {
+    updatedAt: account?.updatedAt || null,
+    equity: safeNumber(account?.equity),
+    equityCurve: (Array.isArray(account?.equityCurve) ? account.equityCurve : []).map((point) => ({
+      time: point?.time,
+      equity: safeNumber(point?.equity),
+      returnPct: safeNumber(point?.returnPct)
+    })),
+    tradeHistory: (Array.isArray(account?.tradeHistory) ? account.tradeHistory : []).map((trade) => ({
+      id: trade?.id || null,
+      symbol: trade?.symbol || null,
+      side: trade?.side || null,
+      closedAt: trade?.closedAt || null,
+      closeReason: trade?.closeReason || null,
+      realizedPnl: safeNumber(trade?.realizedPnl),
+      winRate: safeNumber(trade?.winRate),
+      expectancyPct: safeNumber(trade?.expectancyPct)
+    }))
+  };
+}
+
+function publicPostTradeReview(account, archive = tradeHistoryStats(RUNTIME_DIR)) {
+  const review = account?.postTradeReview || {};
+  const latest = review.latestReview || null;
+  const trades = (Array.isArray(latest?.trades) ? latest.trades : []).slice(-20).map((trade) => ({
+    symbol: trade?.symbol || null,
+    side: trade?.side || null,
+    openedAt: trade?.openedAt || null,
+    closedAt: trade?.closedAt || null,
+    closeReason: trade?.closeReason || null,
+    realizedPnl: safeNumber(trade?.realizedPnl),
+    classification: trade?.classification || null,
+    entry: safeNumber(trade?.entry),
+    exitPrice: safeNumber(trade?.exitPrice),
+    takeProfit: safeNumber(trade?.takeProfit),
+    stopLoss: safeNumber(trade?.stopLoss),
+    decision: trade?.decision || null,
+    factorContributions: trade?.factorContributions || [],
+    exitDecision: trade?.exitDecision || null,
+    exitCounterfactual: trade?.exitCounterfactual || null
+  }));
+  return {
+    config: account?.postTradeReviewConfig,
+    review: {
+      version: review.version,
+      sessionId: review.sessionId,
+      completedReviews: safeNumber(review.completedReviews),
+      reviewedTradeCount: safeNumber(review.reviewedTradeCount),
+      weightVersion: safeNumber(review.weightVersion),
+      exitWeightVersion: safeNumber(review.exitWeightVersion),
+      currentDirectionWeights: review.currentDirectionWeights || {},
+      currentExitWeights: review.currentExitWeights || {},
+      previousDirectionWeights: review.previousDirectionWeights || null,
+      previousExitWeights: review.previousExitWeights || null,
+      latestReview: latest ? { ...latest, trades } : null
+    },
+    closedTrades: Math.max(
+      safeNumber(archive?.totalRecords),
+      Array.isArray(account?.tradeHistory) ? account.tradeHistory.length : 0,
+      safeNumber(account?.lifetimeClosedTrades)
+    ),
+    historyDatabase: {
+      totalRecords: safeNumber(archive?.totalRecords),
+      totalBytes: safeNumber(archive?.totalBytes),
+      shards: Array.isArray(archive?.files) ? archive.files.length : 0,
+      modelWindowLimit: MODEL_TRADE_HISTORY_LIMIT,
+      updatedAt: archive?.updatedAt || null
+    }
+  };
+}
+
+function runDashboardArchivedReview(account, now = new Date().toISOString()) {
+  const archive = appendTradeHistoryRecords(RUNTIME_DIR, account.tradeHistory);
+  const config = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
+  const reviewed = safeNumber(account.postTradeReview?.reviewedTradeCount);
+  const due = config.enabled && archive.totalRecords - reviewed >= config.reviewEveryTrades;
+  return {
+    archive,
+    result: maybeRunPostTradeReview(account, DEFAULT_DIRECTION_MODEL_WEIGHTS, now, {
+      totalClosedTrades: archive.totalRecords,
+      trades: due ? loadTradeHistoryRecords(RUNTIME_DIR, { limit: MODEL_TRADE_HISTORY_LIMIT }) : account.tradeHistory,
+      exitDecisionTrades: account.exitDecisionHistory
+    })
+  };
+}
+
+function closeAllPaperPositions(account, now = new Date().toISOString()) {
+  const closed = [];
+  const failed = [];
+  for (const [positionId, position] of Object.entries(account.positions || {})) {
+    const referencePrice = safeNumber(position.currentPrice, safeNumber(position.entry));
+    if (!(referencePrice > 0)) {
+      failed.push({ id: positionId, symbol: position.symbol || positionId, reason: "INVALID_PRICE" });
+      continue;
+    }
+    const item = closePaperPosition(account, positionId, referencePrice, "MANUAL_CLOSE_ALL", now);
+    if (item) closed.push(item);
+    else failed.push({ id: positionId, symbol: position.symbol || positionId, reason: "SETTLEMENT_FAILED" });
+  }
+  if (!closed.length) return { closed, failed };
+
+  const remaining = Object.values(account.positions || {});
+  account.unrealizedPnl = remaining.reduce((sum, position) => sum + safeNumber(position.unrealizedPnl), 0);
+  account.marginUsed = remaining.reduce((sum, position) => sum + safeNumber(position.marginRequired), 0);
+  account.equity = safeNumber(account.startingCapital) + safeNumber(account.realizedPnl) + account.unrealizedPnl;
   account.availableEquity = Math.max(0, account.equity - account.marginUsed);
   account.updatedAt = now;
   const equityPoint = {
@@ -1097,4 +1645,3 @@ server.listen(PORT, "127.0.0.1", () => {
 const serviceEnsureTimer = setInterval(ensureMonitorSupervisor, SERVICE_ENSURE_INTERVAL_MS);
 serviceEnsureTimer.unref();
 server.once("close", () => clearInterval(serviceEnsureTimer));
-

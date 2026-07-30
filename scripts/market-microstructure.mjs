@@ -277,4 +277,3 @@ export function createMarketMicrostructure(options = {}) {
     }
   };
 }
-

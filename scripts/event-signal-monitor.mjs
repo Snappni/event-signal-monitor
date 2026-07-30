@@ -560,7 +560,5190 @@ function readPaperAccount(accountConfig) {
     position.riskProfile =
       position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
   }
- …51542 tokens truncated…iskPct: 0.02,
+  for (const position of Object.values(account.positions)) {
+    position.accountMarketType = position.accountMarketType || config.marketType;
+    position.signalEntryPrice = safeNumber(position.signalEntryPrice, position.entry);
+    position.entryFee = safeNumber(position.entryFee);
+    position.entrySlippageCost = safeNumber(position.entrySlippageCost);
+    position.exitFee = safeNumber(position.exitFee);
+    position.exitSlippageCost = safeNumber(position.exitSlippageCost);
+    position.fundingPnl = safeNumber(position.fundingPnl);
+    position.fundingSettlements = safeNumber(position.fundingSettlements);
+    position.initialNotional = safeNumber(position.initialNotional, position.notional);
+    position.initialMarginRequired = safeNumber(position.initialMarginRequired, position.marginRequired);
+    position.initialQuantity = safeNumber(position.initialQuantity, position.quantity);
+    position.partialGrossTradingPnl = safeNumber(position.partialGrossTradingPnl);
+    position.partialRealizedPnl = safeNumber(position.partialRealizedPnl);
+    position.partialEntryFee = safeNumber(position.partialEntryFee);
+    position.partialExitFee = safeNumber(position.partialExitFee);
+    position.partialEntrySlippageCost = safeNumber(position.partialEntrySlippageCost);
+    position.partialExitSlippageCost = safeNumber(position.partialExitSlippageCost);
+    position.partialFundingPnl = safeNumber(position.partialFundingPnl);
+    position.partialClosedQuantity = safeNumber(position.partialClosedQuantity);
+    position.partialExitPriceQuantitySum = safeNumber(position.partialExitPriceQuantitySum);
+    position.capitalRotationCount = safeNumber(position.capitalRotationCount);
+    position.adaptiveDeRiskCount = safeNumber(position.adaptiveDeRiskCount);
+    position.deRiskConfirmationCount = safeNumber(position.deRiskConfirmationCount);
+    position.lastAdaptiveDeRiskAt = position.lastAdaptiveDeRiskAt || null;
+    position.originalStopLoss = safeNumber(position.originalStopLoss, position.stopLoss);
+    position.originalTakeProfit = safeNumber(position.originalTakeProfit, position.takeProfit);
+    position.initialMaxLossAmount = safeNumber(position.initialMaxLossAmount, position.maxLossAmount);
+    position.dynamicTakeProfitPartialCount = safeNumber(position.dynamicTakeProfitPartialCount);
+    position.dynamicProtection = position.dynamicProtection || initializeDynamicProtection(position, position.openedAt);
+    position.feeRate = safeNumber(position.feeRate, config.takerFeeRate);
+    position.slippageRate = safeNumber(position.slippageRate, config.slippageRate);
+    position.fundingIntervalHours = safeNumber(
+      position.fundingIntervalHours,
+      config.fundingIntervalHours
+    );
+    if (!position.nextFundingAt && config.marketType === "futures") {
+      position.nextFundingAt = nextFundingSettlement(Date.now(), position.fundingIntervalHours);
+    }
+  }
+  account.tradeHistory = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+  account.equityCurve = Array.isArray(account.equityCurve) && account.equityCurve.length
+    ? account.equityCurve
+    : createPaperAccount(accountConfig).equityCurve;
+  account.summary = buildPaperAccountSummary(account);
+  return account;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function safeNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function mean(values) {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+}
+
+function std(values) {
+  if (values.length < 2) return 0;
+  const avg = mean(values);
+  return Math.sqrt(mean(values.map((value) => (value - avg) ** 2)));
+}
+
+function ema(values, period) {
+  if (!values.length) return 0;
+  const alpha = 2 / (period + 1);
+  let current = values[0];
+  for (let index = 1; index < values.length; index += 1) {
+    current = values[index] * alpha + current * (1 - alpha);
+  }
+  return current;
+}
+
+function atr(candles, period = 14) {
+  if (candles.length < 2) return 0;
+  const trueRanges = [];
+  for (let index = 1; index < candles.length; index += 1) {
+    const current = candles[index];
+    const previous = candles[index - 1];
+    trueRanges.push(
+      Math.max(
+        current.high - current.low,
+        Math.abs(current.high - previous.close),
+        Math.abs(current.low - previous.close)
+      )
+    );
+  }
+  return mean(trueRanges.slice(-period));
+}
+
+function rsi(values, period = 14) {
+  if (values.length <= period) return 50;
+  const deltas = [];
+  for (let index = 1; index < values.length; index += 1) {
+    deltas.push(values[index] - values[index - 1]);
+  }
+  const recent = deltas.slice(-period);
+  const avgGain = mean(recent.map((value) => Math.max(value, 0)));
+  const avgLoss = mean(recent.map((value) => Math.max(-value, 0)));
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+function normalCdf(value) {
+  const sign = value < 0 ? -1 : 1;
+  const x = Math.abs(value) / Math.sqrt(2);
+  const t = 1 / (1 + 0.3275911 * x);
+  const erf =
+    1 -
+    (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t +
+      0.254829592) *
+      t) *
+      Math.exp(-x * x);
+  return 0.5 * (1 + sign * erf);
+}
+
+function gaussianDensity(value, center, deviation) {
+  const sigma = Math.max(Math.abs(deviation), 1e-9);
+  const z = (value - center) / sigma;
+  return Math.exp(-0.5 * z * z) / (sigma * Math.sqrt(2 * Math.PI));
+}
+
+function calculateLogReturns(values) {
+  const returns = [];
+  for (let index = 1; index < values.length; index += 1) {
+    const previous = safeNumber(values[index - 1]);
+    const current = safeNumber(values[index]);
+    if (previous > 0 && current > 0) returns.push(Math.log(current / previous));
+  }
+  return returns;
+}
+
+function analyzeGeometricBrownianMotion(returns, horizonSteps = 4) {
+  const sample = returns.slice(-96);
+  const meanLogReturn = mean(sample);
+  const sigma = std(sample);
+  const horizonLogMean = meanLogReturn * horizonSteps;
+  const horizonVolatility = sigma * Math.sqrt(horizonSteps);
+  const expectedReturn = Math.exp(horizonLogMean + 0.5 * sigma * sigma * horizonSteps) - 1;
+  const probabilityUp = sigma > 0 ? normalCdf(horizonLogMean / Math.max(horizonVolatility, 1e-9)) : 0.5;
+  const probabilitySignal = (probabilityUp - 0.5) * 2;
+  const expectedReturnSignal =
+    horizonVolatility > 0 ? clamp(expectedReturn / Math.max(horizonVolatility * 1.5, 1e-9), -1, 1) : 0;
+  const signal = clamp(probabilitySignal * 0.7 + expectedReturnSignal * 0.3, -1, 1);
+  return {
+    horizonSteps,
+    observations: sample.length,
+    meanLogReturn,
+    sigma,
+    expectedReturn,
+    probabilityUp,
+    signal,
+    formula:
+      "GBM: ln(S[t+h]/S[t]) ~ N(m*h, sigma^2*h); E[S[t+h]/S[t]-1] = exp(m*h + 0.5*sigma^2*h)-1"
+  };
+}
+
+function estimateGarch11(returns) {
+  const sample = returns.slice(-96);
+  const sampleVariance = Math.max(std(sample) ** 2, 1e-12);
+  const alphaGrid = [0.05, 0.08, 0.12, 0.16];
+  const betaGrid = [0.72, 0.8, 0.86, 0.9, 0.93];
+  let best = null;
+
+  for (const alpha of alphaGrid) {
+    for (const beta of betaGrid) {
+      if (alpha + beta >= 0.985) continue;
+      const omega = sampleVariance * (1 - alpha - beta);
+      let variance = sampleVariance;
+      let logLikelihood = 0;
+      for (const value of sample) {
+        variance = Math.max(omega + alpha * value * value + beta * variance, 1e-12);
+        logLikelihood += -0.5 * (Math.log(2 * Math.PI) + Math.log(variance) + (value * value) / variance);
+      }
+      if (!best || logLikelihood > best.logLikelihood) {
+        best = { alpha, beta, omega, variance, logLikelihood };
+      }
+    }
+  }
+
+  const fallback = {
+    alpha: 0.08,
+    beta: 0.9,
+    omega: sampleVariance * 0.02,
+    variance: sampleVariance,
+    logLikelihood: 0
+  };
+  const parameters = best || fallback;
+  const latestReturn = safeNumber(sample.at(-1));
+  const forecastVariance = Math.max(
+    parameters.omega + parameters.alpha * latestReturn * latestReturn + parameters.beta * parameters.variance,
+    1e-12
+  );
+  const forecastVolatility = Math.sqrt(forecastVariance);
+  const baselineVolatility = Math.sqrt(sampleVariance);
+  const volatilityRatio = baselineVolatility > 0 ? forecastVolatility / baselineVolatility : 1;
+  const stabilityScore = clamp(1.25 - volatilityRatio * 0.35, 0, 1);
+  const confidenceMultiplier =
+    1 - GARCH_CONFIDENCE_WEIGHT + GARCH_CONFIDENCE_WEIGHT * stabilityScore;
+  return {
+    observations: sample.length,
+    alpha: parameters.alpha,
+    beta: parameters.beta,
+    omega: parameters.omega,
+    persistence: parameters.alpha + parameters.beta,
+    forecastVariance,
+    forecastVolatility,
+    volatilityRatio,
+    stabilityScore,
+    confidenceMultiplier,
+    formula:
+      "GARCH(1,1): sigma[t+1]^2 = omega + alpha*epsilon[t]^2 + beta*sigma[t]^2; final signal magnitude *= 0.65 + 0.35*stability"
+  };
+}
+
+function analyzeHiddenMarkovRegime(returns) {
+  const sample = returns.slice(-96);
+  const sigma = Math.max(std(sample), 1e-6);
+  const states = [
+    { name: "bull", mean: sigma * 0.35, deviation: sigma * 0.9 },
+    { name: "bear", mean: -sigma * 0.35, deviation: sigma * 0.9 },
+    { name: "range", mean: 0, deviation: sigma * 0.55 }
+  ];
+  const transition = [
+    [0.92, 0.03, 0.05],
+    [0.03, 0.92, 0.05],
+    [0.08, 0.08, 0.84]
+  ];
+  let probabilities = [1 / 3, 1 / 3, 1 / 3];
+
+  for (const value of sample) {
+    const predicted = states.map((_, nextState) =>
+      probabilities.reduce(
+        (sum, probability, previousState) => sum + probability * transition[previousState][nextState],
+        0
+      )
+    );
+    const filtered = states.map(
+      (state, index) => predicted[index] * gaussianDensity(value, state.mean, state.deviation)
+    );
+    const total = filtered.reduce((sum, value) => sum + value, 0);
+    probabilities =
+      total > 0 ? filtered.map((value) => value / total) : [1 / 3, 1 / 3, 1 / 3];
+  }
+
+  const regimeIndex = probabilities.indexOf(Math.max(...probabilities));
+  return {
+    observations: sample.length,
+    regime: states[regimeIndex].name,
+    bullProbability: probabilities[0],
+    bearProbability: probabilities[1],
+    rangeProbability: probabilities[2],
+    confidence: probabilities[regimeIndex],
+    signal: clamp(probabilities[0] - probabilities[1], -1, 1),
+    transition,
+    formula:
+      "HMM filter: P(z[t]|r[1:t]) proportional to Normal(r[t]|mu[z],sigma[z]) * sum(P(z[t]|z[t-1])*P(z[t-1]|r[1:t-1]))"
+  };
+}
+
+function poissonProbability(k, lambda) {
+  const count = Math.max(0, Math.floor(safeNumber(k)));
+  const rate = Math.max(1e-9, safeNumber(lambda, 1e-9));
+  let probability = Math.exp(-rate);
+  for (let index = 1; index <= count; index += 1) {
+    probability *= rate / index;
+  }
+  return probability;
+}
+
+function poissonCdf(k, lambda) {
+  const count = Math.max(0, Math.floor(safeNumber(k)));
+  let total = 0;
+  for (let index = 0; index <= count; index += 1) {
+    total += poissonProbability(index, lambda);
+  }
+  return clamp(total, 0, 1);
+}
+
+function poissonTailProbability(k, lambda) {
+  const count = Math.max(0, Math.floor(safeNumber(k)));
+  if (count <= 0) return 1;
+  return clamp(1 - poissonCdf(count - 1, lambda), 0, 1);
+}
+
+function analyzePoissonEventArrival(eventAggregate, eventScoreNorm, highImpactEvent) {
+  const observedEvents = Math.max(
+    0,
+    Math.floor(safeNumber(eventAggregate.eventCount, eventAggregate.events?.length || 0))
+  );
+  const baselineLambda = clamp(
+    0.25 + eventScoreNorm * 1.65 + (highImpactEvent ? 0.35 : 0),
+    0.05,
+    4
+  );
+  const tailProbability = observedEvents > 0 ? poissonTailProbability(observedEvents, baselineLambda) : 1;
+  const eventClusterScore =
+    observedEvents > 0
+      ? clamp((observedEvents - baselineLambda) / Math.sqrt(baselineLambda + 1e-9), -3, 3)
+      : 0;
+  const burstSurprise = observedEvents > 0 ? clamp(1 - tailProbability, 0, 1) : 0;
+  const directionalIntensity = burstSurprise * Math.abs(safeNumber(eventAggregate.direction));
+  return {
+    observedEvents,
+    baselineLambda,
+    tailProbability,
+    burstSurprise,
+    eventClusterScore,
+    directionalIntensity,
+    formula:
+      "Poisson: P(N>=k)=1-CDF(k-1;lambda). k=observed relevant events, lambda=baseline event arrival rate. Low tail probability means event clustering is unusual."
+  };
+}
+
+function bayesianWinRateUpdate({
+  priorWinRate,
+  combinedDirection,
+  eventScoreNorm,
+  alignment,
+  volatilityRegimeScore,
+  advancedModelQualityBoost,
+  poisson,
+  roundTripExecutionCostPct,
+  riskPct
+}) {
+  const prior = clamp(priorWinRate, 0.35, 0.86);
+  const eventAgreement =
+    alignment > 0
+      ? eventScoreNorm * (0.55 + poisson.burstSurprise * 0.45)
+      : alignment < 0
+        ? -eventScoreNorm * (0.65 + poisson.burstSurprise * 0.35)
+        : 0;
+  const costToRisk = riskPct > 0 ? roundTripExecutionCostPct / riskPct : 0;
+  const winEvidence =
+    Math.abs(combinedDirection) * 0.75 +
+    Math.max(0, eventAgreement) * 0.5 +
+    Math.max(0, advancedModelQualityBoost) * 7 +
+    Math.max(0, volatilityRegimeScore) * 0.35;
+  const lossEvidence =
+    Math.max(0, -eventAgreement) * 0.6 +
+    Math.max(0, -volatilityRegimeScore) * 0.4 +
+    clamp(costToRisk, 0, 2) * 0.28;
+  const likelihoodWin = clamp(Math.exp(winEvidence), 0.35, 2.8);
+  const likelihoodLoss = clamp(Math.exp(lossEvidence), 0.35, 2.8);
+  const numerator = prior * likelihoodWin;
+  const denominator = numerator + (1 - prior) * likelihoodLoss;
+  const posteriorWinRate = denominator > 0 ? numerator / denominator : prior;
+  return {
+    priorWinRate: prior,
+    eventAgreement,
+    costToRisk,
+    likelihoodWin,
+    likelihoodLoss,
+    posteriorWinRate: clamp(posteriorWinRate, 0.35, 0.86),
+    adjustment: clamp(posteriorWinRate - prior, -0.08, 0.08),
+    formula:
+      "Bayes: P(win|evidence)=P(win)*L(evidence|win)/(P(win)*L(evidence|win)+(1-P(win))*L(evidence|loss)). Evidence includes direction strength, event agreement, Poisson event burst, volatility regime and execution cost."
+  };
+}
+
+function parseBinanceKline(row) {
+  return {
+    time: safeNumber(row[0]),
+    open: safeNumber(row[1]),
+    high: safeNumber(row[2]),
+    low: safeNumber(row[3]),
+    close: safeNumber(row[4]),
+    volume: safeNumber(row[5]),
+    quoteVolume: safeNumber(row[7]),
+    tradeCount: safeNumber(row[8]),
+    takerBuyVolume: safeNumber(row[9]),
+    takerBuyQuoteVolume: safeNumber(row[10])
+  };
+}
+
+function parseOkxCandle(row) {
+  return {
+    time: safeNumber(row[0]),
+    open: safeNumber(row[1]),
+    high: safeNumber(row[2]),
+    low: safeNumber(row[3]),
+    close: safeNumber(row[4]),
+    volume: safeNumber(row[5]),
+    quoteVolume: safeNumber(row[7])
+  };
+}
+
+async function fetchJson(url, options = {}) {
+  if (FETCH_IMPL === "powershell") {
+    return fetchJsonWithPowerShell(url, options);
+  }
+  if (FETCH_IMPL === "node") {
+    return fetchJsonWithNode(url, options);
+  }
+  try {
+    return await fetchJsonWithNode(url, options);
+  } catch (nodeError) {
+    try {
+      return await fetchJsonWithPowerShell(url, options);
+    } catch (powerShellError) {
+      const nodeMessage = nodeError instanceof Error ? nodeError.message : String(nodeError);
+      const powerShellMessage = powerShellError instanceof Error ? powerShellError.message : String(powerShellError);
+      throw new Error(`Node fetch failed: ${nodeMessage}; PowerShell fetch failed: ${powerShellMessage}`);
+    }
+  }
+}
+
+async function fetchText(url, options = {}) {
+  if (FETCH_IMPL === "powershell") {
+    return fetchTextWithPowerShell(url, options);
+  }
+  if (FETCH_IMPL === "node") {
+    return fetchTextWithNode(url, options);
+  }
+  try {
+    return await fetchTextWithNode(url, options);
+  } catch (nodeError) {
+    try {
+      return await fetchTextWithPowerShell(url, options);
+    } catch (powerShellError) {
+      const nodeMessage = nodeError instanceof Error ? nodeError.message : String(nodeError);
+      const powerShellMessage = powerShellError instanceof Error ? powerShellError.message : String(powerShellError);
+      throw new Error(`Node fetch failed: ${nodeMessage}; PowerShell fetch failed: ${powerShellMessage}`);
+    }
+  }
+}
+
+async function fetchTextWithNode(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 event-signal-monitor/0.8",
+        Accept: options.accept || "application/rss+xml,application/atom+xml,text/xml,text/plain,*/*",
+        ...(options.headers || {})
+      }
+    });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    return await response.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchTextWithPowerShell(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const timeoutSec = Math.max(2, Math.ceil(timeoutMs / 1000));
+  const command = [
+    "$ProgressPreference='SilentlyContinue';",
+    "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);",
+    "$url=$env:SIGNAL_MONITOR_REQUEST_URL;",
+    "$timeoutSec=[int]$env:SIGNAL_MONITOR_REQUEST_TIMEOUT_SEC;",
+    "$accept=$env:SIGNAL_MONITOR_REQUEST_ACCEPT;",
+    "$headers=@{'User-Agent'='Mozilla/5.0 event-signal-monitor/0.8';'Accept'=$accept};",
+    "$response=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec $timeoutSec -Headers $headers;",
+    "[Console]::Write($response.Content)"
+  ].join(" ");
+  const { stdout } = await execFileAsync(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+    {
+      timeout: timeoutMs + 6_000,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        SIGNAL_MONITOR_REQUEST_URL: url,
+        SIGNAL_MONITOR_REQUEST_TIMEOUT_SEC: String(timeoutSec),
+        SIGNAL_MONITOR_REQUEST_ACCEPT:
+          options.accept || "application/rss+xml,application/atom+xml,text/xml,text/plain,*/*"
+      },
+      maxBuffer: 8 * 1024 * 1024
+    }
+  );
+  return stdout;
+}
+
+async function fetchJsonWithNode(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 event-signal-monitor/0.2",
+        Accept: "application/json,text/plain,*/*",
+        ...(options.headers || {})
+      }
+    });
+    const body = await response.text();
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}; body=${body.slice(0, 180)}`);
+    }
+    if (!body.trim()) throw new Error(`empty JSON response (HTTP ${response.status})`);
+    try {
+      return JSON.parse(body);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`JSON parse failed: ${message}; body=${body.slice(0, 180)}`);
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchJsonWithPowerShell(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  const timeoutSec = Math.max(2, Math.ceil(timeoutMs / 1000));
+  const command = [
+    "$ProgressPreference='SilentlyContinue';",
+    "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);",
+    "$url=$env:SIGNAL_MONITOR_REQUEST_URL;",
+    "$timeoutSec=[int]$env:SIGNAL_MONITOR_REQUEST_TIMEOUT_SEC;",
+    "$headers=@{'User-Agent'='Mozilla/5.0 event-signal-monitor/0.4';'Accept'='application/json,text/plain,*/*'};",
+    "$response=Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec $timeoutSec -Headers $headers;",
+    "[Console]::Write($response.Content)"
+  ].join(" ");
+  const { stdout } = await execFileAsync(
+    "powershell",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+    {
+      timeout: timeoutMs + 6_000,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        SIGNAL_MONITOR_REQUEST_URL: url,
+        SIGNAL_MONITOR_REQUEST_TIMEOUT_SEC: String(timeoutSec)
+      },
+      maxBuffer: 8 * 1024 * 1024
+    }
+  );
+  if (!stdout.trim()) throw new Error("empty JSON response");
+  try {
+    return JSON.parse(stdout);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`JSON parse failed: ${message}; body=${stdout.slice(0, 180)}`);
+  }
+}
+
+async function fetchBinanceLeverageBrackets() {
+  const apiKey = process.env.BINANCE_FUTURES_API_KEY || process.env.BINANCE_API_KEY;
+  const apiSecret = process.env.BINANCE_FUTURES_API_SECRET || process.env.BINANCE_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    return { brackets: {}, warning: "未配置币安只读 API 凭证；模拟交易按模型整数杠杆与账户硬上限计算，币安账户档位未验证。" };
+  }
+  const query = `timestamp=${Date.now()}&recvWindow=5000`;
+  const signature = createHmac("sha256", apiSecret).update(query).digest("hex");
+  const payload = await fetchJsonWithNode(
+    `https://fapi.binance.com/fapi/v1/leverageBracket?${query}&signature=${signature}`,
+    { headers: { "X-MBX-APIKEY": apiKey } }
+  );
+  return { brackets: parseBinanceLeverageBrackets(payload), warning: null };
+}
+
+async function fetchBinanceTradingRules(marketType) {
+  const fetchedAt = new Date().toISOString();
+  const configuredRules = (symbols) => Object.fromEntries(
+    SYMBOLS.map((symbol) => [symbol, symbols[symbol]]).filter(([, rule]) => Boolean(rule))
+  );
+  if (marketType === "spot") {
+    let payload;
+    try {
+      payload = await fetchJson("https://data-api.binance.vision/api/v3/exchangeInfo");
+    } catch {
+      payload = await fetchJson("https://api.binance.com/api/v3/exchangeInfo");
+    }
+    return {
+      marketType,
+      fetchedAt,
+      symbols: configuredRules(parseBinanceExchangeInfo(payload, { marketType, fetchedAt })),
+      leverageExact: true,
+      warning: null
+    };
+  }
+  const warnings = [];
+  let payload;
+  let ruleSource = "binance-futures-exchangeInfo";
+  try {
+    payload = await fetchJson("https://fapi.binance.com/fapi/v1/exchangeInfo");
+  } catch (error) {
+    payload = await fetchJson("https://testnet.binancefuture.com/fapi/v1/exchangeInfo");
+    ruleSource = "binance-futures-testnet-exchangeInfo";
+    warnings.push(
+      `币安生产合约公开规则不可用，纸面交易改用币安合约测试网的数量与价格步长；该来源不代表生产账户杠杆档位：${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+  let leverage = { brackets: {}, warning: null };
+  try {
+    leverage = await fetchBinanceLeverageBrackets();
+  } catch (error) {
+    leverage.warning = `币安杠杆档位读取失败；模拟交易按模型整数杠杆与账户硬上限计算，币安账户档位未验证：${error instanceof Error ? error.message : String(error)}`;
+  }
+  const symbols = configuredRules(parseBinanceExchangeInfo(payload, {
+    marketType,
+    leverageBrackets: leverage.brackets,
+    fetchedAt,
+    ruleSource
+  }));
+  if (leverage.warning) warnings.push(leverage.warning);
+  return {
+    marketType,
+    fetchedAt,
+    symbols,
+    leverageExact: Object.values(symbols).some((rule) => rule.leverageExact),
+    warning: warnings.join(" | ") || null
+  };
+}
+
+async function fetchWithFallback(label, fetcher, fallback) {
+  try {
+    return await fetcher();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ...fallback,
+      sourceFailure: `${localizeSourceLabel(label)}：${localizeErrorMessage(message)}`
+    };
+  }
+}
+
+function localizeSourceLabel(label) {
+  if (/ market data$/i.test(label)) return label.replace(/ market data$/i, " 行情数据");
+  if (/ funding$/i.test(label)) return label.replace(/ funding$/i, " 资金费率");
+  if (/ open interest$/i.test(label)) return label.replace(/ open interest$/i, " OI");
+  const sourceMap = {
+    "Binance announcements": "Binance 公告",
+    "OKX announcements": "OKX 公告",
+    GDELT: "GDELT 新闻",
+    "Message aggregator": "消息聚合器",
+    Polymarket: "Polymarket 盘口",
+    WhaleAlert: "WhaleAlert 巨鲸监控"
+  };
+  return sourceMap[label] || label;
+}
+
+function localizeErrorMessage(message) {
+  const whaleApiKey = readWhaleAlertApiKey();
+  const text = String(message || "")
+    .replace(/api_key=[^&\s]+/gi, "api_key=[REDACTED]")
+    .replace(new RegExp(escapeRegExp(whaleApiKey || "__NO_KEY__"), "g"), "[REDACTED]");
+  const parts = [];
+  if (/429|Too Many Requests/i.test(text)) parts.push("接口限流");
+  if (/aborted|AbortError/i.test(text)) parts.push("请求超时或被中止");
+  if (/fetch failed/i.test(text)) parts.push("网络请求失败");
+  if (/empty response/i.test(text)) parts.push("接口返回为空");
+  if (/unavailable/i.test(text)) parts.push("数据源不可用");
+  if (!parts.length) parts.push(text || "未知错误");
+  return [...new Set(parts)].join("；");
+}
+
+function readWhaleAlertApiKey() {
+  const credentials = readJsonIfExists(WHALE_CREDENTIALS_PATH, null);
+  const storedKey = typeof credentials?.apiKey === "string" ? credentials.apiKey.trim() : "";
+  return storedKey || String(process.env.WHALE_ALERT_API_KEY || "").trim();
+}
+
+function writeWhaleAlertStatus(value) {
+  writeJson(WHALE_STATUS_PATH, {
+    provider: "Whale Alert",
+    ...value,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function readMessageAggregatorConfig() {
+  const saved = readJsonIfExists(MESSAGE_AGGREGATOR_CONFIG_PATH, null);
+  const environmentConfig = {
+    enabled: process.env.MESSAGE_AGGREGATOR_ENABLED,
+    filterKeywords: process.env.MESSAGE_FILTER_KEYWORDS,
+    maxItemsPerSource: process.env.MESSAGE_MAX_ITEMS_PER_SOURCE
+  };
+  try {
+    return normalizeMessageAggregatorConfig(saved || environmentConfig);
+  } catch (error) {
+    return {
+      ...normalizeMessageAggregatorConfig({ enabled: false }),
+      configurationError: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function writeMessageAggregatorStatus(value) {
+  writeJson(MESSAGE_AGGREGATOR_STATUS_PATH, {
+    provider: "Message Aggregator",
+    ...value,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+async function firstSuccessful(label, fetchers) {
+  const reasons = [];
+  for (const fetcher of fetchers) {
+    try {
+      const value = await fetcher();
+      if (Array.isArray(value) && value.length) return value;
+      reasons.push("empty response");
+    } catch (error) {
+      reasons.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  throw new Error(`${label} unavailable: ${reasons.join(" | ") || "empty response"}`);
+}
+
+async function firstSuccessfulNumber(label, fetchers) {
+  const reasons = [];
+  for (const fetcher of fetchers) {
+    try {
+      const value = Number(await fetcher());
+      if (Number.isFinite(value)) return value;
+      reasons.push("empty response");
+    } catch (error) {
+      reasons.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  throw new Error(`${label} unavailable: ${reasons.join(" | ") || "empty response"}`);
+}
+
+async function fetchBinanceKlines(symbol, interval, limit) {
+  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const rows = await fetchJson(url);
+  return rows.map(parseBinanceKline).filter((candle) => candle.close > 0);
+}
+
+async function fetchOkxKlines(symbol, interval, limit) {
+  const instId = symbol.replace("USDT", "-USDT-SWAP");
+  const okxInterval = interval === "1h" ? "1H" : interval;
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${okxInterval}&limit=${limit}`;
+  const data = await fetchJson(url);
+  const rows = Array.isArray(data?.data) ? data.data : [];
+  return rows.map(parseOkxCandle).reverse().filter((candle) => candle.close > 0);
+}
+
+async function fetchCandles(symbol, interval, limit) {
+  return firstSuccessful(`${symbol} ${interval} candles`, [
+    () => fetchOkxKlines(symbol, interval, limit),
+    () => fetchBinanceKlines(symbol, interval, limit)
+  ]);
+}
+
+async function fetchBinanceOpenInterest(symbol) {
+  const data = await fetchJson(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`);
+  return safeNumber(data?.openInterest);
+}
+
+async function fetchBinanceFunding(symbol) {
+  const data = await fetchJson(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`);
+  return safeNumber(data?.lastFundingRate);
+}
+
+async function fetchOkxOpenInterest(symbol) {
+  const instId = symbol.replace("USDT", "-USDT-SWAP");
+  const data = await fetchJson(
+    `https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId=${instId}`
+  );
+  return Number(data?.data?.[0]?.oi);
+}
+
+async function fetchOkxFunding(symbol) {
+  const instId = symbol.replace("USDT", "-USDT-SWAP");
+  const data = await fetchJson(
+    `https://www.okx.com/api/v5/public/funding-rate-history?instId=${instId}&limit=1`
+  );
+  return Number(data?.data?.[0]?.fundingRate);
+}
+
+async function fetchOpenInterest(symbol) {
+  return firstSuccessfulNumber(`${symbol} open interest`, [
+    () => fetchOkxOpenInterest(symbol),
+    () => fetchBinanceOpenInterest(symbol)
+  ]);
+}
+
+async function fetchFunding(symbol) {
+  return firstSuccessfulNumber(`${symbol} funding`, [
+    () => fetchOkxFunding(symbol),
+    () => fetchBinanceFunding(symbol)
+  ]);
+}
+
+async function fetchOkxHistoricalCandles(symbol, intervalMinutes, fromMs, toMs) {
+  const instId = okxInstrumentId(symbol);
+  const bar = intervalMinutes === 60 ? "1H" : `${intervalMinutes}m`;
+  const rows = [];
+  let cursor = String(toMs);
+  for (let page = 0; page < 40; page += 1) {
+    const url = `https://www.okx.com/api/v5/market/history-candles?instId=${instId}&bar=${bar}&limit=300&after=${cursor}`;
+    const payload = await fetchJson(url);
+    if (String(payload?.code ?? "0") !== "0") throw new Error(payload?.msg || `OKX historical ${symbol} error`);
+    const batch = (Array.isArray(payload?.data) ? payload.data : [])
+      .map(parseOkxCandle)
+      .filter((candle) => candle.close > 0 && candle.time >= fromMs && candle.time <= toMs);
+    rows.push(...batch);
+    const allTimes = (Array.isArray(payload?.data) ? payload.data : []).map((row) => safeNumber(row?.[0])).filter((time) => time > 0);
+    if (!allTimes.length) break;
+    const oldest = Math.min(...allTimes);
+    if (oldest <= fromMs || oldest >= Number(cursor)) break;
+    cursor = String(oldest - 1);
+    await sleep(120);
+  }
+  return [...new Map(rows.map((candle) => [candle.time, candle])).values()]
+    .sort((left, right) => left.time - right.time);
+}
+
+async function fetchFactorHistory(symbols) {
+  const toMs = Date.now() - 2 * 24 * 60 * 60 * 1_000;
+  const fromMs = toMs - FACTOR_HISTORY_LOOKBACK_MONTHS * 31 * 24 * 60 * 60 * 1_000;
+  const results = await mapWithConcurrency(symbols, 3, async (symbol) => {
+    try {
+      return [symbol, await fetchOkxHistoricalCandles(symbol, FACTOR_HISTORY_INTERVAL_MINUTES, fromMs, toMs)];
+    } catch (error) {
+      return [symbol, []];
+    }
+  });
+  return Object.fromEntries(results.filter(([, candles]) => candles.length >= 50));
+}
+
+async function cachedFactorSource(key, ttlMs, fetcher, fallback) {
+  const cached = factorSourceCache.get(key);
+  if (cached && Date.now() - cached.fetchedAtMs < ttlMs) return cached.value;
+  try {
+    const value = await fetcher();
+    factorSourceCache.set(key, { fetchedAtMs: Date.now(), value });
+    return value;
+  } catch (error) {
+    if (cached) return cached.value;
+    return typeof fallback === "function" ? fallback(error) : fallback;
+  }
+}
+
+function okxInstrumentId(symbol) {
+  return symbol.replace(/USDT$/i, "-USDT-SWAP");
+}
+
+function okxInstrumentFamily(symbol) {
+  return symbol.replace(/USDT$/i, "-USDT");
+}
+
+async function fetchOkxFactorStatistics(symbol) {
+  const instId = okxInstrumentId(symbol);
+  const instFamily = okxInstrumentFamily(symbol);
+  const currency = symbol.replace(/USDT$/i, "");
+  const updatedAt = new Date().toISOString();
+  const sources = {};
+  const load = async (key, url) => {
+    try {
+      const payload = await fetchJson(url);
+      if (String(payload?.code ?? "0") !== "0") throw new Error(payload?.msg || `OKX ${key} error`);
+      sources[key] = { available: true, updatedAt };
+      return Array.isArray(payload?.data) ? payload.data : [];
+    } catch (error) {
+      sources[key] = { available: false, updatedAt, error: error instanceof Error ? error.message : String(error) };
+      return [];
+    }
+  };
+  const [takerRows, longShortRows, fundingRows, markRows, indexRows, liquidationRows, bookRows] = await Promise.all([
+    load("okxTakerVolume", `https://www.okx.com/api/v5/rubik/stat/taker-volume-contract?instId=${instId}&period=5m&unit=1`),
+    load("okxLongShortRatio", `https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=${currency}&period=5m`),
+    load("okxFundingHistory", `https://www.okx.com/api/v5/public/funding-rate-history?instId=${instId}&limit=20`),
+    load("okxMarkPrice", `https://www.okx.com/api/v5/public/mark-price?instType=SWAP&instId=${instId}`),
+    load("okxIndexPrice", `https://www.okx.com/api/v5/market/index-tickers?instId=${instFamily}`),
+    load("okxLiquidations", `https://www.okx.com/api/v5/public/liquidation-orders?instType=SWAP&instFamily=${instFamily}&state=filled&limit=20`),
+    load("okxDepth20", `https://www.okx.com/api/v5/market/books?instId=${instId}&sz=20`)
+  ]);
+
+  const takerRow = takerRows[0] || [];
+  const sellVolume = safeNumber(takerRow[1]);
+  const buyVolume = safeNumber(takerRow[2]);
+  const takerImbalance = buyVolume + sellVolume > 0
+    ? (buyVolume - sellVolume) / (buyVolume + sellVolume)
+    : null;
+  const longShortRatio = safeNumber(longShortRows[0]?.[1], NaN);
+  const longShortContrarian = Number.isFinite(longShortRatio) && longShortRatio > 0
+    ? clamp(-(longShortRatio - 1) / (longShortRatio + 1), -1, 1)
+    : null;
+  const fundingRates = fundingRows
+    .map((item) => safeNumber(item?.fundingRate, NaN))
+    .filter(Number.isFinite);
+  const fundingMean = mean(fundingRates);
+  const fundingStd = std(fundingRates);
+  const fundingZScore = fundingRates.length >= 5 && fundingStd > 0
+    ? (fundingRates[0] - fundingMean) / fundingStd
+    : null;
+  const markPrice = safeNumber(markRows[0]?.markPx, NaN);
+  const indexPrice = safeNumber(indexRows[0]?.idxPx, NaN);
+  const perpetualBasis = Number.isFinite(markPrice) && Number.isFinite(indexPrice) && indexPrice > 0
+    ? markPrice / indexPrice - 1
+    : null;
+  const basisHistory = factorBasisHistory.get(symbol) || [];
+  if (perpetualBasis != null) basisHistory.push(perpetualBasis);
+  factorBasisHistory.set(symbol, basisHistory.slice(-60));
+  const basisVolatility = basisHistory.length >= 5 ? std(basisHistory) : null;
+
+  let longLiquidationQuote = 0;
+  let shortLiquidationQuote = 0;
+  for (const group of liquidationRows) {
+    for (const item of Array.isArray(group?.details) ? group.details : []) {
+      const quote = safeNumber(item?.bkPx) * safeNumber(item?.sz);
+      if (item?.posSide === "long") longLiquidationQuote += quote;
+      if (item?.posSide === "short") shortLiquidationQuote += quote;
+    }
+  }
+  const liquidationTotal = longLiquidationQuote + shortLiquidationQuote;
+  const liquidationImbalance = liquidationTotal > 0
+    ? (shortLiquidationQuote - longLiquidationQuote) / liquidationTotal
+    : null;
+
+  const depth = bookRows[0] || {};
+  const bidDepth = (Array.isArray(depth.bids) ? depth.bids : []).reduce(
+    (sum, level) => sum + safeNumber(level?.[0]) * safeNumber(level?.[1]),
+    0
+  );
+  const askDepth = (Array.isArray(depth.asks) ? depth.asks : []).reduce(
+    (sum, level) => sum + safeNumber(level?.[0]) * safeNumber(level?.[1]),
+    0
+  );
+  const depthImbalanceL20 = bidDepth + askDepth > 0 ? (bidDepth - askDepth) / (bidDepth + askDepth) : null;
+
+  return {
+    fetchedAt: updatedAt,
+    takerImbalance,
+    longShortRatio: Number.isFinite(longShortRatio) ? longShortRatio : null,
+    longShortContrarian,
+    fundingZScore,
+    perpetualBasis,
+    basisVolatility,
+    liquidationImbalance,
+    depthImbalanceL20,
+    sources
+  };
+}
+
+function normalizeText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeSourceTimestamp(value) {
+  if (value == null || value === "") return null;
+  if (typeof value === "number" || /^\d+$/.test(String(value).trim())) {
+    const numeric = Number(value);
+    const milliseconds = numeric > 0 && numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+    const parsed = new Date(milliseconds);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+  const compact = String(value).trim().match(/^(\d{4})(\d{2})(\d{2})T?(\d{2})(\d{2})(\d{2})Z?$/i);
+  if (compact) {
+    const [, year, month, day, hour, minute, second] = compact;
+    return new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`).toISOString();
+  }
+  const parsed = new Date(String(value));
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function flattenArticleLikeObjects(value, source, maxItems = 30) {
+  const items = [];
+  const seen = new Set();
+
+  function visit(node) {
+    if (!node || items.length >= maxItems) return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    if (typeof node !== "object") return;
+
+    const maybeTitle = node.title || node.name || node.question || node.heading;
+    if (typeof maybeTitle === "string" && maybeTitle.trim().length > 5) {
+      const text = normalizeText(
+        [
+          maybeTitle,
+          node.subtitle,
+          node.summary,
+          node.description,
+          node.slug,
+          node.publishedDate,
+          node.createTime,
+          node.date
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      const url = node.url || node.link || node.articleUrl || node.shareLink || node.sourceUrl || "";
+      const key = `${source}:${text}:${url}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        items.push({
+          source,
+          title: normalizeText(maybeTitle),
+          text,
+          url: typeof url === "string" ? url : "",
+          occurredAt: normalizeSourceTimestamp(
+            node.publishedDate || node.publishedAt || node.createTime || node.releaseDate || node.updatedAt || node.date
+          ),
+          raw: node
+        });
+      }
+    }
+
+    for (const nested of Object.values(node)) {
+      if (typeof nested === "object") visit(nested);
+    }
+  }
+
+  visit(value);
+  return items;
+}
+
+async function fetchGdeltNews() {
+  const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(
+    CRYPTO_QUERY
+  )}&mode=ArtList&format=json&maxrecords=25&sort=hybridrel`;
+  const data = await fetchJson(url);
+  const articles = Array.isArray(data?.articles) ? data.articles : [];
+  return articles.map((article) => ({
+    source: "GDELT",
+    title: normalizeText(article.title),
+    text: normalizeText([article.title, article.seendate, article.domain].filter(Boolean).join(" ")),
+    url: article.url || "",
+    occurredAt: normalizeSourceTimestamp(article.seendate),
+    raw: article
+  }));
+}
+
+async function fetchPolymarketMarkets(state) {
+  const url =
+    "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=10";
+  const data = await fetchJson(url, { timeoutMs: Math.max(20_000, REQUEST_TIMEOUT_MS) });
+  const rows = Array.isArray(data)
+    ? [...data]
+        .sort(
+          (left, right) =>
+            safeNumber(right?.volume24hr, safeNumber(right?.volume)) -
+            safeNumber(left?.volume24hr, safeNumber(left?.volume))
+        )
+        .flatMap((event) => (Array.isArray(event?.markets) ? event.markets : []))
+    : [];
+  const discovered = rows.slice(0, 30);
+  const discoveredIds = new Set(
+    discovered.map((market) => String(market.id || market.conditionId || market.slug || market.question))
+  );
+  const trackedIds = Object.entries(state.polymarket || {})
+    .filter(([id, record]) => id && record?.closed !== true && record?.status !== "closed" && !discoveredIds.has(id))
+    .map(([id]) => id);
+  const trackedRows = await mapWithConcurrency(trackedIds, 6, async (id) => {
+    try {
+      const market = await fetchJson(`https://gamma-api.polymarket.com/markets/${encodeURIComponent(id)}`, {
+        timeoutMs: 8_000
+      });
+      return market && typeof market === "object" && !Array.isArray(market) ? market : null;
+    } catch {
+      return null;
+    }
+  });
+  const combined = new Map();
+  for (const market of [...discovered, ...trackedRows.filter(Boolean)]) {
+    const id = String(market.id || market.conditionId || market.slug || market.question || "");
+    if (id) combined.set(id, market);
+  }
+  const receivedAt = new Date().toISOString();
+
+  return [...combined.values()].map((market) => {
+      const marketId = String(market.id || market.conditionId || market.slug || market.question);
+      const previous = state.polymarket?.[marketId] || {};
+      const prices = parseMaybeJsonArray(market.outcomePrices);
+      const yesPrice = prices.length ? safeNumber(prices[0], null) : safeNumber(market.lastTradePrice, null);
+      const previousYesPrice = previous.yesPrice ?? null;
+      const priceDelta =
+        typeof yesPrice === "number" && typeof previousYesPrice === "number" ? yesPrice - previousYesPrice : 0;
+      const sentiment = buildPolymarketPriceSentiment(market, previous);
+      const binary = extractBinaryMarketProbabilities(market);
+      const volume = safeNumber(market.volume, safeNumber(market.volume24hr));
+      const liquidity = safeNumber(market.liquidity);
+      const outcomeProbabilities = binary?.probabilities || [];
+      const outcomeLabels = binary?.labels || [];
+      return {
+        source: "Polymarket",
+        type: "prediction",
+        provider: "Polymarket",
+        id: marketId,
+        title: normalizeText(market.question || market.title || market.slug),
+        text: normalizeText(
+          [
+            market.question,
+            market.title,
+            market.slug,
+            `volume=${market.volume || market.volume24hr || ""}`,
+            `liquidity=${market.liquidity || ""}`,
+            `yes=${yesPrice ?? ""}`,
+            `delta=${priceDelta.toFixed(4)}`,
+            sentiment ? `bull=${sentiment.bullProbability.toFixed(4)}` : "",
+            sentiment ? `bear=${sentiment.bearProbability.toFixed(4)}` : "",
+            Number.isFinite(sentiment?.bullBearRatio) ? `bullBearRatio=${sentiment.bullBearRatio.toFixed(4)}` : "",
+            sentiment ? `bullDelta=${sentiment.bullProbabilityDelta.toFixed(4)}` : ""
+          ].join(" ")
+        ),
+        url: market.slug ? `https://polymarket.com/market/${market.slug}` : "",
+        receivedAt,
+        yesPrice,
+        priceDelta,
+        yesProbability: sentiment?.yesProbability ?? null,
+        noProbability: sentiment?.noProbability ?? null,
+        outcomeLabels,
+        outcomeProbabilities,
+        outcomeRatio: binary?.ratio ?? null,
+        volume,
+        liquidity,
+        volumeDelta: Number.isFinite(Number(previous.volume)) ? volume - Number(previous.volume) : 0,
+        liquidityDelta: Number.isFinite(Number(previous.liquidity)) ? liquidity - Number(previous.liquidity) : 0,
+        symbol: sentiment?.symbol || null,
+        isPricePrediction: Boolean(sentiment),
+        yesProbability: sentiment?.yesProbability ?? null,
+        noProbability: sentiment?.noProbability ?? null,
+        bullProbability: sentiment?.bullProbability ?? null,
+        bearProbability: sentiment?.bearProbability ?? null,
+        bullBearRatio: sentiment?.bullBearRatio ?? null,
+        bullProbabilityDelta: sentiment?.bullProbabilityDelta ?? null,
+        sentimentDirection: sentiment?.direction ?? null,
+        sentimentImpact: sentiment?.sentimentImpact ?? null,
+        monitoringStatus: market.closed === true ? "closed" : "tracking",
+        monitoringStartedAt: previous.firstSeenAt || receivedAt,
+        monitoringObservations: Math.max(0, safeNumber(previous.observations)) + 1,
+        marketActive: market.active !== false,
+        marketClosed: market.closed === true,
+        marketEndDate: normalizeSourceTimestamp(market.endDate),
+        marketSlug: market.slug || null,
+        metrics: sentiment
+          ? {
+              symbol: sentiment.symbol,
+              orientation: sentiment.orientation,
+              yesProbability: roundNumber(sentiment.yesProbability),
+              noProbability: roundNumber(sentiment.noProbability),
+              bullProbability: roundNumber(sentiment.bullProbability),
+              bearProbability: roundNumber(sentiment.bearProbability),
+              bullBearRatio: roundNumber(sentiment.bullBearRatio),
+              bullProbabilityDelta: roundNumber(sentiment.bullProbabilityDelta),
+              volume: roundNumber(volume),
+              liquidity: roundNumber(liquidity),
+              volumeDelta: roundNumber(Number.isFinite(Number(previous.volume)) ? volume - Number(previous.volume) : 0),
+              liquidityDelta: roundNumber(
+                Number.isFinite(Number(previous.liquidity)) ? liquidity - Number(previous.liquidity) : 0
+              ),
+              monitoringStatus: market.closed === true ? "closed" : "tracking",
+              monitoringObservations: Math.max(0, safeNumber(previous.observations)) + 1,
+              monitoringStartedAt: previous.firstSeenAt || receivedAt,
+              marketEndDate: normalizeSourceTimestamp(market.endDate)
+            }
+          : {
+              outcomeLabels,
+              outcomeProbabilities: outcomeProbabilities.map((value) => roundNumber(value)),
+              outcomeRatio: roundNumber(binary?.ratio),
+              volume: roundNumber(volume),
+              liquidity: roundNumber(liquidity),
+              volumeDelta: roundNumber(Number.isFinite(Number(previous.volume)) ? volume - Number(previous.volume) : 0),
+              liquidityDelta: roundNumber(
+                Number.isFinite(Number(previous.liquidity)) ? liquidity - Number(previous.liquidity) : 0
+              ),
+              monitoringStatus: market.closed === true ? "closed" : "tracking",
+              monitoringObservations: Math.max(0, safeNumber(previous.observations)) + 1,
+              monitoringStartedAt: previous.firstSeenAt || receivedAt,
+              marketEndDate: normalizeSourceTimestamp(market.endDate)
+            },
+        raw: market
+      };
+    });
+}
+
+function parseMaybeJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function fetchBinanceAnnouncements() {
+  const endpoints = [
+    "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId=48&pageNo=1&pageSize=20",
+    "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=30"
+  ];
+  const items = [];
+  for (const endpoint of endpoints) {
+    try {
+      const data = await fetchJson(endpoint);
+      items.push(...flattenArticleLikeObjects(data, "Binance"));
+      if (items.length) break;
+    } catch {
+      // Try next endpoint.
+    }
+  }
+  return items.filter((item) => !isRoutineExchangeProductAnnouncement(item)).slice(0, 30);
+}
+
+async function fetchOkxAnnouncements() {
+  const endpoints = [
+    "https://www.okx.com/help/hc/api/internal/recentlyPublished?locale=en_US&category=announcements&page=1&limit=20",
+    "https://www.okx.com/help/hc/api/internal/recentlyPublished?locale=zh_CN&category=announcements&page=1&limit=20"
+  ];
+  const items = [];
+  for (const endpoint of endpoints) {
+    try {
+      const data = await fetchJson(endpoint);
+      items.push(...flattenArticleLikeObjects(data, "OKX"));
+      if (items.length) break;
+    } catch {
+      // Try next endpoint.
+    }
+  }
+  return items.filter((item) => !isRoutineExchangeProductAnnouncement(item)).slice(0, 30);
+}
+
+function deduplicateMessageItems(items) {
+  const seenUrls = new Set();
+  const seenTitles = new Set();
+  return items.filter((item) => {
+    const sourceKey = normalizeText(item.source || item.provider).toLocaleLowerCase();
+    const url = normalizeText(item.url).toLocaleLowerCase();
+    const title = normalizeText(item.title).toLocaleLowerCase();
+    const urlKey = url ? `${sourceKey}:${url}` : "";
+    const titleKey = title ? `${sourceKey}:${title}` : "";
+    if ((!urlKey && !titleKey) || (urlKey && seenUrls.has(urlKey)) || (titleKey && seenTitles.has(titleKey))) return false;
+    if (urlKey) seenUrls.add(urlKey);
+    if (titleKey) seenTitles.add(titleKey);
+    return true;
+  });
+}
+
+async function fetchMessageAggregator() {
+  const config = readMessageAggregatorConfig();
+  const configured = config.rssFeeds.length + config.trendSources.length > 0;
+  if (!config.enabled || !configured || config.configurationError) {
+    const error = config.configurationError || null;
+    writeMessageAggregatorStatus({
+      configured,
+      enabled: config.enabled,
+      connected: false,
+      degraded: false,
+      messageCount: 0,
+      checkedAt: new Date().toISOString(),
+      sources: [],
+      errorCode: error ? "invalid_configuration" : null,
+      error
+    });
+    return { items: [], sourceFailures: error ? [`消息聚合器：${error}`] : [] };
+  }
+
+  const jobs = [
+    ...config.rssFeeds.map((feed) => ({
+      type: "rss",
+      name: feed.name,
+      url: feed.url,
+      run: async () => parseRssXml(await fetchText(feed.url), feed, config)
+    })),
+    ...config.trendSources.map((source) => ({
+      type: "trend",
+      name: source.name,
+      url: source.url,
+      run: async () => {
+        const payload = await fetchJson(source.url, {
+          timeoutMs: 8_000,
+          headers: {
+            Referer: "https://newsnow.busiyi.world/",
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+          }
+        });
+        return parseNewsNowPayload(payload, source, config);
+      }
+    }))
+  ];
+  const settled = await Promise.allSettled(
+    jobs.map(async (job) => {
+      const startedAt = Date.now();
+      const rows = await job.run();
+      const fetchLatencyMs = Date.now() - startedAt;
+      return {
+        fetchLatencyMs,
+        rows: rows.map((item) => ({
+          ...item,
+          metrics: { ...(item.metrics || {}), fetchLatencyMs }
+        }))
+      };
+    })
+  );
+  const items = [];
+  const sources = [];
+  const sourceFailures = [];
+  settled.forEach((result, index) => {
+    const job = jobs[index];
+    if (result.status === "fulfilled") {
+      items.push(...result.value.rows);
+      sources.push({
+        type: job.type,
+        name: job.name,
+        url: job.url,
+        connected: true,
+        messageCount: result.value.rows.length,
+        latencyMs: result.value.fetchLatencyMs,
+        error: null
+      });
+      return;
+    }
+    const error = localizeErrorMessage(result.reason instanceof Error ? result.reason.message : String(result.reason));
+    sources.push({ type: job.type, name: job.name, url: job.url, connected: false, messageCount: 0, latencyMs: null, error });
+    sourceFailures.push(`消息聚合器 ${job.name}：${error}`);
+  });
+  const deduplicatedItems = deduplicateMessageItems(items);
+  const connectedCount = sources.filter((source) => source.connected).length;
+  writeMessageAggregatorStatus({
+    configured: true,
+    enabled: true,
+    connected: connectedCount > 0,
+    degraded: connectedCount > 0 && connectedCount < sources.length,
+    messageCount: deduplicatedItems.length,
+    checkedAt: new Date().toISOString(),
+    sources,
+    errorCode: connectedCount ? null : "all_sources_failed",
+    error: connectedCount ? null : "所有已配置聚合源均连接失败。"
+  });
+  return { items: deduplicatedItems, sourceFailures };
+}
+
+async function fetchWhaleAlertIfConfigured() {
+  const apiKey = readWhaleAlertApiKey();
+  if (!WHALE_ALERT_ENABLED || !apiKey) {
+    writeWhaleAlertStatus({
+      configured: Boolean(apiKey),
+      connected: false,
+      messageCount: 0,
+      errorCode: WHALE_ALERT_ENABLED ? "not_configured" : "disabled",
+      error: WHALE_ALERT_ENABLED ? "未配置 Whale Alert API Key。" : "Whale Alert 已由聚合消息源替代。"
+    });
+    return {
+      items: [],
+      warning: null
+    };
+  }
+  try {
+    const start = Math.floor((Date.now() - 60 * 60 * 1000) / 1000);
+    const url = `https://api.whale-alert.io/v1/transactions?api_key=${encodeURIComponent(
+      apiKey
+    )}&min_value=5000000&start=${start}`;
+    const data = await fetchJson(url);
+    if (data?.result && data.result !== "success") {
+      throw new Error(String(data?.message || data?.result));
+    }
+    if (!Array.isArray(data?.transactions)) {
+      throw new Error("Whale Alert response does not contain a transactions array");
+    }
+    const transactions = data.transactions;
+    writeWhaleAlertStatus({
+      configured: true,
+      connected: true,
+      messageCount: transactions.length,
+      checkedAt: new Date().toISOString(),
+      errorCode: null,
+      error: null
+    });
+    return {
+      items: transactions.slice(0, 30).map((tx) => ({
+        source: "WhaleAlert",
+        title: `${tx.symbol || tx.blockchain || "crypto"} whale transfer ${tx.amount_usd || ""} USD`,
+        text: normalizeText(JSON.stringify(tx).slice(0, 500)),
+        url: tx.transaction?.hash ? String(tx.transaction.hash) : "",
+        occurredAt: normalizeSourceTimestamp(tx.timestamp),
+        raw: tx
+      })),
+      warning: null
+    };
+  } catch (error) {
+    writeWhaleAlertStatus({
+      configured: true,
+      connected: false,
+      messageCount: 0,
+      checkedAt: new Date().toISOString(),
+      errorCode: "request_failed",
+      error: localizeErrorMessage(error instanceof Error ? error.message : String(error))
+    });
+    throw error;
+  }
+}
+
+function classifyEvent(item) {
+  const text = `${item.title || ""} ${item.text || ""}`.toUpperCase();
+  const bullTerms = [
+    "APPROVE",
+    "APPROVAL",
+    "ETF INFLOW",
+    "INFLOW",
+    "LISTING",
+    "RATE CUT",
+    "DOVISH",
+    "ADOPTION",
+    "BUY",
+    "ACCUMULATION",
+    "RESERVE",
+    "PARTNERSHIP",
+    "LAUNCH",
+    "REOPEN",
+    "批准",
+    "通过",
+    "流入",
+    "上线",
+    "降息",
+    "采用",
+    "增持",
+    "储备",
+    "合作",
+    "推出"
+  ];
+  const bearTerms = [
+    "HACK",
+    "EXPLOIT",
+    "LAWSUIT",
+    "BAN",
+    "REJECT",
+    "REJECTION",
+    "DELIST",
+    "OUTFLOW",
+    "RATE HIKE",
+    "HAWKISH",
+    "DEPEG",
+    "INSOLV",
+    "BANKRUPT",
+    "FREEZE",
+    "OUTAGE",
+    "SELL",
+    "SEC CHARG",
+    "黑客",
+    "攻击",
+    "漏洞",
+    "诉讼",
+    "禁止",
+    "拒绝",
+    "下架",
+    "流出",
+    "加息",
+    "脱锚",
+    "破产",
+    "冻结",
+    "宕机",
+    "制裁"
+  ];
+  const highImpactTerms = [
+    "ETF",
+    "SEC",
+    "FED",
+    "FOMC",
+    "CPI",
+    "PCE",
+    "RATE",
+    "BINANCE",
+    "OKX",
+    "TETHER",
+    "USDT",
+    "USDC",
+    "STABLECOIN",
+    "HACK",
+    "EXPLOIT",
+    "DELIST",
+    "APPROVAL",
+    "REJECTION",
+    "POLYMARKET",
+    "LIQUIDATION",
+    "比特币",
+    "以太坊",
+    "加密货币",
+    "稳定币",
+    "美联储",
+    "央行",
+    "利率",
+    "降息",
+    "加息",
+    "通胀",
+    "关税",
+    "制裁",
+    "战争",
+    "冲突",
+    "监管",
+    "黑客",
+    "攻击",
+    "下架",
+    "批准",
+    "拒绝"
+  ];
+
+  const bull = bullTerms.filter((term) => text.includes(term)).length;
+  const bear = bearTerms.filter((term) => text.includes(term)).length;
+  const highImpact = highImpactTerms.filter((term) => text.includes(term)).length;
+  const sourceTier = Number(item.sourceTier) || inferSourceTier(item);
+  const sourceWeight =
+    Number(item.sourceQualityWeight) ||
+    (item.source === "Polymarket"
+      ? 1.05
+      : item.source === "WhaleAlert"
+        ? 1.1
+        : sourceWeightForTier(sourceTier));
+  const corroborationCount = Math.max(1, safeNumber(item.corroborationCount, 1));
+  const corroborationMultiplier = Math.min(1.24, 1 + (corroborationCount - 1) * 0.08);
+  const trendScore = clamp(safeNumber(item.trendScore), 0, 1);
+  const freshness = analyzeEventFreshness(item);
+
+  const matchedSymbols = SYMBOLS.filter((symbol) => {
+    const aliases = SYMBOL_ALIASES[symbol] || [symbol.replace("USDT", "")];
+    return aliases.some((alias) => new RegExp(`(^|[^A-Z0-9])${escapeRegExp(alias)}([^A-Z0-9]|$)`).test(text));
+  });
+
+  const marketWide =
+    /CRYPTO|CRYPTOCURRENCY|BITCOIN|BTC|ETHEREUM|ETH|BINANCE|OKX|STABLECOIN|USDT|USDC|ETF|FED|FOMC|CPI|PCE|比特币|以太坊|加密货币|数字货币|虚拟货币|稳定币|美联储|央行|利率|降息|加息|通胀|关税|制裁|战争|冲突/.test(
+      text
+    );
+  const directionRaw = bull - bear;
+  const direction = item.source === "Polymarket"
+    ? Number.isFinite(item.sentimentDirection)
+      ? item.sentimentDirection
+      : 0
+    : directionRaw > 0
+      ? 1
+      : directionRaw < 0
+        ? -1
+        : 0;
+  const termImpactScore = clamp(
+    (18 + highImpact * 12 + Math.abs(directionRaw) * 10) * sourceWeight * corroborationMultiplier +
+      trendScore * 10,
+    0,
+    100
+  );
+  const rawImpactScore = Math.max(termImpactScore, safeNumber(item.sentimentImpact));
+  const impactScore = clamp(rawImpactScore * freshness.freshnessWeight, 0, 100);
+
+  return {
+    ...item,
+    matchedSymbols,
+    marketWide,
+    direction,
+    rawImpactScore,
+    impactScore,
+    freshness,
+    reasons: {
+      bullTerms: bull,
+      bearTerms: bear,
+      highImpactTerms: highImpact,
+      sourceTier,
+      sourceWeight,
+      corroborationCount,
+      corroborationMultiplier,
+      trendScore,
+      freshnessLevel: freshness.level,
+      freshnessWeight: freshness.freshnessWeight,
+      ageMinutes: freshness.ageMinutes,
+      predictionSentiment: Boolean(item.isPricePrediction)
+    }
+  };
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function aggregateEventsBySymbol(classifiedEvents) {
+  const result = Object.fromEntries(
+    SYMBOLS.map((symbol) => [symbol, { score: 0, directionScore: 0, eventCount: 0, events: [] }])
+  );
+
+  for (const event of classifiedEvents) {
+    const targetSymbols = event.matchedSymbols.length
+      ? event.matchedSymbols
+      : event.marketWide
+        ? SYMBOLS.slice(0, 6)
+        : [];
+    for (const symbol of targetSymbols) {
+      if (!result[symbol]) continue;
+      const relevance = event.matchedSymbols.includes(symbol) ? 1 : 0.45;
+      result[symbol].score += event.impactScore * relevance;
+      result[symbol].directionScore += event.direction * event.impactScore * relevance;
+      result[symbol].eventCount += relevance;
+      result[symbol].events.push(event);
+    }
+  }
+
+  for (const value of Object.values(result)) {
+    value.score = clamp(value.score, 0, 100);
+    value.eventCount = roundNumber(value.eventCount, 3);
+    value.direction = value.score > 0 ? clamp(value.directionScore / Math.max(value.score, 1), -1, 1) : 0;
+    value.events = value.events
+      .sort((a, b) => b.impactScore - a.impactScore)
+      .slice(0, 5)
+      .map((event) => ({
+        source: event.source,
+        title: event.title,
+        url: event.url,
+        direction: event.direction,
+        impactScore: Math.round(event.impactScore)
+      }));
+  }
+
+  return result;
+}
+
+function analyzeMarket(
+  symbol,
+  candles15m,
+  candles1h,
+  fundingRate,
+  openInterest,
+  previousOpenInterest,
+  microstructureSnapshot,
+  directionWeightsValue = DIRECTION_MODEL_WEIGHTS
+) {
+  const directionWeights = normalizeDirectionWeights(directionWeightsValue, DIRECTION_MODEL_WEIGHTS);
+  const closes15m = candles15m.map((candle) => candle.close);
+  const closes1h = candles1h.map((candle) => candle.close);
+  const latest = closes15m.at(-1) || closes1h.at(-1) || 0;
+  const atrValue = atr(candles15m);
+  const atrPct = latest > 0 ? atrValue / latest : 0;
+  const ema20 = ema(closes15m.slice(-80), 20);
+  const ema50 = ema(closes15m.slice(-120), 50);
+  const ema1h20 = ema(closes1h.slice(-80), 20);
+  const ema1h50 = ema(closes1h.slice(-120), 50);
+  const returns = calculateLogReturns(closes15m);
+
+  const realizedVol = std(returns.slice(-48)) * Math.sqrt(96);
+  const shortVol = std(returns.slice(-12)) * Math.sqrt(96);
+  const volatilityExpansion = realizedVol > 0 ? shortVol / realizedVol : 1;
+  const roc15m = closes15m.length >= 5 ? latest / closes15m.at(-5) - 1 : 0;
+  const roc1h = closes1h.length >= 5 ? latest / closes1h.at(-5) - 1 : 0;
+  const rsi14 = rsi(closes15m);
+  const closedVolumes15m = candles15m.slice(0, -1).map((candle) => safeNumber(candle.volume)).filter((value) => value > 0);
+  const latestClosedVolume15m = closedVolumes15m.at(-1) || 0;
+  const averageVolume15m = mean(closedVolumes15m.slice(-21, -1));
+  const volumeExpansion = averageVolume15m > 0
+    ? clamp(latestClosedVolume15m / averageVolume15m, 0, 5)
+    : 1;
+  const closedRoc15m = closes15m.length >= 6 ? closes15m.at(-2) / closes15m.at(-6) - 1 : roc15m;
+  const volumeSignal = clamp(Math.sign(closedRoc15m) * (volumeExpansion - 1) / 2, -0.35, 0.35);
+  const orderFlowAvailable = microstructureSnapshot?.available === true;
+  const orderFlowSignal = orderFlowAvailable
+    ? clamp(safeNumber(microstructureSnapshot.signal), -1, 1)
+    : 0;
+  const effectiveDirectionWeights = { ...directionWeights };
+  if (!orderFlowAvailable && effectiveDirectionWeights.orderFlow > 0) {
+    const activeWeight = 1 - effectiveDirectionWeights.orderFlow;
+    for (const key of Object.keys(effectiveDirectionWeights)) {
+      effectiveDirectionWeights[key] = key === "orderFlow"
+        ? 0
+        : effectiveDirectionWeights[key] / activeWeight;
+    }
+  }
+  const oiChange =
+    previousOpenInterest && previousOpenInterest.value > 0
+      ? openInterest / previousOpenInterest.value - 1
+      : 0;
+
+  const trendSignal = clamp(((ema20 - ema50) / Math.max(latest * Math.max(atrPct, 0.004), 1e-9)) * 0.5, -1, 1);
+  const htfTrendSignal = clamp(((ema1h20 - ema1h50) / Math.max(latest * Math.max(atrPct, 0.004), 1e-9)) * 0.35, -1, 1);
+  const momentumSignal = clamp((roc15m + roc1h * 0.8) / Math.max(atrPct * 3, 0.006), -1, 1);
+  const rsiSignal = rsi14 > 72 ? -0.35 : rsi14 < 28 ? 0.35 : 0;
+  const fundingSignal = clamp(-fundingRate / 0.001, -0.4, 0.4);
+  const oiSignal = clamp(oiChange / 0.06, -0.35, 0.35);
+  const volatilityRegimeScore = volatilityExpansion > 1.6 ? -0.15 : volatilityExpansion < 0.65 ? -0.05 : 0.1;
+  const gbm = analyzeGeometricBrownianMotion(returns);
+  const garch = estimateGarch11(returns);
+  const hiddenMarkov = analyzeHiddenMarkovRegime(returns);
+  const directionalSignal = clamp(
+    trendSignal * effectiveDirectionWeights.trend +
+      htfTrendSignal * effectiveDirectionWeights.higherTimeframeTrend +
+      momentumSignal * effectiveDirectionWeights.momentum +
+      rsiSignal * effectiveDirectionWeights.rsi +
+      volumeSignal * effectiveDirectionWeights.volume +
+      fundingSignal * effectiveDirectionWeights.funding +
+      oiSignal * effectiveDirectionWeights.openInterest +
+      orderFlowSignal * effectiveDirectionWeights.orderFlow +
+      gbm.signal * effectiveDirectionWeights.geometricBrownianMotion +
+      hiddenMarkov.signal * effectiveDirectionWeights.hiddenMarkovModel,
+    -1,
+    1
+  );
+  const mathSignal = clamp(directionalSignal * garch.confidenceMultiplier, -1, 1);
+  const regime =
+    hiddenMarkov.confidence >= 0.55
+      ? `hmm_${hiddenMarkov.regime}`
+      : Math.abs(trendSignal + htfTrendSignal) > 0.8
+      ? "trend"
+      : volatilityExpansion > 1.6
+        ? "high_volatility"
+        : Math.abs(momentumSignal) < 0.25
+          ? "range"
+          : "transition";
+
+  return {
+    symbol,
+    latest,
+    atrPct,
+    realizedVol,
+    shortVol,
+    volatilityExpansion,
+    fundingRate,
+    openInterest,
+    oiChange,
+    rsi14,
+    trendSignal,
+    htfTrendSignal,
+    momentumSignal,
+    volumeSignal,
+    volumeExpansion,
+    fundingSignal,
+    oiSignal,
+    orderFlowSignal,
+    orderFlowAvailable,
+    microstructure: microstructureSnapshot || null,
+    volatilityRegimeScore,
+    gbm,
+    garch,
+    hiddenMarkov,
+    directionalSignal,
+    mathSignal,
+    regime,
+    returns15m: returns.slice(-96),
+    mathBreakdown: {
+      formula:
+        "directionalSignal = sum(price/volume/funding/OI/orderFlow/modelFactor*currentReviewWeight); stale order flow is excluded and remaining weights are renormalized; mathSignal = directionalSignal*(0.65 + 0.35*GARCH_stability)",
+      decisionWeights: {
+        ...effectiveDirectionWeights,
+        garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
+        markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT
+      },
+      inputs: {
+        latest,
+        ema20,
+        ema50,
+        ema1h20,
+        ema1h50,
+        atrPct,
+        roc15m,
+        roc1h,
+        rsi14,
+        latestClosedVolume15m,
+        averageVolume15m,
+        volumeExpansion,
+        closedRoc15m,
+        fundingRate,
+        openInterest,
+        oiChange,
+        orderFlowAvailable,
+        orderFlowSignal,
+        tradeImbalance5s: safeNumber(microstructureSnapshot?.flow5s?.imbalance),
+        tradeImbalance30s: safeNumber(microstructureSnapshot?.flow30s?.imbalance),
+        cumulativeVolumeDelta30s: safeNumber(microstructureSnapshot?.cumulativeVolumeDelta30s),
+        volumeRateRatio: safeNumber(microstructureSnapshot?.volumeRateRatio),
+        orderFlowTradeConfidence: safeNumber(microstructureSnapshot?.tradeConfidence),
+        orderBookImbalance: safeNumber(microstructureSnapshot?.orderBookImbalance),
+        bookFlowImbalance5s: safeNumber(microstructureSnapshot?.bookFlow5s?.imbalance),
+        bookFlowImbalance30s: safeNumber(microstructureSnapshot?.bookFlow30s?.imbalance),
+        bookFlowConfidence: safeNumber(microstructureSnapshot?.bookFlowConfidence),
+        spreadBps: safeNumber(microstructureSnapshot?.spreadBps),
+        bidDepthQuote: safeNumber(microstructureSnapshot?.bidDepthQuote),
+        askDepthQuote: safeNumber(microstructureSnapshot?.askDepthQuote),
+        microPriceBiasBps: safeNumber(microstructureSnapshot?.microPriceBiasBps),
+        realizedVol,
+        shortVol,
+        volatilityExpansion
+      },
+      components: {
+        trendSignal,
+        htfTrendSignal,
+        momentumSignal,
+        rsiSignal,
+        volumeSignal,
+        fundingSignal,
+        oiSignal,
+        orderFlowSignal,
+        volatilityRegimeScore,
+        gbmSignal: gbm.signal,
+        garchStabilityScore: garch.stabilityScore,
+        hiddenMarkovSignal: hiddenMarkov.signal,
+        directionalSignal
+      },
+      weightedTerms: {
+        trend: trendSignal * effectiveDirectionWeights.trend,
+        htfTrend: htfTrendSignal * effectiveDirectionWeights.higherTimeframeTrend,
+        momentum: momentumSignal * effectiveDirectionWeights.momentum,
+        rsi: rsiSignal * effectiveDirectionWeights.rsi,
+        volume: volumeSignal * effectiveDirectionWeights.volume,
+        funding: fundingSignal * effectiveDirectionWeights.funding,
+        openInterest: oiSignal * effectiveDirectionWeights.openInterest,
+        orderFlow: orderFlowSignal * effectiveDirectionWeights.orderFlow,
+        geometricBrownianMotion: gbm.signal * effectiveDirectionWeights.geometricBrownianMotion,
+        hiddenMarkovModel: hiddenMarkov.signal * effectiveDirectionWeights.hiddenMarkovModel
+      },
+      models: { gbm, garch, hiddenMarkov },
+      result: mathSignal,
+      regimeRule:
+        "Prefer HMM bull/bear/range when posterior confidence >= 55%; otherwise fall back to trend/high-volatility/range/transition rules."
+    }
+  };
+}
+
+function buildCandidate(
+  market,
+  eventAggregate,
+  modelWeights,
+  accountConfig,
+  weightVersion = 1,
+  calibration = {},
+  tradingRulesBySymbol = {},
+  sessionContext = null
+) {
+  if (!market.latest || !Number.isFinite(market.latest)) return null;
+
+  const normalizedAccountConfig = normalizeAccountConfig(accountConfig);
+  const sessionPolicy = sessionContext?.policy || null;
+  const eventScoreNorm = clamp(eventAggregate.score / 100, 0, 1);
+  const hasEventContext = eventAggregate.score > 0 && Array.isArray(eventAggregate.events) && eventAggregate.events.length > 0;
+  const highImpactEvent = hasEventContext && eventAggregate.score >= 70 && Math.abs(eventAggregate.direction) >= 0.2;
+  const eventDirection = eventAggregate.direction;
+  const mathDirection = market.mathSignal;
+  const candidateMode = hasEventContext ? (highImpactEvent ? "event_impact" : "event_math") : "math_only";
+  const eventWeight = hasEventContext ? (highImpactEvent ? 0.62 : eventScoreNorm > 0.25 ? 0.42 : 0.18) : 0;
+  const mathWeight = 1 - eventWeight;
+  const combinedDirection = clamp(eventDirection * eventWeight + mathDirection * mathWeight, -1, 1);
+  if (Math.abs(combinedDirection) < MIN_COMBINED_DIRECTION) return null;
+
+  const side = combinedDirection > 0 ? "long" : "short";
+  const alignment =
+    eventScoreNorm > 0
+      ? Math.sign(eventDirection || combinedDirection) === Math.sign(mathDirection || combinedDirection)
+        ? 1
+        : -0.35
+      : 0;
+  const factors = {
+    eventImpact: eventScoreNorm,
+    trend: Math.abs(market.trendSignal),
+    momentum: Math.abs(market.momentumSignal),
+    volume: clamp(market.volumeExpansion / 2, 0, 1),
+    volatilityRegime: Math.max(market.volatilityRegimeScore, -0.1),
+    funding: Math.abs(market.fundingSignal),
+    openInterest: Math.abs(market.oiSignal),
+    orderFlow: Math.abs(market.orderFlowSignal),
+    liquidity: 0.5,
+    gbm: Math.abs(market.gbm.signal),
+    garch: market.garch.stabilityScore,
+    hiddenMarkov: Math.abs(market.hiddenMarkov.signal) * market.hiddenMarkov.confidence,
+    markowitz: 0.5,
+    poisson: 0.5,
+    bayesian: 0.5
+  };
+  factors.factorLibrary = Math.abs(safeNumber(market.factorLibrary?.composite)) * safeNumber(market.factorLibrary?.coverage);
+  const modelCalibrationBoost = estimateCalibrationBoost(modelWeights, factors);
+  const advancedModelQualityBoost = clamp(
+    (market.hiddenMarkov.confidence - 1 / 3) * 0.035 +
+      (market.garch.stabilityScore - 0.5) * 0.025 +
+      Math.abs(market.gbm.signal) * 0.01,
+    -0.02,
+    0.035
+  );
+  const baseWinRate = clamp(
+    0.5 +
+      Math.abs(combinedDirection) * 0.18 +
+      eventScoreNorm * 0.08 +
+      alignment * 0.04 +
+      market.volatilityRegimeScore * 0.05 +
+      (candidateMode === "math_only" ? -0.02 : 0) +
+      advancedModelQualityBoost +
+      modelCalibrationBoost,
+    0.35,
+    0.86
+  );
+  const garchRiskFloor = market.garch.forecastVolatility * Math.sqrt(4) * 1.25;
+  const riskPct = clamp(
+    Math.max(market.atrPct * (highImpactEvent ? 2.4 : 1.9), garchRiskFloor, 0.006),
+    0.006,
+    0.09
+  );
+  const rewardRiskRatio = highImpactEvent ? 1.85 : Math.abs(market.mathSignal) > 0.65 ? 1.65 : 1.45;
+  const rewardPct = riskPct * rewardRiskRatio;
+  const roundTripExecutionCostPct =
+    2 * (normalizedAccountConfig.takerFeeRate + normalizedAccountConfig.slippageRate);
+  const poisson = analyzePoissonEventArrival(eventAggregate, eventScoreNorm, highImpactEvent);
+  const bayesian = bayesianWinRateUpdate({
+    priorWinRate: baseWinRate,
+    combinedDirection,
+    eventScoreNorm,
+    alignment,
+    volatilityRegimeScore: market.volatilityRegimeScore,
+    advancedModelQualityBoost,
+    poisson,
+    roundTripExecutionCostPct,
+    riskPct
+  });
+  const rawWinRate = clamp(
+    baseWinRate * (1 - BAYESIAN_POSTERIOR_WEIGHT) +
+      bayesian.posteriorWinRate * BAYESIAN_POSTERIOR_WEIGHT,
+    0.35,
+    0.86
+  );
+  const winRateCalibration = calibrateCandidateWinRate({
+    winRate: rawWinRate,
+    calibration,
+    candidateMode,
+    regime: market.regime
+  });
+  const winRate = winRateCalibration.calibratedWinRate;
+  factors.poisson = poisson.directionalIntensity;
+  factors.bayesian = Math.abs(bayesian.adjustment) / 0.08;
+  const expectancyPct = winRate * rewardPct - (1 - winRate) * riskPct - roundTripExecutionCostPct;
+  const expectancyR = riskPct > 0 ? expectancyPct / riskPct : 0;
+  const gateResult = evaluateAdaptiveEntryGate({
+    riskProfile: normalizedAccountConfig.riskProfile,
+    expectancyPct,
+    winRate,
+    riskPct,
+    rewardRiskRatio,
+    roundTripExecutionCostPct,
+    regime: market.regime,
+    volatilityExpansion: Math.max(market.volatilityExpansion, market.garch.volatilityRatio),
+    alignment,
+    candidateMode,
+    combinedDirection,
+    calibration
+  });
+  const expectancyClass = expectancyR >= MIN_HIGH_EXPECTANCY_R ? "high" : "normal";
+  const adaptiveWinRateThreshold = clamp(
+    gateResult.adaptiveWinRateThreshold + safeNumber(sessionPolicy?.entryThresholdAdd),
+    0.35,
+    0.95
+  );
+  const passesGate = gateResult.passesGate && winRate >= adaptiveWinRateThreshold;
+  const tradingRule = tradingRulesBySymbol[market.symbol] || null;
+  const entry = tradingRule
+    ? alignToStep(market.latest, tradingRule.tickSize, "nearest")
+    : market.latest;
+  const rawStopLoss = side === "long" ? entry * (1 - riskPct) : entry * (1 + riskPct);
+  const rawTakeProfit = side === "long" ? entry * (1 + rewardPct) : entry * (1 - rewardPct);
+  const priceAlignment = side === "long" ? "floor" : "ceil";
+  const stopLoss = tradingRule
+    ? alignToStep(rawStopLoss, tradingRule.tickSize, priceAlignment)
+    : rawStopLoss;
+  const takeProfit = tradingRule
+    ? alignToStep(rawTakeProfit, tradingRule.tickSize, priceAlignment)
+    : rawTakeProfit;
+  const kelly = clamp((rewardRiskRatio * winRate - (1 - winRate)) / rewardRiskRatio, 0, 0.35);
+  const fractionalKelly = kelly * 0.2;
+  const maxRiskPct = (highImpactEvent ? 0.008 : 0.005) * safeNumber(sessionPolicy?.riskMultiplier, 1);
+  const positionRiskPct = clamp(Math.min(fractionalKelly, maxRiskPct), 0, maxRiskPct);
+  const accountControl = buildAccountControl({
+    accountConfig,
+    symbol: market.symbol,
+    tradingRule,
+    side,
+    entry,
+    riskPct,
+    positionRiskPct,
+    winRate,
+    expectancyR,
+    combinedDirection,
+    volatilityExpansion: Math.max(market.volatilityExpansion, market.garch.volatilityRatio)
+  });
+  const accountAllowsSignal = accountControl.allowed;
+  const finalStatus = passesGate && accountAllowsSignal ? "passed" : accountAllowsSignal ? "watch" : "blocked";
+
+  return {
+    id: `${market.symbol}-${Date.now()}-${side}`,
+    symbol: market.symbol,
+    side,
+    status: finalStatus,
+    candidateMode,
+    entry,
+    takeProfit,
+    stopLoss,
+    winRate,
+    rawWinRate,
+    winRateCalibration,
+    expectancyPct,
+    expectancyR,
+    expectancyClass,
+    adaptiveWinRateThreshold,
+    breakEvenWinRate: gateResult.breakEvenWinRate,
+    rewardRiskRatio,
+    riskPct,
+    positionRiskPct,
+    leverageHint: accountControl.appliedLeverage,
+    accountControl,
+    highImpactEvent,
+    eventImpactScore: Math.round(eventAggregate.score),
+    marketSession: sessionContext,
+    combinedDirection,
+    mathSignal: market.mathSignal,
+    eventDirection,
+    regime: market.regime,
+    factors,
+    factorSnapshot: {
+      capturedAt: new Date().toISOString(),
+      modelVersion: MONITOR_VERSION,
+      weightVersion,
+      factorLibraryVersion: 1,
+      factorLibraryWeightVersion: safeNumber(market.factorLibrary?.weightVersion, 1),
+      regime: market.regime,
+      factorLibrary: {
+        composite: safeNumber(market.factorLibrary?.composite),
+        influence: safeNumber(market.factorLibrary?.influence),
+        coverage: safeNumber(market.factorLibrary?.coverage),
+        sufficient: market.factorLibrary?.sufficient === true,
+        activeFactors: Array.isArray(market.factorLibrary?.activeFactors)
+          ? market.factorLibrary.activeFactors.map((item) => ({ ...item }))
+          : [],
+        values: { ...(market.factorValues || {}) }
+      },
+      directionSignals: {
+        trend: market.trendSignal,
+        higherTimeframeTrend: market.htfTrendSignal,
+        momentum: market.momentumSignal,
+        rsi: market.mathBreakdown?.components?.rsiSignal || 0,
+        volume: market.volumeSignal,
+        funding: market.fundingSignal,
+        openInterest: market.oiSignal,
+        orderFlow: market.orderFlowSignal,
+        geometricBrownianMotion: market.gbm.signal,
+        hiddenMarkovModel: market.hiddenMarkov.signal
+      },
+      directionWeights: {
+        trend: market.mathBreakdown?.decisionWeights?.trend,
+        higherTimeframeTrend: market.mathBreakdown?.decisionWeights?.higherTimeframeTrend,
+        momentum: market.mathBreakdown?.decisionWeights?.momentum,
+        rsi: market.mathBreakdown?.decisionWeights?.rsi,
+        volume: market.mathBreakdown?.decisionWeights?.volume,
+        funding: market.mathBreakdown?.decisionWeights?.funding,
+        openInterest: market.mathBreakdown?.decisionWeights?.openInterest,
+        orderFlow: market.mathBreakdown?.decisionWeights?.orderFlow,
+        geometricBrownianMotion: market.mathBreakdown?.decisionWeights?.geometricBrownianMotion,
+        hiddenMarkovModel: market.mathBreakdown?.decisionWeights?.hiddenMarkovModel
+      },
+      weightedTerms: { ...(market.mathBreakdown?.weightedTerms || {}) },
+      qualityFactors: { ...factors },
+      qualityWeights: { ...modelWeights },
+      eventContext: {
+        score: eventAggregate.score,
+        direction: eventDirection,
+        eventWeight,
+        mathWeight,
+        alignment,
+        eventCount: Array.isArray(eventAggregate.events) ? eventAggregate.events.length : 0
+      },
+      marketInputs: { ...(market.mathBreakdown?.inputs || {}) }
+    },
+    calculation: {
+      direction: {
+        formula: "factorAdjustedMathSignal = originalMathSignal*(1-factorInfluence) + factorComposite*factorInfluence; combinedDirection = eventDirection*eventWeight + factorAdjustedMathSignal*mathWeight",
+        candidateMode,
+        hasEventContext,
+        eventDirection,
+        mathDirection,
+        originalMathDirection: safeNumber(market.mathSignalBeforeFactorLibrary, mathDirection),
+        factorLibrary: market.factorLibrary || null,
+        eventWeight,
+        mathWeight,
+        combinedDirection
+      },
+      winRate: {
+        formula:
+          "baseP = clamp(0.50 + abs(combinedDirection)*0.18 + eventScoreNorm*0.08 + alignment*0.04 + volatilityRegimeScore*0.05 + mode/model adjustments, 0.35, 0.86); rawP = 0.70*baseP + 0.30*BayesianPosterior; P(win) = rawP - shrinkage-calibrated historical overconfidence correction",
+        eventScoreNorm,
+        alignment,
+        volatilityRegimeScore: market.volatilityRegimeScore,
+        mathOnlyPenalty: candidateMode === "math_only" ? -0.02 : 0,
+        advancedModelQualityBoost,
+        calibrationBoost: modelCalibrationBoost,
+        baseWinRate,
+        bayesianPosteriorWeight: BAYESIAN_POSTERIOR_WEIGHT,
+        rawWinRate,
+        historicalCalibration: winRateCalibration,
+        result: winRate
+      },
+      poisson,
+      bayesian,
+      riskReward: {
+        formula:
+          "riskPct = clamp(max(ATR%*eventMultiplier, GARCH_forecastVol*sqrt(4)*1.25, 0.006), 0.006, 0.09); rewardPct = riskPct*rewardRiskRatio",
+        atrPct: market.atrPct,
+        garchRiskFloor,
+        eventMultiplier: highImpactEvent ? 2.4 : 1.9,
+        riskPct,
+        rewardRiskRatio,
+        rewardPct,
+        entry,
+        takeProfit,
+        stopLoss
+      },
+      marketSession: sessionContext,
+      expectancy: {
+        formula:
+          "EV% = P(win)*rewardPct - (1-P(win))*riskPct - 2*(takerFeeRate + slippageRate); funding is settled separately if a funding timestamp is crossed",
+        takerFeeRate: normalizedAccountConfig.takerFeeRate,
+        slippageRate: normalizedAccountConfig.slippageRate,
+        roundTripExecutionCostPct,
+        expectancyPct,
+        expectancyR
+      },
+      gate: {
+        formula:
+          "Pass if point EV% > 0, conservative lower-bound EV >= 0.05R, and P(win) >= adaptive calibrated threshold",
+        riskProfile: gateResult.riskProfile,
+        minCombinedDirection: MIN_COMBINED_DIRECTION,
+        adaptiveWinRateThreshold: gateResult.adaptiveWinRateThreshold,
+        breakEvenWinRate: gateResult.breakEvenWinRate,
+        executionCostR: gateResult.executionCostR,
+        probabilityLowerBound: gateResult.probabilityLowerBound,
+        probabilityUncertainty: gateResult.probabilityUncertainty,
+        lowerBoundExpectancyPct: gateResult.lowerBoundExpectancyPct,
+        lowerBoundExpectancyR: gateResult.lowerBoundExpectancyR,
+        uncertaintyMargin: gateResult.uncertaintyMargin,
+        bounds: gateResult.bounds,
+        components: gateResult.components,
+        context: gateResult.context,
+        minHighExpectancyR: MIN_HIGH_EXPECTANCY_R,
+        minEvPct: MIN_EV_PCT,
+        passesGate
+      },
+      sizing: {
+        formula:
+          "fractionalKelly = 0.2 * clamp((rewardRiskRatio*P(win) - (1-P(win))) / rewardRiskRatio, 0, 0.35); appliedLeverage = min(floor(modelSuggestedLeverage), accountMaxLeverage, BinanceSymbolBracketLeverage)",
+        kelly,
+        fractionalKelly,
+        maxRiskPct,
+        positionRiskPct,
+        accountControl
+      },
+      advancedModels: {
+        formula:
+          "GBM and HMM contribute to direction; GARCH scales confidence and supplies a volatility-based stop floor; Poisson measures event clustering; Bayesian update calibrates win probability; Markowitz is applied after all candidates are formed.",
+        gbm: market.gbm,
+        garch: market.garch,
+        hiddenMarkov: market.hiddenMarkov,
+        poisson,
+        bayesian,
+        weights: {
+          ...Object.fromEntries(
+            Object.entries(market.mathBreakdown?.decisionWeights || {}).filter(
+              ([key]) => !["garchConfidenceWeight", "markowitzSizingWeight"].includes(key)
+            )
+          ),
+          garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
+          markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT,
+          bayesianPosteriorWeight: BAYESIAN_POSTERIOR_WEIGHT
+        }
+      }
+    },
+    reasons: [
+      candidateMode === "math_only"
+        ? "no-message math-only path"
+        : highImpactEvent
+          ? "high-impact event path"
+          : "normal event/math composite path",
+      `mathSignal=${market.mathSignal.toFixed(2)}`,
+      `GBM=${market.gbm.signal.toFixed(2)}`,
+      `HMM=${market.hiddenMarkov.regime}:${market.hiddenMarkov.confidence.toFixed(2)}`,
+      `GARCHvolRatio=${market.garch.volatilityRatio.toFixed(2)}`,
+      `PoissonTail=${poisson.tailProbability.toFixed(2)}`,
+      `BayesP=${(bayesian.posteriorWinRate * 100).toFixed(1)}%`,
+      `FactorICComposite=${safeNumber(market.factorLibrary?.composite).toFixed(2)} coverage=${(
+        safeNumber(market.factorLibrary?.coverage) * 100
+      ).toFixed(0)}% influence=${(safeNumber(market.factorLibrary?.influence) * 100).toFixed(0)}%`,
+      `eventImpact=${Math.round(eventAggregate.score)}`,
+      `regime=${market.regime}`,
+      `adaptiveGate=${(gateResult.adaptiveWinRateThreshold * 100).toFixed(1)}%`,
+      `EV=${(expectancyPct * 100).toFixed(2)}%`
+    ],
+    relatedEvents: eventAggregate.events
+  };
+}
+
+function estimateCalibrationBoost(modelWeights, factors) {
+  let weighted = 0;
+  let total = 0;
+  for (const [name, value] of Object.entries(factors)) {
+    const weight = safeNumber(modelWeights[name], BASE_MODEL_WEIGHTS[name] || 0);
+    weighted += weight * safeNumber(value);
+    total += Math.abs(weight);
+  }
+  return total ? clamp((weighted / total - 0.45) * 0.06, -0.04, 0.04) : 0;
+}
+
+function covariance(left, right) {
+  const length = Math.min(left.length, right.length);
+  if (length < 2) return 0;
+  const leftValues = left.slice(-length);
+  const rightValues = right.slice(-length);
+  const leftMean = mean(leftValues);
+  const rightMean = mean(rightValues);
+  return mean(
+    leftValues.map((value, index) => (value - leftMean) * (rightValues[index] - rightMean))
+  );
+}
+
+function solveLinearSystem(matrix, vector) {
+  const size = vector.length;
+  const augmented = matrix.map((row, index) => [...row, vector[index]]);
+  for (let column = 0; column < size; column += 1) {
+    let pivot = column;
+    for (let row = column + 1; row < size; row += 1) {
+      if (Math.abs(augmented[row][column]) > Math.abs(augmented[pivot][column])) pivot = row;
+    }
+    if (Math.abs(augmented[pivot][column]) < 1e-14) return null;
+    [augmented[column], augmented[pivot]] = [augmented[pivot], augmented[column]];
+    const divisor = augmented[column][column];
+    for (let index = column; index <= size; index += 1) augmented[column][index] /= divisor;
+    for (let row = 0; row < size; row += 1) {
+      if (row === column) continue;
+      const factor = augmented[row][column];
+      for (let index = column; index <= size; index += 1) {
+        augmented[row][index] -= factor * augmented[column][index];
+      }
+    }
+  }
+  return augmented.map((row) => row[size]);
+}
+
+function normalizeCappedWeights(values, maxWeight) {
+  const count = values.length;
+  if (!count) return [];
+  const scores = values.map((value) => Math.max(0, safeNumber(value)));
+  if (scores.every((value) => value === 0)) scores.fill(1);
+  const weights = new Array(count).fill(0);
+  let active = scores.map((_, index) => index);
+  let remaining = 1;
+
+  while (active.length) {
+    const scoreTotal = active.reduce((sum, index) => sum + scores[index], 0);
+    const proposed = active.map((index) => ({
+      index,
+      weight: remaining * (scoreTotal > 0 ? scores[index] / scoreTotal : 1 / active.length)
+    }));
+    const overCap = proposed.filter((item) => item.weight > maxWeight + 1e-12);
+    if (!overCap.length) {
+      for (const item of proposed) weights[item.index] = item.weight;
+      break;
+    }
+    for (const item of overCap) {
+      weights[item.index] = maxWeight;
+      remaining -= maxWeight;
+    }
+    const capped = new Set(overCap.map((item) => item.index));
+    active = active.filter((index) => !capped.has(index));
+  }
+  const total = weights.reduce((sum, value) => sum + value, 0);
+  return total > 0 ? weights.map((value) => value / total) : weights;
+}
+
+function applyMarkowitzSizing(
+  candidates,
+  marketBySymbol,
+  accountConfig,
+  tradingRulesBySymbol = {},
+  sessionContext = null
+) {
+  if (!candidates.length) {
+    return {
+      candidates,
+      portfolio: {
+        method: "regularized_tangency",
+        weights: {},
+        expectedReturn: 0,
+        volatility: 0,
+        formula: "No candidates; Markowitz allocation not applied."
+      }
+    };
+  }
+
+  const strategyReturns = candidates.map((candidate) => {
+    const direction = candidate.side === "long" ? 1 : -1;
+    return (marketBySymbol[candidate.symbol]?.returns15m || []).map((value) => value * direction);
+  });
+  const expectedReturns = candidates.map((candidate) => {
+    const market = marketBySymbol[candidate.symbol];
+    const direction = candidate.side === "long" ? 1 : -1;
+    const gbmReturn = safeNumber(market?.gbm?.expectedReturn) * direction;
+    return Math.max(1e-6, safeNumber(candidate.expectancyPct) * 0.6 + gbmReturn * 0.4);
+  });
+  const covarianceMatrix = candidates.map((_, leftIndex) =>
+    candidates.map((__, rightIndex) => covariance(strategyReturns[leftIndex], strategyReturns[rightIndex]))
+  );
+  const averageVariance = Math.max(
+    mean(covarianceMatrix.map((row, index) => Math.max(row[index], 1e-12))),
+    1e-12
+  );
+  const regularization = averageVariance * 0.2;
+  const regularizedCovariance = covarianceMatrix.map((row, leftIndex) =>
+    row.map((value, rightIndex) =>
+      leftIndex === rightIndex ? value + regularization : value * 0.8
+    )
+  );
+  const rawSolution = solveLinearSystem(regularizedCovariance, expectedReturns);
+  const fallbackScores = candidates.map((_, index) => {
+    const volatility = Math.sqrt(Math.max(regularizedCovariance[index][index], 1e-12));
+    return expectedReturns[index] / volatility;
+  });
+  const positiveSolution =
+    rawSolution && rawSolution.some((value) => value > 0)
+      ? rawSolution.map((value) => Math.max(0, value))
+      : fallbackScores;
+  const maxWeight = Math.max(0.35, 1 / candidates.length);
+  const weights = normalizeCappedWeights(positiveSolution, maxWeight);
+  const equalWeight = 1 / candidates.length;
+
+  const adjustedCandidates = candidates.map((candidate, index) => {
+    const markowitzWeight = weights[index];
+    const relativeWeight = markowitzWeight / equalWeight;
+    const allocationMultiplier = clamp(
+      1 - MARKOWITZ_SIZING_WEIGHT + MARKOWITZ_SIZING_WEIGHT * relativeWeight,
+      0.35,
+      1.35
+    );
+    const originalRiskPct = candidate.positionRiskPct;
+    const riskCap = (candidate.highImpactEvent ? 0.008 : 0.005) *
+      safeNumber(sessionContext?.policy?.riskMultiplier, 1);
+    const adjustedPositionRiskPct = clamp(originalRiskPct * allocationMultiplier, 0, riskCap);
+    const market = marketBySymbol[candidate.symbol];
+    const accountControl = buildAccountControl({
+      accountConfig,
+      symbol: candidate.symbol,
+      tradingRule: tradingRulesBySymbol[candidate.symbol] || null,
+      side: candidate.side,
+      entry: candidate.entry,
+      riskPct: candidate.riskPct,
+      positionRiskPct: adjustedPositionRiskPct,
+      winRate: candidate.winRate,
+      expectancyR: candidate.expectancyR,
+      combinedDirection: candidate.combinedDirection,
+      volatilityExpansion: Math.max(
+        safeNumber(market?.volatilityExpansion, 1),
+        safeNumber(market?.garch?.volatilityRatio, 1)
+      )
+    });
+    const markowitz = {
+      weight: markowitzWeight,
+      equalWeight,
+      relativeWeight,
+      allocationMultiplier,
+      originalPositionRiskPct: originalRiskPct,
+      adjustedPositionRiskPct,
+      expectedReturn: expectedReturns[index],
+      variance: regularizedCovariance[index][index],
+      formula:
+        "w proportional to max((Sigma + ridge*I)^-1 * expectedReturn, 0); positionRisk = baseRisk*(0.60 + 0.40*w/equalWeight), capped by hard risk limit"
+    };
+    return {
+      ...candidate,
+      positionRiskPct: adjustedPositionRiskPct,
+      accountControl,
+      markowitz,
+      factors: {
+        ...candidate.factors,
+        markowitz: clamp(relativeWeight / 2, 0, 1)
+      },
+      calculation: {
+        ...candidate.calculation,
+        sizing: {
+          ...candidate.calculation.sizing,
+          positionRiskPct: adjustedPositionRiskPct,
+          accountControl
+        },
+        markowitz
+      },
+      reasons: [...candidate.reasons, `MarkowitzWeight=${markowitzWeight.toFixed(3)}`]
+    };
+  });
+
+  const portfolioExpectedReturn = weights.reduce(
+    (sum, weight, index) => sum + weight * expectedReturns[index],
+    0
+  );
+  let portfolioVariance = 0;
+  for (let left = 0; left < weights.length; left += 1) {
+    for (let right = 0; right < weights.length; right += 1) {
+      portfolioVariance += weights[left] * weights[right] * regularizedCovariance[left][right];
+    }
+  }
+  return {
+    candidates: adjustedCandidates,
+    portfolio: {
+      method: "regularized_tangency",
+      sizingWeight: MARKOWITZ_SIZING_WEIGHT,
+      regularization,
+      weights: Object.fromEntries(
+        adjustedCandidates.map((candidate) => [candidate.symbol, candidate.markowitz.weight])
+      ),
+      expectedReturn: portfolioExpectedReturn,
+      volatility: Math.sqrt(Math.max(portfolioVariance, 0)),
+      formula:
+        "Markowitz: maximize expectedReturn^T*w / sqrt(w^T*Sigma*w), approximated by regularized tangency weights w proportional to positive((Sigma+ridge*I)^-1*mu)."
+    }
+  };
+}
+
+function buildAccountControl({
+  accountConfig,
+  symbol,
+  tradingRule,
+  side,
+  entry,
+  riskPct,
+  positionRiskPct,
+  winRate,
+  expectancyR,
+  combinedDirection,
+  volatilityExpansion
+}) {
+  const config = normalizeAccountConfig(accountConfig);
+  const isFutures = config.marketType === "futures";
+  const marketAllowsSide = isFutures || side === "long";
+  const usesPaperRuleFallback = isFutures && !tradingRule;
+  let allowed = marketAllowsSide && (usesPaperRuleFallback || Boolean(tradingRule?.tradable));
+  let blockReason = !marketAllowsSide
+    ? "现货账户不允许执行做空信号。"
+    : !tradingRule && !usesPaperRuleFallback
+      ? `币安${config.marketType === "spot" ? "现货" : "合约"}交易规则不可用，禁止开仓。`
+      : tradingRule && !tradingRule.tradable
+        ? `币安 ${symbol || "交易对"} 当前状态为 ${tradingRule.status || "不可交易"}。`
+        : null;
+  const confidenceLeverage = 1 + Math.max(0, winRate - 0.5) * 10 + Math.max(0, expectancyR) * 1.5;
+  const directionLeverage = 1 + Math.max(0, Math.abs(combinedDirection) - MIN_COMBINED_DIRECTION) * 2;
+  const volatilityPenalty = volatilityExpansion > 1.6 ? 0.65 : volatilityExpansion > 1.2 ? 0.82 : 1;
+  const rawConservativeSuggestedLeverage = isFutures
+    ? clamp(roundNumber((confidenceLeverage + directionLeverage) * 0.5 * volatilityPenalty, 2), 1, 125)
+    : 1;
+  const conservativeSuggestedLeverage = Math.max(1, Math.floor(rawConservativeSuggestedLeverage));
+  const profileLeverageMultiplier = isFutures && config.riskProfile === "aggressive" ? 2 : 1;
+  const rawModelSuggestedLeverage = isFutures
+    ? clamp(roundNumber(rawConservativeSuggestedLeverage * profileLeverageMultiplier, 2), 1, 125)
+    : 1;
+  const modelSuggestedLeverage = Math.max(1, Math.floor(rawModelSuggestedLeverage));
+  const targetRiskAmount = marketAllowsSide ? config.initialCapital * positionRiskPct : 0;
+  const riskBasedNotional = marketAllowsSide && riskPct > 0 ? targetRiskAmount / riskPct : 0;
+  const baseMarginCapRatio = config.riskProfile === "aggressive" ? 0.3 : 0.24;
+  const expectancyQuality = clamp(safeNumber(expectancyR) / 0.6, 0, 1);
+  const confidenceQuality = clamp((safeNumber(winRate, 0.5) - 0.5) / 0.2, 0, 1);
+  const directionQuality = clamp((Math.abs(safeNumber(combinedDirection)) - MIN_COMBINED_DIRECTION) / 0.75, 0, 1);
+  const volatilityPenaltyRatio = clamp((safeNumber(volatilityExpansion, 1) - 1) / 1.5, 0, 1);
+  const marginConcentrationCapRatio = clamp(
+    baseMarginCapRatio + expectancyQuality * 0.1 + confidenceQuality * 0.05 + directionQuality * 0.03 - volatilityPenaltyRatio * 0.1,
+    config.riskProfile === "aggressive" ? 0.22 : 0.18,
+    config.riskProfile === "aggressive" ? 0.55 : 0.45
+  );
+  const maxMarginByConcentration = marketAllowsSide ? config.initialCapital * marginConcentrationCapRatio : 0;
+  let leverageResolution = resolveBinanceLeverage({
+    requestedLeverage: modelSuggestedLeverage,
+    accountMaxLeverage: isFutures ? config.maxLeverage : 1,
+    notional: riskBasedNotional,
+    rule: tradingRule,
+    paperTrading: true,
+    marketType: config.marketType
+  });
+  const riskBudgetAvailable = targetRiskAmount > 0 && riskBasedNotional > 0;
+  if (allowed && !riskBudgetAvailable) {
+    allowed = false;
+    blockReason = "风险预算为 0，不开仓。";
+  }
+  let appliedLeverage = allowed ? leverageResolution.appliedLeverage : 0;
+  let unconstrainedNotional = 0;
+  let requestedNotional = 0;
+  let orderValidation = { valid: false, reason: blockReason || "BINANCE_RULES_UNAVAILABLE", quantity: 0, notional: 0 };
+  for (let iteration = 0; iteration < 3 && allowed; iteration += 1) {
+    const maxNotionalByLeverage = isFutures
+      ? config.initialCapital * appliedLeverage
+      : config.initialCapital;
+    const maxNotionalByConcentration = isFutures
+      ? maxMarginByConcentration * appliedLeverage
+      : maxMarginByConcentration;
+    unconstrainedNotional = Math.max(0, Math.min(riskBasedNotional, maxNotionalByLeverage));
+    requestedNotional = Math.max(0, Math.min(unconstrainedNotional, maxNotionalByConcentration));
+    orderValidation = applyBinanceMarketOrderRules({
+      quantity: entry > 0 ? requestedNotional / entry : 0,
+      referencePrice: entry,
+      rule: tradingRule,
+      paperTrading: true,
+      marketType: config.marketType
+    });
+    if (!orderValidation.valid) {
+      allowed = false;
+      blockReason = orderValidation.reason;
+      break;
+    }
+    const nextResolution = resolveBinanceLeverage({
+      requestedLeverage: modelSuggestedLeverage,
+      accountMaxLeverage: isFutures ? config.maxLeverage : 1,
+      notional: orderValidation.notional,
+      rule: tradingRule,
+      paperTrading: true,
+      marketType: config.marketType
+    });
+    leverageResolution = nextResolution;
+    if (nextResolution.appliedLeverage === appliedLeverage) break;
+    appliedLeverage = nextResolution.appliedLeverage;
+  }
+  const notional = allowed ? orderValidation.notional : 0;
+  const effectiveAppliedLeverage = allowed ? appliedLeverage : 0;
+  const marginRequired = isFutures && effectiveAppliedLeverage > 0 ? notional / effectiveAppliedLeverage : notional;
+  const quantity = allowed ? orderValidation.quantity : 0;
+  const maxLossAmount = notional * riskPct;
+  const actualAccountRiskPct = config.initialCapital > 0 ? maxLossAmount / config.initialCapital : 0;
+  const maxLeverage = isFutures ? leverageResolution.symbolMaxLeverage : 1;
+  const leverageCapped = allowed && modelSuggestedLeverage > effectiveAppliedLeverage;
+  return {
+    allowed,
+    blockReason,
+    accountMarketType: config.marketType,
+    riskProfile: config.riskProfile,
+    costModelVersion: 1,
+    initialCapital: config.initialCapital,
+    quoteCurrency: config.quoteCurrency,
+    maxLeverage,
+    accountMaxLeverage: isFutures ? Math.floor(config.maxLeverage) : 1,
+    rawConservativeSuggestedLeverage,
+    conservativeSuggestedLeverage,
+    profileLeverageMultiplier,
+    rawModelSuggestedLeverage,
+    modelSuggestedLeverage,
+    appliedLeverage: effectiveAppliedLeverage,
+    leverageIntegerEnforced: true,
+    leverageRuleExact: leverageResolution.exact,
+    leverageRuleSource: leverageResolution.source,
+    leverageCapped,
+    aggressiveLeverageLimitedByCap:
+      allowed && config.riskProfile === "aggressive" &&
+      effectiveAppliedLeverage < conservativeSuggestedLeverage * profileLeverageMultiplier,
+    targetRiskPct: positionRiskPct,
+    riskBudgetAvailable,
+    actualAccountRiskPct,
+    targetRiskAmount,
+    marginConcentrationCapRatio,
+    maxMarginByConcentration,
+    marginConcentrationCapped: notional + 1e-9 < unconstrainedNotional,
+    exchangeRuleValidated: Boolean(tradingRule) && allowed && orderValidation.valid,
+    paperRuleFallback: allowed && usesPaperRuleFallback,
+    exchangeRule: tradingRule
+      ? {
+          symbol: tradingRule.symbol,
+          marketType: tradingRule.marketType,
+          status: tradingRule.status,
+          minQty: tradingRule.minQty,
+          maxQty: tradingRule.maxQty,
+          stepSize: tradingRule.stepSize,
+          tickSize: tradingRule.tickSize,
+          minNotional: tradingRule.minNotional,
+          maxNotional: tradingRule.maxNotional,
+          ruleSource: tradingRule.ruleSource,
+          leverageRuleSource: tradingRule.leverageRuleSource,
+          fetchedAt: tradingRule.fetchedAt,
+          tradable: tradingRule.tradable
+        }
+      : null,
+    quantityAdjustedToExchangeStep: orderValidation.quantityAdjusted === true,
+    maxLossAmount,
+    notional,
+    marginRequired,
+    quantity,
+    formula:
+      "integerLeverage = min(floor(modelLeverage), accountCap, 125, verifiedBinanceBracketCapIfAvailable); requestedNotional = min(targetRisk/riskPct, capital*integerLeverage, capital*marginCapRatio*integerLeverage); when exchange rules exist, quantity follows Binance filters; otherwise paper futures use the unrounded model quantity"
+  };
+}
+
+function nextFundingSettlement(timestamp, intervalHours = DEFAULT_FUNDING_INTERVAL_HOURS) {
+  const time = new Date(timestamp || Date.now()).getTime();
+  if (!Number.isFinite(time)) return null;
+  const intervalMs = Math.max(1, intervalHours) * 60 * 60 * 1000;
+  return new Date((Math.floor(time / intervalMs) + 1) * intervalMs).toISOString();
+}
+
+function adverseExecutionPrice(referencePrice, side, action, slippageRate) {
+  const isBuy = (action === "entry" && side === "long") || (action === "exit" && side === "short");
+  return referencePrice * (isBuy ? 1 + slippageRate : 1 - slippageRate);
+}
+
+function positionGrossPnl(position, exitPrice) {
+  if (!position || !exitPrice || !position.entry || !position.quantity) return 0;
+  const priceDifference =
+    position.side === "long" ? exitPrice - position.entry : position.entry - exitPrice;
+  return priceDifference * position.quantity;
+}
+
+function accruePaperFunding(account, position, market, now) {
+  if (position.accountMarketType !== "futures" || !position.nextFundingAt) return;
+  const nowMs = new Date(now).getTime();
+  let nextMs = new Date(position.nextFundingAt).getTime();
+  if (!Number.isFinite(nowMs) || !Number.isFinite(nextMs)) return;
+  const intervalHours = safeNumber(position.fundingIntervalHours, DEFAULT_FUNDING_INTERVAL_HOURS);
+  const intervalMs = intervalHours * 60 * 60 * 1000;
+  let settlements = 0;
+  while (nowMs >= nextMs && settlements < 24) {
+    const fundingRate = safeNumber(market?.fundingRate, position.lastFundingRate || 0);
+    const settlementPrice = safeNumber(market?.latest, position.currentPrice || position.entry);
+    const settlementNotional = Math.abs(position.quantity * settlementPrice);
+    const fundingPayment =
+      position.side === "long" ? -settlementNotional * fundingRate : settlementNotional * fundingRate;
+    position.fundingPnl = safeNumber(position.fundingPnl) + fundingPayment;
+    position.fundingSettlements = safeNumber(position.fundingSettlements) + 1;
+    position.lastFundingRate = fundingRate;
+    position.lastFundingAt = new Date(nextMs).toISOString();
+    account.fundingPnl = safeNumber(account.fundingPnl) + fundingPayment;
+    account.realizedPnl = safeNumber(account.realizedPnl) + fundingPayment;
+    nextMs += intervalMs;
+    settlements += 1;
+  }
+  position.nextFundingAt = new Date(nextMs).toISOString();
+}
+
+function markPaperPositions(account, marketBySymbol, now = new Date().toISOString()) {
+  let unrealizedPnl = 0;
+  let marginUsed = 0;
+  for (const position of Object.values(account.positions || {})) {
+    const market = marketBySymbol[position.symbol];
+    const currentPrice = market?.latest || position.currentPrice || position.entry;
+    accruePaperFunding(account, position, market, now);
+    const estimatedExitPrice = adverseExecutionPrice(
+      currentPrice,
+      position.side,
+      "exit",
+      safeNumber(position.slippageRate)
+    );
+    const grossPnl = positionGrossPnl(position, estimatedExitPrice);
+    const estimatedExitNotional = Math.abs(position.quantity * estimatedExitPrice);
+    const estimatedExitFee = estimatedExitNotional * safeNumber(position.feeRate);
+    const pnl = grossPnl - estimatedExitFee;
+    position.currentPrice = currentPrice;
+    position.estimatedExitPrice = estimatedExitPrice;
+    position.grossUnrealizedPnl = grossPnl;
+    position.estimatedExitFee = estimatedExitFee;
+    position.estimatedExitSlippageCost = Math.abs(estimatedExitPrice - currentPrice) * position.quantity;
+    position.unrealizedPnl = pnl;
+    position.netPnl =
+      grossPnl -
+      safeNumber(position.entryFee) -
+      estimatedExitFee +
+      safeNumber(position.fundingPnl);
+    position.unrealizedReturnPct =
+      position.marginRequired > 0 ? position.netPnl / position.marginRequired : 0;
+    position.priceReturnPct =
+      position.side === "long" ? currentPrice / position.entry - 1 : (position.entry - currentPrice) / position.entry;
+    position.maxFavorableExcursionPct = Math.max(
+      safeNumber(position.maxFavorableExcursionPct),
+      position.priceReturnPct
+    );
+    position.maxAdverseExcursionPct = Math.min(
+      safeNumber(position.maxAdverseExcursionPct),
+      position.priceReturnPct
+    );
+    const observations = Array.isArray(position.holdingObservations) ? position.holdingObservations : [];
+    const lastObservation = observations.at(-1);
+    const observationGapMs = lastObservation
+      ? new Date(now).getTime() - new Date(lastObservation.time).getTime()
+      : Number.POSITIVE_INFINITY;
+    if (!lastObservation || (observationGapMs >= 1_000 && safeNumber(lastObservation.price) !== currentPrice)) {
+      observations.push({
+        time: now,
+        price: currentPrice,
+        priceReturnPct: position.priceReturnPct,
+        netPnl: position.netPnl,
+        fundingRate: safeNumber(market?.fundingRate),
+        openInterest: safeNumber(market?.openInterest)
+      });
+    }
+    position.holdingObservations = observations.slice(-900);
+    marginUsed += position.marginRequired || 0;
+    unrealizedPnl += pnl;
+  }
+  account.unrealizedPnl = unrealizedPnl;
+  account.marginUsed = marginUsed;
+  account.equity = account.startingCapital + safeNumber(account.realizedPnl) + unrealizedPnl;
+  account.availableEquity = Math.max(0, account.equity - marginUsed);
+}
+
+function attachCapitalRotationExitEvaluation(position, release, plan, now) {
+  const base = position.exitEvaluation || {};
+  const weights = normalizeExitWeights(base.weights, DEFAULT_EXIT_MODEL_WEIGHTS);
+  const capitalEfficiency = clamp(
+    safeNumber(release?.advantagePct) / Math.max(0.0001, safeNumber(plan?.requiredAdvantagePct, 0.003)),
+    0,
+    1
+  );
+  const signals = {
+    ...(base.signals || {}),
+    capitalEfficiency
+  };
+  const exitScore = EXIT_FACTOR_KEYS.reduce(
+    (score, key) => score + safeNumber(signals[key]) * safeNumber(weights[key]),
+    0
+  );
+  position.exitEvaluation = {
+    ...base,
+    version: 3,
+    evaluatedAt: now,
+    signals,
+    weights,
+    exitScore,
+    threshold: safeNumber(weights.capitalEfficiency, 0.1),
+    recommendsExit: true,
+    capitalRotation: true,
+    diagnostics: {
+      ...(base.diagnostics || {}),
+      replacementSymbol: release?.replacementSymbol || null,
+      candidateAdvantagePct: safeNumber(release?.advantagePct),
+      requiredAdvantagePct: safeNumber(plan?.requiredAdvantagePct),
+      capitalEfficiency
+    }
+  };
+}
+
+function partiallyClosePaperPosition(account, positionId, price, fraction, replacementSignal, now, context = {}) {
+  const position = account.positions[positionId];
+  let closeFraction = clamp(safeNumber(fraction), 0, 1);
+  if (!position || closeFraction <= 0 || closeFraction >= 1) return null;
+  const originalQuantity = safeNumber(position.quantity);
+  const originalMarginRequired = safeNumber(position.marginRequired);
+  const exitPrice = adverseExecutionPrice(price, position.side, "exit", safeNumber(position.slippageRate));
+  let closedQuantity = originalQuantity * closeFraction;
+  if (position.exchangeRule) {
+    const validation = applyBinanceMarketOrderRules({
+      quantity: closedQuantity,
+      referencePrice: exitPrice,
+      rule: position.exchangeRule
+    });
+    if (!validation.valid) return null;
+    closedQuantity = validation.quantity;
+    closeFraction = closedQuantity / originalQuantity;
+  }
+  if (closedQuantity <= 0 || closeFraction >= 1) return null;
+  const exitNotional = Math.abs(closedQuantity * exitPrice);
+  const exitFee = exitNotional * safeNumber(position.feeRate);
+  const exitSlippageCost = Math.abs(exitPrice - price) * closedQuantity;
+  const grossTradingPnl = positionGrossPnl({ ...position, quantity: closedQuantity }, exitPrice);
+  const allocatedEntryFee = safeNumber(position.entryFee) * closeFraction;
+  const allocatedEntrySlippageCost = safeNumber(position.entrySlippageCost) * closeFraction;
+  const allocatedFundingPnl = safeNumber(position.fundingPnl) * closeFraction;
+  const realizedPnl = grossTradingPnl - allocatedEntryFee - exitFee + allocatedFundingPnl;
+  const remainingFraction = 1 - closeFraction;
+
+  account.realizedPnl = safeNumber(account.realizedPnl) + grossTradingPnl - exitFee;
+  account.tradingFees = safeNumber(account.tradingFees) + exitFee;
+  account.slippageCost = safeNumber(account.slippageCost) + exitSlippageCost;
+
+  position.quantity = originalQuantity * remainingFraction;
+  position.notional = safeNumber(position.notional) * remainingFraction;
+  position.marginRequired = safeNumber(position.marginRequired) * remainingFraction;
+  position.maxLossAmount = safeNumber(position.maxLossAmount) * remainingFraction;
+  position.entryFee = safeNumber(position.entryFee) - allocatedEntryFee;
+  position.entrySlippageCost = safeNumber(position.entrySlippageCost) - allocatedEntrySlippageCost;
+  position.fundingPnl = safeNumber(position.fundingPnl) - allocatedFundingPnl;
+  position.partialGrossTradingPnl = safeNumber(position.partialGrossTradingPnl) + grossTradingPnl;
+  position.partialRealizedPnl = safeNumber(position.partialRealizedPnl) + realizedPnl;
+  position.partialEntryFee = safeNumber(position.partialEntryFee) + allocatedEntryFee;
+  position.partialExitFee = safeNumber(position.partialExitFee) + exitFee;
+  position.partialEntrySlippageCost = safeNumber(position.partialEntrySlippageCost) + allocatedEntrySlippageCost;
+  position.partialExitSlippageCost = safeNumber(position.partialExitSlippageCost) + exitSlippageCost;
+  position.partialFundingPnl = safeNumber(position.partialFundingPnl) + allocatedFundingPnl;
+  position.partialClosedQuantity = safeNumber(position.partialClosedQuantity) + closedQuantity;
+  position.partialExitPriceQuantitySum = safeNumber(position.partialExitPriceQuantitySum) + exitPrice * closedQuantity;
+  const isCapitalRotation = Boolean(replacementSignal);
+  const isTakeProfitPartial = context.reason === "DYNAMIC_TP_PARTIAL";
+  if (isCapitalRotation) position.capitalRotationCount = safeNumber(position.capitalRotationCount) + 1;
+  else if (isTakeProfitPartial) {
+    position.dynamicTakeProfitPartialCount = safeNumber(position.dynamicTakeProfitPartialCount) + 1;
+  } else {
+    position.adaptiveDeRiskCount = safeNumber(position.adaptiveDeRiskCount) + 1;
+    position.lastAdaptiveDeRiskAt = now;
+    position.lastAdaptiveDeRiskReason = context.reason || "ADAPTIVE_DE_RISK";
+  }
+
+  const event = {
+    id: `${isCapitalRotation ? "rotation" : isTakeProfitPartial ? "tp-partial" : "de-risk"}-${randomUUID()}`,
+    executedAt: now,
+    positionId,
+    symbol: position.symbol,
+    side: position.side,
+    reason: context.reason || (isCapitalRotation ? "CAPITAL_ROTATION" : "ADAPTIVE_DE_RISK"),
+    replacementSymbol: replacementSignal?.symbol || null,
+    replacementSide: replacementSignal?.side || null,
+    replacementReferencePrice: replacementSignal?.entry || null,
+    replacementExpectancyPct: replacementSignal?.expectancyPct ?? null,
+    remainingPositionExpectancyPct: position.exitEvaluation?.diagnostics?.remainingExpectancyPct ?? position.expectancyPct,
+    fraction: closeFraction,
+    closedQuantity,
+    releasedMargin: originalMarginRequired * closeFraction,
+    exitReferencePrice: price,
+    exitPrice,
+    grossTradingPnl,
+    realizedPnl,
+    exitFee,
+    exitSlippageCost,
+    feeRate: safeNumber(position.feeRate),
+    slippageRate: safeNumber(position.slippageRate),
+    status: "exit_decision",
+    exitFactorSnapshot: position.exitEvaluation
+      ? {
+          version: position.exitEvaluation.version,
+          evaluatedAt: position.exitEvaluation.evaluatedAt,
+          signals: position.exitEvaluation.signals,
+          weights: position.exitEvaluation.weights,
+          exitScore: position.exitEvaluation.exitScore,
+          threshold: position.exitEvaluation.threshold,
+          diagnostics: position.exitEvaluation.diagnostics
+        }
+      : null,
+    exitCounterfactual: position.exitEvaluation
+      ? {
+          status: "pending",
+          horizonHours: safeNumber(position.exitEvaluation.counterfactualHorizonHours, 4),
+          dueAt: new Date(
+            new Date(now).getTime() + safeNumber(position.exitEvaluation.counterfactualHorizonHours, 4) * 3_600_000
+          ).toISOString(),
+          evaluatedAt: null,
+          referenceExitPrice: exitPrice,
+          replacementSymbol: replacementSignal?.symbol || null,
+          replacementSide: replacementSignal?.side || null,
+          replacementReferencePrice: replacementSignal?.entry || null,
+          counterfactualPrice: null,
+          counterfactualReturnPct: null,
+          avoidedReturnPct: null,
+          beneficial: null
+        }
+      : null
+  };
+  if (isCapitalRotation) {
+    account.capitalRotationHistory = [...(account.capitalRotationHistory || []), event].slice(-500);
+  }
+  account.exitDecisionHistory = [...(account.exitDecisionHistory || []), event].slice(-500);
+  return event;
+}
+
+function closeTriggeredPaperPositions(account, marketBySymbol, candidatesBySymbol, now, changedSymbols = null) {
+  const closed = [];
+  const partialDeRisks = [];
+  const partialTakeProfits = [];
+  const exitWeights = normalizeExitWeights(
+    account.postTradeReview?.currentExitWeights,
+    DEFAULT_EXIT_MODEL_WEIGHTS
+  );
+  for (const [positionId, position] of Object.entries(account.positions || {})) {
+    if (changedSymbols && !changedSymbols.has(position.symbol)) continue;
+    const market = marketBySymbol[position.symbol];
+    const price = market?.latest;
+    if (!price) continue;
+    if (!position.exitPolicyStartedAt) position.exitPolicyStartedAt = position.openedAt || now;
+    position.exitPolicyVersion = 4;
+    position.originalStopLoss = safeNumber(position.originalStopLoss, position.stopLoss);
+    position.originalTakeProfit = safeNumber(position.originalTakeProfit, position.takeProfit);
+    position.initialMaxLossAmount = safeNumber(position.initialMaxLossAmount, position.maxLossAmount);
+    position.dynamicProtection = position.dynamicProtection || initializeDynamicProtection(position, position.openedAt || now);
+    const currentStopLoss = safeNumber(position.stopLoss);
+    let reason = null;
+    if (position.side === "long" ? price <= currentStopLoss : price >= currentStopLoss) {
+      reason = currentStopLoss === position.originalStopLoss ? "SL" : "DYNAMIC_SL";
+    }
+    const protection = evaluateDynamicPositionProtection({
+      position,
+      currentPrice: price,
+      candidate: candidatesBySymbol[position.symbol] || null,
+      now
+    });
+    if (protection.valid) {
+      const previousStop = position.stopLoss;
+      const previousTakeProfit = position.takeProfit;
+      const targetMoveDeferred = protection.targetMoved && protection.action === "partial_take_profit";
+      const adjustmentApplied = protection.stopMoved || (protection.targetMoved && !targetMoveDeferred);
+      position.dynamicProtection = {
+        ...position.dynamicProtection,
+        version: 1,
+        evaluatedAt: now,
+        priceR: protection.priceR,
+        mfeR: protection.mfeR,
+        maeR: protection.maeR,
+        stage: targetMoveDeferred ? "trailing" : protection.stage,
+        profitProtection: protection.profitProtection,
+        costBreakEvenR: protection.costBreakEvenR,
+        lastAdjustedAt: adjustmentApplied ? now : position.dynamicProtection?.lastAdjustedAt
+      };
+      if (!reason && protection.action === "close" && protection.closeReason === "DYNAMIC_SL") {
+        reason = "DYNAMIC_SL";
+      }
+      if (protection.stopMoved) position.stopLoss = protection.nextStopLoss;
+      if (protection.targetMoved && !targetMoveDeferred) position.takeProfit = protection.nextTakeProfit;
+      if (adjustmentApplied) {
+        const history = Array.isArray(position.dynamicProtection.adjustmentHistory)
+          ? position.dynamicProtection.adjustmentHistory
+          : [];
+        history.push({
+          time: now,
+          price,
+          priceR: protection.priceR,
+          mfeR: protection.mfeR,
+          stage: protection.stage,
+          previousStopLoss: previousStop,
+          stopLoss: position.stopLoss,
+          previousTakeProfit,
+          takeProfit: position.takeProfit,
+          profitProtection: protection.profitProtection
+        });
+        position.dynamicProtection.adjustmentHistory = history.slice(-200);
+      }
+    }
+    const adaptivePosition = protection.valid && protection.action === "partial_take_profit"
+      ? { ...position, takeProfit: protection.nextTakeProfit }
+      : position;
+    position.exitEvaluation = evaluateAdaptivePositionExit({
+      position: adaptivePosition,
+      market,
+      candidate: candidatesBySymbol[position.symbol] || null,
+      now,
+      weights: exitWeights
+    });
+    if (!reason) {
+      if (position.exitEvaluation.recommendsExit) {
+        const lastConfirmationMs = Date.parse(position.lastExitConfirmationAt || "");
+        if (!Number.isFinite(lastConfirmationMs) || Date.parse(now) - lastConfirmationMs >= 1_000) {
+          position.exitConfirmationCount = safeNumber(position.exitConfirmationCount) + 1;
+          position.lastExitConfirmationAt = now;
+        }
+      } else {
+        position.exitConfirmationCount = 0;
+        position.lastExitConfirmationAt = null;
+      }
+      if (position.exitEvaluation.hardExpired) reason = "MAX_HOLDING_TIME";
+      else if (position.exitConfirmationCount >= position.exitEvaluation.confirmationRunsRequired) {
+        reason = "ADAPTIVE_EXIT";
+      }
+    }
+    if (!reason && protection.valid && protection.action === "partial_take_profit") {
+      const item = partiallyClosePaperPosition(
+        account,
+        positionId,
+        price,
+        protection.partialFraction,
+        null,
+        now,
+        { reason: "DYNAMIC_TP_PARTIAL" }
+      );
+      if (item) {
+        position.takeProfit = protection.nextTakeProfit;
+        partialTakeProfits.push(item);
+        position.dynamicProtection.tpPartialExecuted = true;
+        position.dynamicProtection.tpPartialExecutedAt = now;
+        position.dynamicProtection.stage = "runner";
+        position.dynamicProtection.lastAdjustedAt = now;
+        const history = Array.isArray(position.dynamicProtection.adjustmentHistory)
+          ? position.dynamicProtection.adjustmentHistory
+          : [];
+        const lastAdjustment = history.at(-1);
+        if (lastAdjustment?.time === now) {
+          lastAdjustment.takeProfit = position.takeProfit;
+        } else {
+          history.push({
+            time: now,
+            price,
+            priceR: protection.priceR,
+            mfeR: protection.mfeR,
+            stage: "runner",
+            previousStopLoss: position.stopLoss,
+            stopLoss: position.stopLoss,
+            previousTakeProfit: protection.diagnostics.currentTakeProfit,
+            takeProfit: position.takeProfit,
+            profitProtection: protection.profitProtection
+          });
+        }
+        position.dynamicProtection.adjustmentHistory = history.slice(-200);
+      }
+    } else if (!reason && protection.valid && protection.action === "close") {
+      reason = protection.closeReason;
+    }
+    if (!reason) {
+      const lastDeRiskMs = Date.parse(position.lastAdaptiveDeRiskAt || "");
+      const cooldownMs = safeNumber(position.exitEvaluation.deRiskCooldownMinutes, 30) * 60_000;
+      const cooldownComplete = !Number.isFinite(lastDeRiskMs) || Date.parse(now) - lastDeRiskMs >= cooldownMs;
+      if (position.exitEvaluation.recommendsDeRisk && cooldownComplete) {
+        const lastConfirmationMs = Date.parse(position.lastDeRiskConfirmationAt || "");
+        if (!Number.isFinite(lastConfirmationMs) || Date.parse(now) - lastConfirmationMs >= 5_000) {
+          position.deRiskConfirmationCount = safeNumber(position.deRiskConfirmationCount) + 1;
+          position.lastDeRiskConfirmationAt = now;
+        }
+      } else {
+        position.deRiskConfirmationCount = 0;
+        position.lastDeRiskConfirmationAt = null;
+      }
+      if (
+        position.deRiskConfirmationCount >= position.exitEvaluation.deRiskConfirmationRunsRequired &&
+        safeNumber(position.adaptiveDeRiskCount) < 3
+      ) {
+        const item = partiallyClosePaperPosition(
+          account,
+          positionId,
+          price,
+          position.exitEvaluation.deRiskFraction,
+          null,
+          now,
+          { reason: "ADAPTIVE_DE_RISK" }
+        );
+        if (item) partialDeRisks.push(item);
+        position.deRiskConfirmationCount = 0;
+        position.lastDeRiskConfirmationAt = null;
+      }
+    }
+    if (reason) {
+      const item = closePaperPosition(account, positionId, price, reason, now);
+      if (item) closed.push(item);
+    }
+  }
+  return { closed, partialDeRisks, partialTakeProfits };
+}
+
+function openPaperPosition(account, signal, now) {
+  const control = signal.accountControl || {};
+  if (!control.allowed || signal.status !== "passed") return null;
+  const duplicate = Object.values(account.positions || {}).some((position) => position.symbol === signal.symbol);
+  if (duplicate) return null;
+  const config = normalizeAccountConfig(account.configSnapshot);
+  // Self-tests use deliberately synthetic, oversized fixtures; production paper runs use the portfolio policy.
+  const portfolioRisk = isSelfTestInvocation
+    ? { allowed: true, scale: 1, cluster: null, snapshot: null }
+    : riskBudgetForNewPosition(account, signal);
+  if (!portfolioRisk.allowed) {
+    account.lastRiskDecision = {
+      at: now,
+      symbol: signal.symbol,
+      allowed: false,
+      reason: portfolioRisk.reason,
+      scale: portfolioRisk.scale,
+      snapshot: portfolioRisk.snapshot
+    };
+    return null;
+  }
+  const availableEquity = Math.max(0, safeNumber(account.availableEquity, account.equity));
+  if (availableEquity <= 0 || control.marginRequired <= 0 || control.notional <= 0) return null;
+  const estimatedEntryFee = control.notional * config.takerFeeRate;
+  const marginConcentrationCapRatio = clamp(
+    safeNumber(control.marginConcentrationCapRatio, config.riskProfile === "aggressive" ? 0.55 : 0.45),
+    0.05,
+    0.75
+  );
+  const currentMarginCap = Math.max(0, safeNumber(account.equity)) * marginConcentrationCapRatio;
+  const concentrationScale = Math.min(1, currentMarginCap / control.marginRequired);
+  const availabilityScale = Math.min(1, availableEquity / (control.marginRequired + estimatedEntryFee));
+  const scale = Math.min(concentrationScale, availabilityScale, portfolioRisk.scale);
+  if (scale < 0.05) return null;
+  const signalEntryPrice = signal.entry;
+  const entry = adverseExecutionPrice(signalEntryPrice, signal.side, "entry", config.slippageRate);
+  const rawQuantityAtExecutionPrice = Math.min(
+    safeNumber(control.quantity),
+    entry > 0 ? safeNumber(control.notional) / entry : 0
+  );
+  const orderValidation = applyBinanceMarketOrderRules({
+    quantity: rawQuantityAtExecutionPrice * scale,
+    referencePrice: entry,
+    rule: control.exchangeRule,
+    paperTrading: true,
+    marketType: config.marketType
+  });
+  if (!orderValidation.valid) return null;
+  const quantity = orderValidation.quantity;
+  const notional = orderValidation.notional;
+  const actualScale = safeNumber(control.quantity) > 0 ? quantity / safeNumber(control.quantity) : 0;
+  const marginRequired = config.marketType === "futures"
+    ? notional / Math.max(1, Math.floor(safeNumber(control.appliedLeverage, 1)))
+    : notional;
+  const entryFee = notional * config.takerFeeRate;
+  const entrySlippageCost = Math.abs(entry - signalEntryPrice) * quantity;
+  const maxLossAmount = control.maxLossAmount * actualScale;
+  const position = {
+    id: `paper-${signal.id}`,
+    signalId: signal.id,
+    costModelVersion: 1,
+    openedAt: now,
+    status: "open",
+    symbol: signal.symbol,
+    side: signal.side,
+    candidateMode: signal.candidateMode,
+    accountMarketType: config.marketType,
+    riskProfile: config.riskProfile,
+    signalEntryPrice,
+    entry,
+    currentPrice: signalEntryPrice,
+    takeProfit: signal.takeProfit,
+    stopLoss: signal.stopLoss,
+    originalTakeProfit: signal.takeProfit,
+    originalStopLoss: signal.stopLoss,
+    winRate: signal.winRate,
+    adaptiveWinRateThreshold: signal.adaptiveWinRateThreshold,
+    breakEvenWinRate: signal.breakEvenWinRate,
+    expectancyPct: signal.expectancyPct,
+    expectancyR: signal.expectancyR,
+    eventImpactScore: signal.eventImpactScore,
+    leverage: control.appliedLeverage,
+    leverageRuleExact: control.leverageRuleExact,
+    leverageRuleSource: control.leverageRuleSource,
+    modelSuggestedLeverage: control.modelSuggestedLeverage,
+    leverageCapped: control.leverageCapped,
+    notional,
+    marginRequired,
+    marginConcentrationCapRatio,
+    marginConcentrationCapped: control.marginConcentrationCapped || concentrationScale < 1 - 1e-9,
+    exchangeRule: control.exchangeRule,
+    exchangeRuleValidated: true,
+    quantityAdjustedToExchangeStep: orderValidation.quantityAdjusted || control.quantityAdjustedToExchangeStep,
+    quantity,
+    initialNotional: notional,
+    initialMarginRequired: marginRequired,
+    initialQuantity: quantity,
+    maxLossAmount,
+    initialMaxLossAmount: maxLossAmount,
+    feeRate: config.takerFeeRate,
+    slippageRate: config.slippageRate,
+    fundingIntervalHours: config.fundingIntervalHours,
+    entryFee,
+    entrySlippageCost,
+    exitFee: 0,
+    exitSlippageCost: 0,
+    fundingPnl: 0,
+    fundingSettlements: 0,
+    partialGrossTradingPnl: 0,
+    partialRealizedPnl: 0,
+    partialEntryFee: 0,
+    partialExitFee: 0,
+    partialEntrySlippageCost: 0,
+    partialExitSlippageCost: 0,
+    partialFundingPnl: 0,
+    partialClosedQuantity: 0,
+    partialExitPriceQuantitySum: 0,
+    capitalRotationCount: 0,
+    adaptiveDeRiskCount: 0,
+    dynamicTakeProfitPartialCount: 0,
+    deRiskConfirmationCount: 0,
+    lastAdaptiveDeRiskAt: null,
+    lastFundingRate: 0,
+    lastFundingAt: null,
+    nextFundingAt:
+      config.marketType === "futures"
+        ? nextFundingSettlement(now, config.fundingIntervalHours)
+        : null,
+    scaledByAvailableEquity: availabilityScale < 1 - 1e-9,
+    scaledByPortfolioRisk: portfolioRisk.scale < 1 - 1e-9,
+    portfolioRisk: {
+      scale: portfolioRisk.scale,
+      cluster: portfolioRisk.cluster,
+      snapshot: portfolioRisk.snapshot
+    },
+    relatedEvents: signal.relatedEvents || [],
+    factorSnapshot: signal.factorSnapshot || null,
+    decisionCalculation: signal.calculation || null,
+    decisionReasons: signal.reasons || [],
+    regime: signal.regime || "unknown",
+    maxFavorableExcursionPct: 0,
+    maxAdverseExcursionPct: 0,
+    holdingObservations: [
+      {
+        time: now,
+        price: entry,
+        priceReturnPct: 0,
+        netPnl: -entryFee,
+        fundingRate: 0,
+        openInterest: 0
+      }
+    ],
+    exitPolicyVersion: 4,
+    exitPolicyStartedAt: now,
+    exitConfirmationCount: 0,
+    exitEvaluation: null,
+    unrealizedPnl: 0,
+    unrealizedReturnPct: 0,
+    priceReturnPct: 0
+  };
+  position.dynamicProtection = initializeDynamicProtection(position, now);
+  account.realizedPnl = safeNumber(account.realizedPnl) - entryFee;
+  account.tradingFees = safeNumber(account.tradingFees) + entryFee;
+  account.slippageCost = safeNumber(account.slippageCost) + entrySlippageCost;
+  account.positions[position.id] = position;
+  return position;
+}
+
+function appendEquityPoint(account, now) {
+  const point = {
+    time: now,
+    equity: account.equity,
+    returnPct: account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0,
+    realizedPnl: safeNumber(account.realizedPnl),
+    unrealizedPnl: safeNumber(account.unrealizedPnl)
+  };
+  const curve = account.equityCurve || [];
+  const last = curve.at(-1);
+  if (!last || last.time !== now || Math.abs(safeNumber(last.equity) - point.equity) > 1e-9) {
+    curve.push(point);
+  }
+  account.equityCurve = curve.slice(-5000);
+}
+
+function buildPaperAccountSummary(account) {
+  const curve = Array.isArray(account.equityCurve) ? account.equityCurve : [];
+  const startingCapital = safeNumber(account.startingCapital);
+  const latestEquity = safeNumber(account.equity, startingCapital);
+  let maxEquity = startingCapital;
+  let peak = startingCapital;
+  let maxDrawdownPct = 0;
+  for (const point of curve) {
+    const equity = safeNumber(point.equity);
+    maxEquity = Math.max(maxEquity, equity);
+    peak = Math.max(peak, equity);
+    if (peak > 0) {
+      maxDrawdownPct = Math.min(maxDrawdownPct, equity / peak - 1);
+    }
+  }
+  const returns = [];
+  for (let index = 1; index < curve.length; index += 1) {
+    const previous = safeNumber(curve[index - 1].equity);
+    const current = safeNumber(curve[index].equity);
+    if (previous > 0) returns.push(current / previous - 1);
+  }
+  const avgReturn = mean(returns);
+  const returnStd = std(returns);
+  const sharpeRatio = returnStd > 0 ? (avgReturn / returnStd) * Math.sqrt(Math.max(returns.length, 1)) : 0;
+  const trades = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+  const closedTrades = Math.max(
+    trades.length,
+    Math.round(safeNumber(account.lifetimeClosedTrades, trades.length))
+  );
+  const wins = Math.min(
+    closedTrades,
+    Math.max(
+      trades.filter((trade) => safeNumber(trade.realizedPnl) > 0).length,
+      Math.round(safeNumber(account.lifetimeWinningTrades))
+    )
+  );
+  return {
+    startTime: account.startedAt || account.createdAt,
+    endTime: account.updatedAt,
+    startingCapital,
+    latestEquity,
+    finalReturnPct: startingCapital > 0 ? latestEquity / startingCapital - 1 : 0,
+    maxReturnPct: startingCapital > 0 ? maxEquity / startingCapital - 1 : 0,
+    maxDrawdownPct,
+    sharpeRatio,
+    closedTrades,
+    wins,
+    losses: closedTrades - wins,
+    winRate: closedTrades ? wins / closedTrades : 0,
+    openPositions: Object.keys(account.positions || {}).length,
+    realizedPnl: safeNumber(account.realizedPnl),
+    unrealizedPnl: safeNumber(account.unrealizedPnl),
+    tradingFees: safeNumber(account.tradingFees),
+    slippageCost: safeNumber(account.slippageCost),
+    fundingPnl: safeNumber(account.fundingPnl),
+    marginUsed: safeNumber(account.marginUsed),
+    availableEquity: safeNumber(account.availableEquity),
+    formula:
+      "净权益=本金+已实现现金流(含手续费与资金费)+按不利滑点和平仓手续费估算的未实现盈亏；收益率=净权益/本金-1。"
+  };
+}
+
+function settleExitCounterfactuals(account, marketBySymbol, now) {
+  const nowMs = Date.parse(now);
+  const updatedClosedTrades = [];
+  for (const trade of [...(account.tradeHistory || []), ...(account.exitDecisionHistory || [])]) {
+    const counterfactual = trade?.exitCounterfactual;
+    if (!counterfactual || counterfactual.status !== "pending") continue;
+    if (nowMs < Date.parse(counterfactual.dueAt || "")) continue;
+    const price = safeNumber(marketBySymbol[trade.symbol]?.latest);
+    const exitPrice = safeNumber(counterfactual.referenceExitPrice, trade.exitPrice);
+    if (price <= 0 || exitPrice <= 0) continue;
+    const counterfactualReturnPct =
+      trade.side === "short" ? 1 - price / exitPrice : price / exitPrice - 1;
+    const replacementSymbol = counterfactual.replacementSymbol;
+    let replacementReturnPct = null;
+    let relativeAdvantagePct = null;
+    if (replacementSymbol) {
+      const replacementPrice = safeNumber(marketBySymbol[replacementSymbol]?.latest);
+      const replacementReferencePrice = safeNumber(counterfactual.replacementReferencePrice);
+      if (replacementPrice <= 0 || replacementReferencePrice <= 0) continue;
+      replacementReturnPct = counterfactual.replacementSide === "short"
+        ? 1 - replacementPrice / replacementReferencePrice
+        : replacementPrice / replacementReferencePrice - 1;
+      const switchingCostPct = 2 * (safeNumber(trade.feeRate) + safeNumber(trade.slippageRate));
+      relativeAdvantagePct = replacementReturnPct - counterfactualReturnPct - switchingCostPct;
+    }
+    trade.exitCounterfactual = {
+      ...counterfactual,
+      status: "evaluated",
+      evaluatedAt: now,
+      counterfactualPrice: price,
+      counterfactualReturnPct,
+      avoidedReturnPct: -counterfactualReturnPct,
+      replacementReturnPct,
+      relativeAdvantagePct,
+      beneficial: replacementSymbol ? relativeAdvantagePct > 0 : counterfactualReturnPct <= 0
+    };
+    if (trade.status === "closed" && trade.id) updatedClosedTrades.push(trade);
+  }
+  return updatedClosedTrades;
+}
+
+function executeCapitalRotation(account, signal, marketBySymbol, now) {
+  if (Object.values(account.positions || {}).some((position) => position.symbol === signal.symbol)) {
+    return { executed: false, plan: { feasible: false, reason: "duplicate_symbol", releases: [] }, closed: [], partial: [] };
+  }
+  const plan = planCapitalRotation({ account, signal, now });
+  if (!plan.required || !plan.feasible || !plan.releases.length) {
+    return { executed: false, plan, closed: [], partial: [] };
+  }
+  const closed = [];
+  const partial = [];
+  for (const release of plan.releases) {
+    const position = account.positions[release.positionId];
+    if (!position) continue;
+    const price = safeNumber(marketBySymbol[position.symbol]?.latest, position.currentPrice || position.entry);
+    if (price <= 0) continue;
+    position.capitalRotationReplacement = {
+      decidedAt: now,
+      symbol: signal.symbol,
+      side: signal.side,
+      entry: signal.entry,
+      expectancyPct: signal.expectancyPct,
+      winRate: signal.winRate,
+      advantagePct: release.advantagePct
+    };
+    attachCapitalRotationExitEvaluation(
+      position,
+      { ...release, replacementSymbol: signal.symbol },
+      plan,
+      now
+    );
+    if (release.fullClose) {
+      const item = closePaperPosition(account, position.id, price, "CAPITAL_ROTATION", now);
+      if (item) closed.push(item);
+    } else {
+      const exchangeStepBuffer = position.exchangeRule
+        ? safeNumber(position.exchangeRule.stepSize) / Math.max(safeNumber(position.quantity), 1e-12)
+        : 0;
+      const bufferedFraction = clamp(release.fraction + exchangeStepBuffer, 0, 0.999999);
+      const item = partiallyClosePaperPosition(account, position.id, price, bufferedFraction, signal, now);
+      if (item) partial.push(item);
+    }
+  }
+  markPaperPositions(account, marketBySymbol, now);
+  return { executed: closed.length + partial.length > 0, plan, closed, partial };
+}
+
+function updatePaperAccount(account, actionableSignals, allCandidates, marketBySymbol) {
+  const now = new Date().toISOString();
+  account.version = MONITOR_VERSION;
+  account.updatedAt = now;
+  markPaperPositions(account, marketBySymbol, now);
+  const candidatesBySymbol = Object.fromEntries(allCandidates.map((candidate) => [candidate.symbol, candidate]));
+  const exitActions = closeTriggeredPaperPositions(account, marketBySymbol, candidatesBySymbol, now);
+  const closedPositions = exitActions.closed;
+  const adaptiveDeRisks = exitActions.partialDeRisks;
+  const dynamicTakeProfits = exitActions.partialTakeProfits;
+  markPaperPositions(account, marketBySymbol, now);
+  const openedPositions = [];
+  const capitalRotations = [];
+  for (const signal of actionableSignals) {
+    const rotation = executeCapitalRotation(account, signal, marketBySymbol, now);
+    if (rotation.executed) {
+      capitalRotations.push({
+        replacementSymbol: signal.symbol,
+        plan: rotation.plan,
+        closedPositionIds: rotation.closed.map((item) => item.id),
+        partialEventIds: rotation.partial.map((item) => item.id)
+      });
+      closedPositions.push(...rotation.closed);
+    }
+    const opened = openPaperPosition(account, signal, now);
+    if (opened) {
+      if (rotation.executed) opened.capitalRotationPlan = rotation.plan;
+      openedPositions.push(opened);
+      markPaperPositions(account, marketBySymbol, now);
+    }
+  }
+  markPaperPositions(account, marketBySymbol, now);
+  const counterfactualUpdates = settleExitCounterfactuals(account, marketBySymbol, now);
+  appendEquityPoint(account, now);
+  const archiveUpdates = [...new Map(
+    [...closedPositions, ...counterfactualUpdates].map((trade) => [trade.id, trade])
+  ).values()];
+  const postTradeReviewResult = runArchivedPostTradeReview(account, archiveUpdates, now);
+  account.summary = buildPaperAccountSummary(account);
+  account.lastRun = {
+    generatedAt: now,
+    openedPositions,
+    closedPositions,
+    adaptiveDeRisks,
+    dynamicTakeProfits,
+    capitalRotations,
+    postTradeReview: postTradeReviewResult.review
+  };
+  return account;
+}
+
+function runArchivedPostTradeReview(account, newlyClosedTrades, now) {
+  if (isSelfTestInvocation) {
+    return maybeRunPostTradeReview(account, DIRECTION_MODEL_WEIGHTS, now);
+  }
+  const archive = (Array.isArray(newlyClosedTrades) && newlyClosedTrades.length)
+    ? appendTradeHistoryRecords(RUNTIME_DIR, newlyClosedTrades)
+    : tradeHistoryStats(RUNTIME_DIR);
+  const config = normalizePostTradeReviewConfig(account.postTradeReviewConfig);
+  const reviewed = safeNumber(account.postTradeReview?.reviewedTradeCount);
+  const due = config.enabled && archive.totalRecords - reviewed >= config.reviewEveryTrades;
+  return maybeRunPostTradeReview(account, DIRECTION_MODEL_WEIGHTS, now, {
+    totalClosedTrades: archive.totalRecords,
+    trades: due ? loadTradeHistoryRecords(RUNTIME_DIR, { limit: MODEL_TRADE_HISTORY_LIMIT }) : account.tradeHistory,
+    exitDecisionTrades: account.exitDecisionHistory
+  });
+}
+
+function updatePaperAccountForEntryState(
+  account,
+  actionableSignals,
+  allCandidates,
+  marketBySymbol,
+  maxConcurrentPositions = Number.POSITIVE_INFINITY
+) {
+  const openSymbols = Object.values(account.positions || {}).map((position) => position.symbol);
+  const sessionLimitedSignals = limitSessionEntryCandidates(
+    actionableSignals,
+    openSymbols,
+    maxConcurrentPositions
+  );
+  return updatePaperAccount(
+    account,
+    account.isActive ? sessionLimitedSignals : [],
+    allCandidates,
+    marketBySymbol
+  );
+}
+
+function updateOpenSignalsAndReviews(state, candidates, marketBySymbol, now = Date.now()) {
+  const closedThisRun = [];
+  const activeSignals = state.activeSignals || {};
+
+  for (const [id, signal] of Object.entries(activeSignals)) {
+    const createdAtMs = Date.parse(signal.createdAt || "");
+    const expired = !Number.isFinite(createdAtMs) || now - createdAtMs >= OPEN_SIGNAL_MAX_AGE_MS;
+    if (!signal.expiresAt && Number.isFinite(createdAtMs)) {
+      signal.expiresAt = new Date(createdAtMs + OPEN_SIGNAL_MAX_AGE_MS).toISOString();
+    }
+    const market = marketBySymbol[signal.symbol];
+    const price = safeNumber(market?.latest);
+    if (!(price > 0)) {
+      if (!expired) continue;
+      const closed = compactClosedSignal({
+        ...signal,
+        closedAt: new Date(now).toISOString(),
+        closePrice: null,
+        outcome: "UNRESOLVED_EXPIRED",
+        realizedR: null,
+        calibrationEligible: false,
+        unresolvedReason: "MARKET_PRICE_UNAVAILABLE_AT_EXPIRY",
+        review: buildReview("UNRESOLVED_EXPIRED", null)
+      });
+      closedThisRun.push(closed);
+      delete activeSignals[id];
+      continue;
+    }
+    signal.lastObservedAt = new Date(now).toISOString();
+    signal.lastObservedPrice = price;
+    let outcome = null;
+    if (signal.side === "long") {
+      if (price >= signal.takeProfit) outcome = "TP";
+      if (price <= signal.stopLoss) outcome = "SL";
+    } else {
+      if (price <= signal.takeProfit) outcome = "TP";
+      if (price >= signal.stopLoss) outcome = "SL";
+    }
+    if (!outcome && expired) outcome = "EXPIRED";
+    if (!outcome) continue;
+
+    const realizedR =
+      outcome === "TP"
+        ? signal.rewardRiskRatio
+        : outcome === "SL"
+          ? -1
+          : signal.side === "long"
+            ? (price - signal.entry) / Math.max(signal.entry - signal.stopLoss, 1e-9)
+            : (signal.entry - price) / Math.max(signal.stopLoss - signal.entry, 1e-9);
+    const closed = compactClosedSignal({
+      ...signal,
+      closedAt: new Date(now).toISOString(),
+      closePrice: price,
+      outcome,
+      realizedR,
+      calibrationEligible: true,
+      review: buildReview(outcome, realizedR)
+    });
+    closedThisRun.push(closed);
+    delete activeSignals[id];
+    updateCalibration(state, signal.winRate, realizedR);
+  }
+
+  for (const candidate of candidates.filter((item) => item.status === "passed")) {
+    const duplicate = Object.values(activeSignals).some(
+      (signal) => signal.symbol === candidate.symbol && signal.side === candidate.side
+    );
+    if (duplicate) continue;
+    activeSignals[candidate.id] = {
+      ...candidate,
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + OPEN_SIGNAL_MAX_AGE_MS).toISOString()
+    };
+  }
+
+  state.activeSignals = activeSignals;
+  state.closedSignals = [...(state.closedSignals || []), ...closedThisRun]
+    .map(compactClosedSignal)
+    .slice(-SIGNAL_OUTCOME_HISTORY_LIMIT);
+  return closedThisRun;
+}
+
+function compactClosedSignal(signal) {
+  const closePrice = signal?.closePrice == null ? Number.NaN : Number(signal.closePrice);
+  const realizedR = signal?.realizedR == null ? Number.NaN : Number(signal.realizedR);
+  return {
+    id: signal?.id || null,
+    symbol: signal?.symbol || null,
+    side: signal?.side || null,
+    candidateMode: signal?.candidateMode || null,
+    createdAt: signal?.createdAt || null,
+    expiresAt: signal?.expiresAt || null,
+    closedAt: signal?.closedAt || null,
+    closePrice: Number.isFinite(closePrice) ? closePrice : null,
+    outcome: signal?.outcome || null,
+    realizedR: Number.isFinite(realizedR) ? realizedR : null,
+    calibrationEligible: signal?.calibrationEligible !== false && Number.isFinite(realizedR),
+    unresolvedReason: signal?.unresolvedReason || null,
+    entry: safeNumber(signal?.entry),
+    takeProfit: safeNumber(signal?.takeProfit),
+    stopLoss: safeNumber(signal?.stopLoss),
+    winRate: safeNumber(signal?.winRate),
+    adaptiveWinRateThreshold: safeNumber(signal?.adaptiveWinRateThreshold),
+    breakEvenWinRate: safeNumber(signal?.breakEvenWinRate),
+    expectancyPct: safeNumber(signal?.expectancyPct),
+    expectancyR: safeNumber(signal?.expectancyR),
+    rewardRiskRatio: safeNumber(signal?.rewardRiskRatio),
+    highImpactEvent: signal?.highImpactEvent === true,
+    eventImpactScore: safeNumber(signal?.eventImpactScore),
+    combinedDirection: safeNumber(signal?.combinedDirection),
+    mathSignal: safeNumber(signal?.mathSignal),
+    eventDirection: safeNumber(signal?.eventDirection),
+    regime: signal?.regime || null,
+    factors: signal?.factors && typeof signal.factors === "object" ? signal.factors : {},
+    review: signal?.review || null
+  };
+}
+
+function summarizeSignalOutcomeSamples(samples) {
+  const rows = Array.isArray(samples) ? samples : [];
+  if (!rows.length) {
+    return { samples: 0, wins: 0, winRate: 0, avgPredictedWinRate: 0, avgRealizedR: 0, brierScore: null };
+  }
+  let wins = 0;
+  let predictedSum = 0;
+  let realizedRSum = 0;
+  let brierSum = 0;
+  for (const sample of rows) {
+    const won = safeNumber(sample.realizedR) > 0 ? 1 : 0;
+    const predicted = clamp(safeNumber(sample.winRate), 0, 1);
+    wins += won;
+    predictedSum += predicted;
+    realizedRSum += safeNumber(sample.realizedR);
+    brierSum += (predicted - won) ** 2;
+  }
+  return {
+    samples: rows.length,
+    wins,
+    winRate: wins / rows.length,
+    avgPredictedWinRate: predictedSum / rows.length,
+    avgRealizedR: realizedRSum / rows.length,
+    brierScore: brierSum / rows.length
+  };
+}
+
+function buildSignalOutcomeDataset(state) {
+  const stored = (Array.isArray(state?.closedSignals) ? state.closedSignals : [])
+    .map(compactClosedSignal)
+    .sort((left, right) => Date.parse(left.closedAt || "") - Date.parse(right.closedAt || ""));
+  const eligible = stored.filter((sample) => sample.calibrationEligible && Number.isFinite(sample.realizedR));
+  const trainingCount = Math.floor(eligible.length * 0.8);
+  return {
+    observationWindowHours: OPEN_SIGNAL_MAX_AGE_MS / 3_600_000,
+    historyLimit: SIGNAL_OUTCOME_HISTORY_LIMIT,
+    storedSamples: stored.length,
+    eligibleSamples: eligible.length,
+    unresolvedSamples: stored.filter((sample) => sample.outcome === "UNRESOLVED_EXPIRED").length,
+    split: "chronological-80-20",
+    training: summarizeSignalOutcomeSamples(eligible.slice(0, trainingCount)),
+    validation: summarizeSignalOutcomeSamples(eligible.slice(trainingCount)),
+    lifetimeCalibration: state?.calibration || createInitialState().calibration
+  };
+}
+
+function buildReview(outcome, realizedR) {
+  if (outcome === "TP") {
+    return "Take profit reached. Increase weights for contributing factors slightly, then continue out-of-sample calibration.";
+  }
+  if (outcome === "SL") {
+    return "Stop loss reached. Reduce weights for contributing factors and review event score, math direction, and cost assumptions.";
+  }
+  if (outcome === "UNRESOLVED_EXPIRED") {
+    return "Signal observation window expired without a usable market price. Removed without changing calibration.";
+  }
+  return `Signal expired with realizedR=${realizedR.toFixed(2)}. Lower confidence in similar time-window signals.`;
+}
+
+function updateCalibration(state, predictedWinRate, realizedR) {
+  const calibration = state.calibration || createInitialState().calibration;
+  const sample = calibration.samples + 1;
+  const won = realizedR > 0 ? 1 : 0;
+  calibration.samples = sample;
+  calibration.wins += won;
+  calibration.losses += won ? 0 : 1;
+  calibration.avgPredictedWinRate =
+    (calibration.avgPredictedWinRate * (sample - 1) + predictedWinRate) / sample;
+  calibration.avgRealizedR = (calibration.avgRealizedR * (sample - 1) + realizedR) / sample;
+  state.calibration = calibration;
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+}
+
+async function analyzeSymbol(symbol, state, factorConfig) {
+  const microstructureSnapshot = marketMicrostructure.snapshot(symbol);
+  const factorLibraryEnabled = factorConfig?.enabled !== false;
+  const richExternalData = factorLibraryEnabled && SYMBOLS.indexOf(symbol) < FACTOR_EXTERNAL_SYMBOL_LIMIT;
+  const [candles15m, candles1h, fundingRate, openInterest, candles1m, derivatives] = await Promise.all([
+    fetchCandles(symbol, "15m", 120),
+    fetchCandles(symbol, "1h", 120),
+    fetchWithFallback(`${symbol} funding`, () => fetchFunding(symbol), 0),
+    fetchWithFallback(`${symbol} open interest`, () => fetchOpenInterest(symbol), 0),
+    factorLibraryEnabled
+      ? cachedFactorSource(`factor:1m:${symbol}`, 55_000, () => fetchCandles(symbol, "1m", 120), [])
+      : Promise.resolve([]),
+    richExternalData
+      ? cachedFactorSource(`factor:okx:${symbol}`, 5 * 60_000, () => fetchOkxFactorStatistics(symbol), { sources: {} })
+      : Promise.resolve({ sources: {} })
+  ]);
+  const warnings = [];
+  if (fundingRate?.sourceFailure) warnings.push(fundingRate.sourceFailure);
+  if (openInterest?.sourceFailure) warnings.push(openInterest.sourceFailure);
+  const previousOpenInterest = state.openInterest?.[symbol] || null;
+  const market = analyzeMarket(
+    symbol,
+    candles15m,
+    candles1h,
+    safeNumber(fundingRate),
+    safeNumber(openInterest),
+    previousOpenInterest,
+    microstructureSnapshot,
+    state.directionWeights || DIRECTION_MODEL_WEIGHTS
+  );
+  state.openInterest = state.openInterest || {};
+  state.openInterest[symbol] = {
+    value: safeNumber(openInterest),
+    updatedAt: new Date().toISOString()
+  };
+  return {
+    market,
+    warnings,
+    factorContext: {
+      candles1m: Array.isArray(candles1m) ? candles1m : [],
+      candles15m,
+      candles1h,
+      derivatives: derivatives && typeof derivatives === "object" ? derivatives : { sources: {} }
+    }
+  };
+}
+
+function roundNumber(value, digits = 6) {
+  return typeof value === "number" && Number.isFinite(value) ? Number(value.toFixed(digits)) : value;
+}
+
+function compactEvent(event) {
+  return {
+    id: event.id || null,
+    type: event.type || "news",
+    provider: event.provider || event.source,
+    source: event.source,
+    sourceName: event.sourceName || null,
+    storyId: event.storyId || null,
+    sourceTier: event.sourceTier || null,
+    corroborationCount: event.corroborationCount || 1,
+    duplicateCount: event.duplicateCount || 0,
+    corroboratingSources: event.corroboratingSources || [event.source],
+    trendScore: roundNumber(event.trendScore),
+    title: event.title,
+    url: event.url,
+    occurredAt: event.occurredAt || null,
+    receivedAt: event.receivedAt || null,
+    freshness: event.freshness || null,
+    direction: event.direction,
+    rawImpactScore: Math.round(safeNumber(event.rawImpactScore, event.impactScore)),
+    impactScore: Math.round(safeNumber(event.impactScore)),
+    matchedSymbols: event.matchedSymbols || [],
+    marketWide: Boolean(event.marketWide),
+    yesPrice: roundNumber(event.yesPrice),
+    yesProbability: roundNumber(event.yesProbability),
+    noProbability: roundNumber(event.noProbability),
+    outcomeLabels: event.outcomeLabels || [],
+    outcomeProbabilities: (event.outcomeProbabilities || []).map((value) => roundNumber(value)),
+    outcomeRatio: roundNumber(event.outcomeRatio),
+    priceDelta: roundNumber(event.priceDelta),
+    bullProbability: roundNumber(event.bullProbability),
+    bearProbability: roundNumber(event.bearProbability),
+    bullBearRatio: roundNumber(event.bullBearRatio),
+    bullProbabilityDelta: roundNumber(event.bullProbabilityDelta),
+    volume: roundNumber(event.volume),
+    liquidity: roundNumber(event.liquidity),
+    volumeDelta: roundNumber(event.volumeDelta),
+    liquidityDelta: roundNumber(event.liquidityDelta),
+    monitoringStatus: event.monitoringStatus || null,
+    monitoringStartedAt: event.monitoringStartedAt || null,
+    monitoringObservations: event.monitoringObservations || null,
+    marketEndDate: event.marketEndDate || null,
+    metrics: event.metrics || {},
+    reasons: event.reasons || null,
+    text: event.text
+  };
+}
+
+function buildMessageFeed(scoredEvents) {
+  return scoredEvents
+    .slice()
+    .sort((a, b) => safeNumber(b.impactScore) - safeNumber(a.impactScore))
+    .slice(0, MESSAGE_FEED_LIMIT)
+    .map(compactEvent);
+}
+
+function buildModelCalculations(marketAnalyses, eventsBySymbol, candidates) {
+  const candidateBySymbol = new Map(candidates.map((candidate) => [candidate.symbol, candidate]));
+  return marketAnalyses
+    .slice()
+    .sort((a, b) => Math.abs(b.mathSignal) - Math.abs(a.mathSignal))
+    .map((market) => {
+      const eventAggregate = eventsBySymbol[market.symbol] || { score: 0, direction: 0, events: [] };
+      const candidate = candidateBySymbol.get(market.symbol) || null;
+      return {
+        symbol: market.symbol,
+        latest: market.latest,
+        regime: market.regime,
+        mathSignal: market.mathSignal,
+        eventImpactScore: Math.round(eventAggregate.score || 0),
+        eventDirection: roundNumber(eventAggregate.direction || 0),
+        analysisMode: eventAggregate.score > 0 ? "event_math" : "math_only",
+        candidateStatus: candidate?.status || "no_candidate",
+        eventCount: roundNumber(eventAggregate.eventCount || 0, 3),
+        candidateMode: candidate?.candidateMode || (eventAggregate.score > 0 ? "event_math" : "math_only"),
+        noCandidateReason: candidate
+          ? null
+          : `abs(${eventAggregate.score > 0 ? "combinedDirection" : "mathSignal"}) < ${MIN_COMBINED_DIRECTION} or missing market price`,
+        mathBreakdown: market.mathBreakdown,
+        candidateCalculation: candidate?.calculation || null,
+        signal: candidate
+          ? {
+              side: candidate.side,
+              entry: candidate.entry,
+              takeProfit: candidate.takeProfit,
+              stopLoss: candidate.stopLoss,
+              winRate: candidate.winRate,
+              expectancyPct: candidate.expectancyPct,
+              expectancyR: candidate.expectancyR,
+              positionRiskPct: candidate.positionRiskPct,
+              accountControl: candidate.accountControl,
+              markowitz: candidate.markowitz
+            }
+          : null,
+        advancedModels: {
+          gbm: market.gbm,
+          garch: market.garch,
+          hiddenMarkov: market.hiddenMarkov,
+          poisson:
+            candidate?.calculation?.poisson ||
+            analyzePoissonEventArrival(
+              eventAggregate,
+              clamp((eventAggregate.score || 0) / 100, 0, 1),
+              eventAggregate.score >= 70 && Math.abs(eventAggregate.direction || 0) >= 0.2
+            ),
+          bayesian: candidate?.calculation?.bayesian || null,
+          markowitz: candidate?.markowitz || null
+        },
+        relatedEvents: eventAggregate.events || []
+      };
+    });
+}
+
+function formatPrice(value) {
+  if (value >= 1000) return value.toFixed(2);
+  if (value >= 10) return value.toFixed(4);
+  if (value >= 1) return value.toFixed(5);
+  return value.toPrecision(6);
+}
+
+function renderConsoleReport(report) {
+  const lines = [];
+  lines.push(`Event signal monitor ${report.generatedAt}`);
+  lines.push(`Mode: ${report.mode}. Layer: ${report.layer}. This is not live trading.`);
+  lines.push(
+    `Sources: RSS=${report.sourceCounts.rss} Trend=${report.sourceCounts.trend} GDELT=${report.sourceCounts.gdelt} Polymarket=${report.sourceCounts.polymarket} Binance=${report.sourceCounts.binanceAnnouncements} OKX=${report.sourceCounts.okxAnnouncements} Whale=${report.sourceCounts.whale} UniqueStories=${report.sourceCounts.uniqueStories} Suppressed=${report.sourceCounts.suppressedDuplicates} Markets=${report.sourceCounts.marketAnalyses}`
+  );
+  if (report.warnings.length) {
+    lines.push(`告警：${report.warnings.slice(0, 6).join(" | ")}`);
+  }
+  if (report.closedSignals.length) {
+    lines.push("Closed signals this run:");
+    for (const item of report.closedSignals) {
+      lines.push(
+        `- ${item.symbol} ${item.side} ${item.outcome} close=${formatPrice(item.closePrice)} R=${item.realizedR.toFixed(
+          2
+        )} review=${item.review}`
+      );
+    }
+  }
+  if (!report.actionableSignals.length) {
+    lines.push("No actionable signal passed the hard gates in this run.");
+  } else {
+    lines.push("Actionable paper-alert candidates:");
+    for (const signal of report.actionableSignals) {
+      lines.push(
+        `- ${signal.symbol} ${signal.side.toUpperCase()} entry=${formatPrice(signal.entry)} TP=${formatPrice(
+          signal.takeProfit
+        )} SL=${formatPrice(signal.stopLoss)} Pwin=${(signal.winRate * 100).toFixed(1)}% Gate=${(
+          signal.adaptiveWinRateThreshold * 100
+        ).toFixed(1)}% BE=${(signal.breakEvenWinRate * 100).toFixed(1)}% EV=${(
+          signal.expectancyPct * 100
+        ).toFixed(2)}% EV/R=${signal.expectancyR.toFixed(2)} risk=${(signal.positionRiskPct * 100).toFixed(
+          2
+        )}% event=${signal.eventImpactScore}`
+      );
+    }
+  }
+  lines.push(`Report: ${report.reportPath || LAYER_REPORT_PATH}`);
+  return lines.join("\n");
+}
+
+async function main() {
+  ensureRuntimeDir();
+  const state = readJsonIfExists(STATE_PATH, createInitialState());
+  let factorStatus = normalizeFactorLibraryStatus(
+    readJsonIfExists(FACTOR_LIBRARY_STATUS_PATH, createFactorLibraryStatus())
+  );
+  let factorConfig = normalizeFactorLibraryConfig(
+    readJsonIfExists(FACTOR_LIBRARY_CONFIG_PATH, {}),
+    factorStatus.minedFactors
+  );
+  if (!fs.existsSync(FACTOR_LIBRARY_CONFIG_PATH)) writeJson(FACTOR_LIBRARY_CONFIG_PATH, factorConfig);
+  state.version = MONITOR_VERSION;
+  state.modelWeights = { ...BASE_MODEL_WEIGHTS, ...(state.modelWeights || {}) };
+  state.polymarket = state.polymarket || {};
+  state.openInterest = state.openInterest || {};
+  state.newsTrends = state.newsTrends || {};
+  state.sourceCache = state.sourceCache || {};
+  state.closedSignals = (Array.isArray(state.closedSignals) ? state.closedSignals : [])
+    .map(compactClosedSignal)
+    .slice(-SIGNAL_OUTCOME_HISTORY_LIMIT);
+  const releaseInitialAccountLock = await acquireAccountLock();
+  let accountConfig;
+  let accountSessionId;
+  let reviewWeightVersion = 1;
+  let entryCalibration = state.calibration || createInitialState().calibration;
+  try {
+    accountConfig = readAccountConfig();
+    const initialPaperAccount = readPaperAccount(accountConfig);
+    if (!tradeHistoryMigrated) {
+      appendTradeHistoryRecords(RUNTIME_DIR, initialPaperAccount.tradeHistory);
+      tradeHistoryMigrated = true;
+    }
+    const executedTradeCalibration = buildTradeCalibration(initialPaperAccount.tradeHistory);
+    if (executedTradeCalibration.samples >= 10) entryCalibration = executedTradeCalibration;
+    accountSessionId = initialPaperAccount.sessionId;
+    state.directionWeights = initialPaperAccount.postTradeReview.currentDirectionWeights;
+    reviewWeightVersion = initialPaperAccount.postTradeReview.weightVersion;
+  } finally {
+    releaseInitialAccountLock();
+  }
+  const currentMarketSession = classifyMarketSession(new Date());
+  const warnings = [
+    "仅模拟告警：脚本不会发送实盘订单。",
+    "无证据表明新闻聚合、大模型推理或 Polymarket 赔率本身能稳定盈利。"
+  ];
+  const [aggregatorFetch, gdeltFetch, polymarketFetch, binanceFetch, okxFetch, whaleFetch, tradingRulesFetch] =
+    await Promise.all([
+      fetchCachedSource(state, "aggregator", SOURCE_REFRESH_MS.aggregator, fetchMessageAggregator),
+      fetchCachedSource(state, "gdelt", SOURCE_REFRESH_MS.gdelt, () =>
+        GDELT_ENABLED ? fetchWithFallback("GDELT", fetchGdeltNews, []) : Promise.resolve([])
+      ),
+      fetchCachedSource(state, "polymarket", SOURCE_REFRESH_MS.polymarket, () =>
+        fetchWithFallback("Polymarket", () => fetchPolymarketMarkets(state), [])
+      ),
+      fetchCachedSource(state, "binanceAnnouncements", SOURCE_REFRESH_MS.announcements, () =>
+        fetchWithFallback("Binance announcements", fetchBinanceAnnouncements, [])
+      ),
+      fetchCachedSource(state, "okxAnnouncements", SOURCE_REFRESH_MS.announcements, () =>
+        fetchWithFallback("OKX announcements", fetchOkxAnnouncements, [])
+      ),
+      fetchCachedSource(state, "whale", SOURCE_REFRESH_MS.whale, () =>
+        fetchWithFallback("WhaleAlert", fetchWhaleAlertIfConfigured, { items: [], warning: null })
+      ),
+      fetchCachedSource(
+        state,
+        `binanceTradingRules:${accountConfig.marketType}`,
+        SOURCE_REFRESH_MS.tradingRules,
+        () => fetchWithFallback(
+          "Binance trading rules",
+          () => fetchBinanceTradingRules(accountConfig.marketType),
+          { marketType: accountConfig.marketType, symbols: {}, warning: null }
+        )
+      )
+    ]);
+  const aggregatorResult = aggregatorFetch.value;
+  const gdeltNewsResult = gdeltFetch.value;
+  const polymarketResult = polymarketFetch.value;
+  const binanceAnnouncementsResult = binanceFetch.value;
+  const okxAnnouncementsResult = okxFetch.value;
+  const whaleResult = whaleFetch.value;
+  const tradingRulesResult = tradingRulesFetch.value;
+  for (const result of [aggregatorFetch, gdeltFetch, polymarketFetch, binanceFetch, okxFetch, whaleFetch, tradingRulesFetch]) {
+    if (result.refreshFailure) warnings.push(`缓存降级：${result.refreshFailure}`);
+  }
+  const sourceRefresh = Object.fromEntries(
+    Object.entries({ aggregator: aggregatorFetch, gdelt: gdeltFetch, polymarket: polymarketFetch, binanceAnnouncements: binanceFetch, okxAnnouncements: okxFetch, whale: whaleFetch, binanceTradingRules: tradingRulesFetch })
+      .map(([key, result]) => [key, { cached: result.cached, stale: result.stale === true, fetchedAt: result.fetchedAt, attemptedAt: result.attemptedAt || null, refreshFailure: result.refreshFailure || null, ttlMs: result.ttlMs }])
+  );
+
+  const rawAggregatedItems = Array.isArray(aggregatorResult?.items) ? aggregatorResult.items : [];
+  const trendUpdate = updateTrendHistory(rawAggregatedItems, state.newsTrends);
+  const aggregatedItems = trendUpdate.items;
+  state.newsTrends = trendUpdate.history;
+  const gdeltNews = Array.isArray(gdeltNewsResult) ? gdeltNewsResult : [];
+  const polymarketMarkets = Array.isArray(polymarketResult) ? polymarketResult : [];
+  const binanceAnnouncements = Array.isArray(binanceAnnouncementsResult) ? binanceAnnouncementsResult : [];
+  const okxAnnouncements = Array.isArray(okxAnnouncementsResult) ? okxAnnouncementsResult : [];
+  const whaleItems = Array.isArray(whaleResult?.items) ? whaleResult.items : [];
+  if (whaleResult?.warning) warnings.push(whaleResult.warning);
+  if (tradingRulesResult?.warning) warnings.push(tradingRulesResult.warning);
+  if (aggregatorResult?.sourceFailures?.length) warnings.push(...aggregatorResult.sourceFailures);
+  for (const result of [gdeltNewsResult, polymarketResult, binanceAnnouncementsResult, okxAnnouncementsResult, whaleResult, tradingRulesResult]) {
+    if (result?.sourceFailure) warnings.push(result.sourceFailure);
+  }
+
+  const collectedAt = new Date().toISOString();
+  const allEvents = [
+    ...aggregatedItems,
+    ...gdeltNews,
+    ...polymarketMarkets,
+    ...binanceAnnouncements,
+    ...okxAnnouncements,
+    ...whaleItems
+  ].map((item) => ({ ...item, receivedAt: item.receivedAt || collectedAt }));
+  const storyClustering = clusterMessageItems(allEvents);
+  const scoredEvents = storyClustering.items.map(classifyEvent);
+  const classifiedEvents = scoredEvents.filter((event) => event.impactScore >= 18);
+  const eventsBySymbol = aggregateEventsBySymbol(classifiedEvents);
+
+  const marketResults = await mapWithConcurrency(SYMBOLS, MARKET_CONCURRENCY, async (symbol) => {
+    try {
+      return await analyzeSymbol(symbol, state, factorConfig);
+    } catch (error) {
+      return {
+        market: null,
+        warnings: [`${symbol} 行情数据：${localizeErrorMessage(error instanceof Error ? error.message : String(error))}`]
+      };
+    }
+  });
+  const marketAnalyses = [];
+  for (const result of marketResults) {
+    if (result?.market) marketAnalyses.push(result.market);
+    if (result?.warnings?.length) warnings.push(...result.warnings);
+  }
+
+  const factorSnapshots = buildFactorSnapshots({
+    marketResults,
+    eventsBySymbol,
+    sessionContext: currentMarketSession,
+    status: factorStatus
+  });
+  let historicalFrames = [];
+  const historicalStatus = factorStatus.historicalBackfill || {};
+  const lastHistoryAttemptMs = Date.parse(historicalStatus.lastAttemptAt || "");
+  const historyRetryDue = !Number.isFinite(lastHistoryAttemptMs) || Date.now() - lastHistoryAttemptMs >= 6 * 60 * 60 * 1_000;
+  const historyNeedsMigration = historicalStatus.samplingMode !== "hourly_anchors_non_overlapping_v2";
+  if (
+    factorConfig.enabled &&
+    (
+      historicalStatus.status !== "complete" ||
+      historyNeedsMigration
+    ) &&
+    (historyRetryDue || historyNeedsMigration)
+  ) {
+    factorStatus.historicalBackfill = {
+      ...historicalStatus,
+      status: "processing",
+      lastAttemptAt: new Date().toISOString(),
+      error: null,
+      lookbackMonths: FACTOR_HISTORY_LOOKBACK_MONTHS,
+      intervalMinutes: FACTOR_HISTORY_INTERVAL_MINUTES
+    };
+    writeJson(FACTOR_LIBRARY_STATUS_PATH, factorStatus);
+    try {
+      const historySymbols = SYMBOLS.slice(0, FACTOR_HISTORY_SYMBOL_LIMIT);
+      const seriesBySymbol = await fetchFactorHistory(historySymbols);
+      historicalFrames = buildHistoricalFactorFrames({
+        seriesBySymbol,
+        intervalMinutes: FACTOR_HISTORY_INTERVAL_MINUTES,
+        status: factorStatus,
+        stride: 1
+      });
+      if (historicalFrames.length && Object.keys(seriesBySymbol).length >= 5) {
+        factorStatus.historicalBackfill.symbols = Object.keys(seriesBySymbol).length;
+      } else {
+        throw new Error(`历史 K 线有效标的不足：${Object.keys(seriesBySymbol).length}`);
+      }
+    } catch (error) {
+      factorStatus.historicalBackfill.status = "failed";
+      factorStatus.historicalBackfill.error = error instanceof Error ? error.message : String(error);
+      warnings.push(`因子历史回填暂不可用：${factorStatus.historicalBackfill.error}；继续使用实时样本。`);
+    }
+  }
+  const factorRuntime = updateFactorLibraryRuntime({
+    config: factorConfig,
+    status: factorStatus,
+    snapshots: factorSnapshots,
+    historicalFrames,
+    now: new Date().toISOString()
+  });
+  factorConfig = factorRuntime.config;
+  factorStatus = factorRuntime.status;
+  const factorSnapshotBySymbol = Object.fromEntries(factorSnapshots.map((snapshot) => [snapshot.symbol, snapshot]));
+  for (const market of marketAnalyses) {
+    const snapshot = factorSnapshotBySymbol[market.symbol];
+    const factorDecision = factorDecisionForSnapshot(snapshot, factorConfig, factorStatus);
+    const originalMathSignal = market.mathSignal;
+    market.factorLibrary = factorDecision;
+    market.factorValues = snapshot?.values || {};
+    market.mathSignalBeforeFactorLibrary = originalMathSignal;
+    market.mathSignal = clamp(
+      originalMathSignal * (1 - factorDecision.influence) + factorDecision.composite * factorDecision.influence,
+      -1,
+      1
+    );
+    if (market.mathBreakdown) {
+      market.mathBreakdown.factorLibrary = factorDecision;
+      market.mathBreakdown.resultBeforeFactorLibrary = originalMathSignal;
+      market.mathBreakdown.result = market.mathSignal;
+    }
+  }
+  writeJson(FACTOR_LIBRARY_STATUS_PATH, factorStatus);
+  const factorPublicState = publicFactorLibrary(factorConfig, factorStatus);
+  const factorOneMinuteCoverage = factorPublicState.factors.find((item) => item.id === "return_1m")?.availability?.coverage || 0;
+  if (factorConfig.enabled && factorOneMinuteCoverage < 0.5) {
+    warnings.push("因子库1分钟数据覆盖不足50%；相关因子保持不可用且不会用估算值替代。");
+  }
+
+  for (const market of polymarketMarkets) {
+    if (market.id) {
+      state.polymarket[market.id] = updatePredictionMarketTracking(
+        state.polymarket[market.id],
+        {
+          id: market.id,
+          slug: market.marketSlug,
+          title: market.title,
+          active: market.marketActive,
+          closed: market.marketClosed,
+          endDate: market.marketEndDate,
+          yesPrice: market.yesPrice,
+          yesProbability: market.yesProbability,
+          noProbability: market.noProbability,
+          bullProbability: market.bullProbability,
+          bearProbability: market.bearProbability,
+          outcomeRatio: market.outcomeRatio,
+          bullBearRatio: market.bullBearRatio,
+          volume: market.volume,
+          liquidity: market.liquidity
+        },
+        market.receivedAt || new Date().toISOString()
+      );
+    }
+  }
+
+  const marketBySymbol = Object.fromEntries(marketAnalyses.map((market) => [market.symbol, market]));
+  const tradingRulesBySymbol = tradingRulesResult?.symbols || {};
+  const rawCandidates = marketAnalyses
+    .map((market) =>
+      buildCandidate(
+        market,
+        eventsBySymbol[market.symbol] || { score: 0, direction: 0, events: [] },
+        state.modelWeights,
+        accountConfig,
+        reviewWeightVersion,
+        entryCalibration,
+        tradingRulesBySymbol,
+        currentMarketSession
+      )
+    )
+    .filter(Boolean);
+  const markowitzResult = applyMarkowitzSizing(
+    rawCandidates,
+    marketBySymbol,
+    accountConfig,
+    tradingRulesBySymbol,
+    currentMarketSession
+  );
+  const candidates = markowitzResult.candidates.sort((a, b) => b.expectancyR - a.expectancyR);
+  const actionableSignals = candidates.filter((candidate) => candidate.status === "passed").slice(0, 5);
+  const watchlist = candidates.filter((candidate) => candidate.status !== "passed").slice(0, 8);
+  const closedSignals = updateOpenSignalsAndReviews(state, actionableSignals, marketBySymbol);
+  const releaseAccountLock = await acquireAccountLock();
+  let finalAccountConfig;
+  let updatedPaperAccount;
+  try {
+    finalAccountConfig = readAccountConfig();
+    const latestPaperAccount = readPaperAccount(finalAccountConfig);
+    const sameAccountSession =
+      sameAccountConfig(accountConfig, finalAccountConfig) && accountSessionId === latestPaperAccount.sessionId;
+    updatedPaperAccount = sameAccountSession
+      ? updatePaperAccountForEntryState(
+        latestPaperAccount,
+        actionableSignals,
+        candidates,
+        marketBySymbol,
+        currentMarketSession.policy.maxConcurrentPositions
+      )
+      : latestPaperAccount;
+    state.directionWeights = updatedPaperAccount.postTradeReview?.currentDirectionWeights || state.directionWeights;
+    writeJson(ACCOUNT_STATE_PATH, updatedPaperAccount);
+  } finally {
+    releaseAccountLock();
+  }
+  const messageFeed = buildMessageFeed(scoredEvents);
+  const modelCalculations = buildModelCalculations(marketAnalyses, eventsBySymbol, candidates);
+
+  state.updatedAt = new Date().toISOString();
+  const report = {
+    version: MONITOR_VERSION,
+    generatedAt: state.updatedAt,
+    mode: "paper-alert-only",
+    layer: RUN_LAYER,
+    marketSession: currentMarketSession,
+    simulatedAccount: finalAccountConfig,
+    binanceTradingRules: {
+      marketType: tradingRulesResult?.marketType || accountConfig.marketType,
+      fetchedAt: tradingRulesResult?.fetchedAt || tradingRulesFetch.fetchedAt || null,
+      cached: tradingRulesFetch.cached === true,
+      stale: tradingRulesFetch.stale === true,
+      symbols: Object.keys(tradingRulesBySymbol).length,
+      leverageExact: tradingRulesResult?.leverageExact === true,
+      warning: tradingRulesResult?.warning || tradingRulesResult?.sourceFailure || null
+    },
+    layerTasks: {
+      unifiedHighFrequency: [
+        "Binance/OKX market data",
+        "funding",
+        "open interest",
+        "Polymarket price delta",
+        "exchange announcements",
+        "built-in RSS aggregation",
+        "NewsNow trend ranking",
+        "GDELT global news",
+        "story clustering",
+        "event review",
+        "model weight calibration",
+        "TP/SL/adaptive exit/expiry review"
+      ]
+    },
+    analysisPolicy: {
+      noMessageFallback: "消息面为空时，不中断流程；改用数学模型单独分析市场状态。",
+      mathOnlyInputs: [
+        "EMA20/EMA50",
+        "1h EMA20/EMA50",
+        "ATR",
+        "RSI",
+        "15m/1h ROC",
+        "15m 成交量确认",
+        "实时主动成交、CVD 与五档盘口",
+        "资金费率",
+        "OI 变化",
+        "GBM",
+        "GARCH(1,1)",
+        "三状态 HMM",
+        "泊松事件到达分布",
+        "贝叶斯后验胜率校准",
+        "Markowitz 均值-方差配置"
+      ],
+      advancedModelWeights: {
+        direction: state.directionWeights || DIRECTION_MODEL_WEIGHTS,
+        exit: updatedPaperAccount.postTradeReview?.currentExitWeights || DEFAULT_EXIT_MODEL_WEIGHTS,
+        garchConfidenceWeight: GARCH_CONFIDENCE_WEIGHT,
+        markowitzSizingWeight: MARKOWITZ_SIZING_WEIGHT,
+        bayesianPosteriorWeight: BAYESIAN_POSTERIOR_WEIGHT
+      },
+      mathOnlyGate:
+        "纯数学模式仍必须满足方向强度、正 EV 和自适应胜率门槛；门槛由成本保本胜率、校准误差、样本量、行情状态、波动和因子分歧共同决定，未过线只进入观察或模型展示。",
+      liveTrading: "paper-alert-only，不会发送实盘订单。"
+    },
+    factorLibrary: factorPublicState,
+    reportPath: LAYER_REPORT_PATH,
+    disclaimer:
+      "Trading signals are not profit guarantees. No live order is sent unless the user separately authorizes real trading API access.",
+    gateRules: {
+      mode: "adaptive-break-even-plus-uncertainty",
+      formula:
+        "threshold = clamp(cost-adjusted break-even win rate + profile/sample/calibration/regime/volatility/alignment/mode margins - strong-direction discount, profile safety bounds)",
+      safetyBounds: ADAPTIVE_GATE_BOUNDS,
+      minHighExpectancyR: MIN_HIGH_EXPECTANCY_R,
+      minEvPct: MIN_EV_PCT
+    },
+    portfolioOptimization: markowitzResult.portfolio,
+    sourceCounts: {
+      aggregated: aggregatedItems.length,
+      rss: aggregatedItems.filter((item) => item.provider === "Built-in RSS").length,
+      trend: aggregatedItems.filter((item) => item.provider === "NewsNow").length,
+      gdelt: gdeltNews.length,
+      polymarket: polymarketMarkets.length,
+      binanceAnnouncements: binanceAnnouncements.length,
+      okxAnnouncements: okxAnnouncements.length,
+      whale: whaleItems.length,
+      rawEvents: storyClustering.stats.inputCount,
+      uniqueStories: storyClustering.stats.outputCount,
+      suppressedDuplicates: storyClustering.stats.suppressedDuplicates,
+      classifiedEvents: classifiedEvents.length,
+      marketAnalyses: marketAnalyses.length
+    },
+    sourceRefresh,
+    storyClustering: storyClustering.stats,
+    warnings: [...new Set(warnings)].slice(0, 80),
+    messageFeedStats: {
+      total: scoredEvents.length,
+      displayed: messageFeed.length,
+      limit: MESSAGE_FEED_LIMIT
+    },
+    messageFeed,
+    modelCalculations,
+    actionableSignals,
+    watchlist,
+    closedSignals,
+    activeSignals: Object.values(state.activeSignals || {}),
+    signalOutcomeDataset: buildSignalOutcomeDataset(state),
+    paperAccount: updatedPaperAccount,
+    calibration: state.calibration,
+    entryCalibration,
+    modelWeights: state.modelWeights,
+    directionWeights: state.directionWeights,
+    postTradeReview: updatedPaperAccount.postTradeReview || null
+  };
+
+  let historyStorage;
+  try {
+    historyStorage = appendCompactHistory({
+      filePath: HISTORY_PATH,
+      report,
+      state,
+      now: report.generatedAt
+    });
+  } catch (error) {
+    historyStorage = {
+      written: false,
+      reason: "write_failed",
+      error: error instanceof Error ? error.message : String(error)
+    };
+    report.warnings = [
+      ...new Set([...report.warnings, `历史摘要写入失败：${historyStorage.error}`])
+    ];
+  }
+  report.historyStorage = historyStorage;
+  if (historyStorage.reason === "low_disk") {
+    report.warnings = [...new Set([...report.warnings, "历史摘要写入已暂停：磁盘可用空间低于 10%。"])];
+  }
+  writeJson(STATE_PATH, state);
+  writeJson(LAYER_REPORT_PATH, report);
+  if (LAYER_REPORT_PATH !== REPORT_PATH) {
+    writeJson(REPORT_PATH, report);
+  }
+  console.log(renderConsoleReport(report));
+}
+
+async function run() {
+  const startedAt = Date.now();
+  appendRuntimeLog(`[${new Date(startedAt).toISOString()}] signal:monitor run started`);
+  const releaseLock = await acquireRuntimeLock();
+  try {
+    await main();
+    appendRuntimeLog(`[${new Date().toISOString()}] signal:monitor run completed elapsedMs=${Date.now() - startedAt}`);
+  } catch (error) {
+    appendRuntimeLog(`[${new Date().toISOString()}] signal:monitor run failed elapsedMs=${Date.now() - startedAt} error=${error instanceof Error ? error.message : String(error)}`);
+    throw error;
+  } finally {
+    releaseLock();
+  }
+}
+
+function candidatesFromLatestReport() {
+  const report = readJsonIfExists(REPORT_PATH, {});
+  const candidates = [
+    ...(Array.isArray(report?.actionableSignals) ? report.actionableSignals : []),
+    ...(Array.isArray(report?.watchlist) ? report.watchlist : [])
+  ];
+  return Object.fromEntries(candidates.map((candidate) => [candidate.symbol, candidate]));
+}
+
+function openPositionStreamConfig() {
+  const account = readJsonIfExists(ACCOUNT_STATE_PATH, null);
+  const symbols = [...new Set(Object.values(account?.positions || {}).map((position) => position.symbol).filter(Boolean))].sort();
+  return {
+    symbols,
+    marketType: account?.configSnapshot?.marketType === "spot" ? "spot" : "futures",
+    accountActive: account?.isActive === true
+  };
+}
+
+function marketStreamConfig() {
+  const positions = openPositionStreamConfig();
+  const report = readJsonIfExists(REPORT_PATH, {});
+  const rankedCandidates = [
+    ...(Array.isArray(report?.actionableSignals) ? report.actionableSignals : []),
+    ...(Array.isArray(report?.watchlist) ? report.watchlist : [])
+  ].map((candidate) => candidate?.symbol).filter(Boolean);
+  const positionSymbols = [...positions.symbols];
+  const remainingCapacity = Math.max(0, ORDER_FLOW_SYMBOL_LIMIT - positionSymbols.length);
+  const candidateSymbols = [...new Set(rankedCandidates)]
+    .filter((symbol) => !positionSymbols.includes(symbol))
+    .slice(0, remainingCapacity);
+  const orderFlowSymbols = [...positionSymbols, ...candidateSymbols];
+  return {
+    ...positions,
+    protectionSymbols: positionSymbols,
+    orderFlowSymbols,
+    symbols: [...new Set([...positionSymbols, ...orderFlowSymbols])].sort()
+  };
+}
+
+async function runPriceProtectionCycle(prices, serviceState) {
+  if (!prices.size) return;
+  const releaseAccountLock = await acquireAccountLock();
+  try {
+    const config = readAccountConfig();
+    const account = readPaperAccount(config);
+    if (!Object.keys(account.positions || {}).length) return;
+    const changedSymbols = new Set(prices.keys());
+    const marketBySymbol = Object.fromEntries(
+      Object.values(account.positions || {}).map((position) => [
+        position.symbol,
+        {
+          latest: safeNumber(prices.get(position.symbol), position.currentPrice || position.entry),
+          fundingRate: safeNumber(position.lastFundingRate)
+        }
+      ])
+    );
+    const now = new Date().toISOString();
+    markPaperPositions(account, marketBySymbol, now);
+    const actions = closeTriggeredPaperPositions(
+      account,
+      marketBySymbol,
+      candidatesFromLatestReport(),
+      now,
+      changedSymbols
+    );
+    markPaperPositions(account, marketBySymbol, now);
+    const counterfactualUpdates = settleExitCounterfactuals(account, marketBySymbol, now);
+    appendEquityPoint(account, now);
+    if (actions.closed.length || actions.partialDeRisks.length || actions.partialTakeProfits.length || counterfactualUpdates.length) {
+      const archiveUpdates = [...new Map(
+        [...actions.closed, ...counterfactualUpdates].map((trade) => [trade.id, trade])
+      ).values()];
+      runArchivedPostTradeReview(account, archiveUpdates, now);
+    }
+    account.updatedAt = now;
+    account.summary = buildPaperAccountSummary(account);
+    account.lastProtectionRun = {
+      generatedAt: now,
+      source: "binance-bookTicker-websocket",
+      symbols: [...changedSymbols],
+      closedPositions: actions.closed.map((item) => ({ id: item.id, symbol: item.symbol, reason: item.closeReason })),
+      adaptiveDeRisks: actions.partialDeRisks.map((item) => ({ id: item.id, symbol: item.symbol })),
+      dynamicTakeProfits: actions.partialTakeProfits.map((item) => ({ id: item.id, symbol: item.symbol }))
+    };
+    writeJson(ACCOUNT_STATE_PATH, account);
+    serviceState.lastProtectionAt = now;
+    serviceState.protectionCycles = safeNumber(serviceState.protectionCycles) + 1;
+    serviceState.protectionActions =
+      safeNumber(serviceState.protectionActions) +
+      actions.closed.length +
+      actions.partialDeRisks.length +
+      actions.partialTakeProfits.length;
+  } finally {
+    releaseAccountLock();
+  }
+}
+
+async function runService() {
+  ensureRuntimeDir();
+  let releaseServiceLock;
+  try {
+    releaseServiceLock = await acquireFileLock(SERVICE_LOCK_PATH, 0, 10_000);
+  } catch (error) {
+    if (String(error instanceof Error ? error.message : error).startsWith("Timed out waiting for lock:")) {
+      appendRuntimeLog(`[${new Date().toISOString()}] monitor service already running; duplicate start ignored`);
+      return;
+    }
+    throw error;
+  }
+  const serviceState = {
+    version: 1,
+    mode: "event-driven-hybrid",
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    heartbeatAt: null,
+    decisionBackend: "adaptive-sequential-rest",
+    priceBackend: "binance-bookTicker-websocket",
+    orderFlowBackend: "binance-aggTrade-depth5-websocket",
+    priceConnected: false,
+    orderFlowConnected: false,
+    orderFlowDepthConnected: false,
+    orderFlowTradeConnected: false,
+    subscribedSymbols: [],
+    orderFlowSymbols: [],
+    lastPriceEventAt: null,
+    lastOrderFlowEventAt: null,
+    lastProtectionAt: null,
+    protectionCycles: 0,
+    protectionActions: 0,
+    decisionCycles: 0,
+    consecutiveDecisionFailures: 0,
+    lastDecisionStartedAt: null,
+    lastDecisionCompletedAt: null,
+    nextDecisionAt: null,
+    lastDecisionError: null
+  };
+  let stopping = false;
+  let quoteSocket = null;
+  let tradeSocket = null;
+  let streamKey = "";
+  let socketMarketType = null;
+  let activeStream = null;
+  let reconnectTimer = null;
+  let protectionTimer = null;
+  let protectionBusy = false;
+  const pendingPrices = new Map();
+
+  const persistStatus = () => {
+    serviceState.heartbeatAt = new Date().toISOString();
+    writeJson(SERVICE_STATUS_PATH, serviceState);
+  };
+
+  const socketReady = (socket) => socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState);
+
+  const updateConnections = () => {
+    const quoteOpen = quoteSocket?.readyState === WebSocket.OPEN;
+    const tradeOpen = tradeSocket?.readyState === WebSocket.OPEN;
+    const hasProtection = Boolean(activeStream?.protectionSymbols?.length);
+    const hasOrderFlow = Boolean(activeStream?.orderFlowSymbols?.length);
+    serviceState.priceConnected = hasProtection && quoteOpen;
+    serviceState.orderFlowDepthConnected = hasOrderFlow && quoteOpen;
+    serviceState.orderFlowTradeConnected = hasOrderFlow && tradeOpen;
+    serviceState.orderFlowConnected =
+      serviceState.orderFlowDepthConnected && serviceState.orderFlowTradeConnected;
+  };
+
+  const disposeSocket = (socket) => {
+    if (!socket) return;
+    socket.removeAllListeners();
+    socket.on("error", () => {});
+    if (socket.readyState === WebSocket.OPEN) socket.close();
+    else socket.terminate();
+  };
+
+  const closeSockets = () => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    disposeSocket(quoteSocket);
+    disposeSocket(tradeSocket);
+    quoteSocket = null;
+    tradeSocket = null;
+    streamKey = "";
+    activeStream = null;
+    updateConnections();
+  };
+
+  const scheduleReconnect = () => {
+    if (stopping || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      ensurePriceStream(true);
+    }, 1_000);
+  };
+
+  const flushProtection = async () => {
+    protectionTimer = null;
+    if (protectionBusy || !pendingPrices.size || stopping) return;
+    protectionBusy = true;
+    const batch = new Map(pendingPrices);
+    pendingPrices.clear();
+    try {
+      await runPriceProtectionCycle(batch, serviceState);
+    } catch (error) {
+      appendRuntimeLog(
+        `[${new Date().toISOString()}] price protection failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      protectionBusy = false;
+      if (pendingPrices.size && !protectionTimer) {
+        protectionTimer = setTimeout(flushProtection, PRICE_EVENT_COALESCE_MS);
+      }
+    }
+  };
+
+  const ensurePriceStream = (force = false) => {
+    const stream = marketStreamConfig();
+    serviceState.subscribedSymbols = stream.symbols;
+    serviceState.orderFlowSymbols = stream.orderFlowSymbols;
+    if (!stream.symbols.length) {
+      closeSockets();
+      return;
+    }
+    const quoteNames = [
+      ...stream.protectionSymbols.map((symbol) => `${symbol.toLowerCase()}@bookTicker`),
+      ...stream.orderFlowSymbols.map((symbol) => `${symbol.toLowerCase()}@depth5@100ms`)
+    ].join("/");
+    const tradeNames = stream.orderFlowSymbols
+      .map((symbol) => `${symbol.toLowerCase()}@aggTrade`)
+      .join("/");
+    const spotBase = "wss://stream.binance.com:9443/stream?streams=";
+    const quoteBase = stream.marketType === "spot"
+      ? spotBase
+      : "wss://fstream.binance.com/public/stream?streams=";
+    const tradeBase = stream.marketType === "spot"
+      ? spotBase
+      : "wss://fstream.binance.com/market/stream?streams=";
+    const nextKey = `${stream.marketType}:${quoteNames}:${tradeNames}`;
+    if (
+      !force &&
+      streamKey === nextKey &&
+      socketReady(quoteSocket) &&
+      (!tradeNames || socketReady(tradeSocket))
+    ) {
+      return;
+    }
+    if (socketMarketType && socketMarketType !== stream.marketType) marketMicrostructure.clear();
+    closeSockets();
+    socketMarketType = stream.marketType;
+    streamKey = nextKey;
+    activeStream = stream;
+
+    const currentQuoteSocket = new WebSocket(`${quoteBase}${quoteNames}`, { handshakeTimeout: 8_000 });
+    quoteSocket = currentQuoteSocket;
+    currentQuoteSocket.on("open", () => {
+      updateConnections();
+      serviceState.lastPriceError = null;
+      persistStatus();
+    });
+    currentQuoteSocket.on("message", (raw) => {
+      try {
+        const payload = JSON.parse(String(raw));
+        const data = payload?.data || payload;
+        const streamName = String(payload?.stream || "");
+        const symbol = String(data?.s || "").toUpperCase();
+        const eventType = String(data?.e || "");
+        if (eventType === "depthUpdate" || streamName.includes("@depth")) {
+          if (marketMicrostructure.updateBook({
+            symbol,
+            bids: data?.b || data?.bids,
+            asks: data?.a || data?.asks,
+            time: data?.E
+          })) {
+            serviceState.lastOrderFlowEventAt = new Date().toISOString();
+          }
+          return;
+        }
+        const bid = safeNumber(data?.b);
+        const ask = safeNumber(data?.a);
+        marketMicrostructure.updateTopQuote({
+          symbol,
+          bid,
+          bidQuantity: data?.B,
+          ask,
+          askQuantity: data?.A,
+          time: data?.E
+        });
+        const price = bid > 0 && ask > 0 ? (bid + ask) / 2 : safeNumber(data?.c || data?.p);
+        if (!symbol || !(price > 0) || !stream.protectionSymbols.includes(symbol)) return;
+        pendingPrices.set(symbol, price);
+        serviceState.lastPriceEventAt = new Date().toISOString();
+        if (!protectionTimer) protectionTimer = setTimeout(flushProtection, PRICE_EVENT_COALESCE_MS);
+      } catch {
+        // Ignore malformed public-stream frames; the next valid quote replaces them.
+      }
+    });
+    currentQuoteSocket.on("error", (error) => {
+      serviceState.lastPriceError = error instanceof Error ? error.message : String(error);
+    });
+    currentQuoteSocket.on("close", () => {
+      if (quoteSocket === currentQuoteSocket) quoteSocket = null;
+      updateConnections();
+      scheduleReconnect();
+    });
+
+    if (!tradeNames) {
+      updateConnections();
+      return;
+    }
+    const currentTradeSocket = new WebSocket(`${tradeBase}${tradeNames}`, { handshakeTimeout: 8_000 });
+    tradeSocket = currentTradeSocket;
+    currentTradeSocket.on("open", () => {
+      updateConnections();
+      serviceState.lastOrderFlowError = null;
+      persistStatus();
+    });
+    currentTradeSocket.on("message", (raw) => {
+      try {
+        const payload = JSON.parse(String(raw));
+        const data = payload?.data || payload;
+        const symbol = String(data?.s || "").toUpperCase();
+        if (marketMicrostructure.updateTrade({
+          symbol,
+          price: data?.p,
+          quantity: data?.q,
+          buyerIsMaker: data?.m === true,
+          time: data?.T || data?.E
+        })) {
+          serviceState.lastOrderFlowEventAt = new Date().toISOString();
+        }
+      } catch {
+        // Ignore malformed market-stream frames; the next valid trade replaces them.
+      }
+    });
+    currentTradeSocket.on("error", (error) => {
+      serviceState.lastOrderFlowError = error instanceof Error ? error.message : String(error);
+    });
+    currentTradeSocket.on("close", () => {
+      if (tradeSocket === currentTradeSocket) tradeSocket = null;
+      updateConnections();
+      scheduleReconnect();
+    });
+  };
+
+  const stop = () => {
+    stopping = true;
+    closeSockets();
+    if (protectionTimer) clearTimeout(protectionTimer);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  const heartbeat = setInterval(persistStatus, 1_000);
+  persistStatus();
+
+  try {
+    while (!stopping) {
+      const cycleStartedMs = Date.now();
+      serviceState.lastDecisionStartedAt = new Date(cycleStartedMs).toISOString();
+      try {
+        await run();
+        serviceState.decisionCycles += 1;
+        serviceState.consecutiveDecisionFailures = 0;
+        serviceState.lastDecisionError = null;
+        serviceState.lastDecisionCompletedAt = new Date().toISOString();
+      } catch (error) {
+        serviceState.consecutiveDecisionFailures += 1;
+        serviceState.lastDecisionError = error instanceof Error ? error.message : String(error);
+      }
+      if (stopping) break;
+      ensurePriceStream();
+      const { accountActive, symbols } = openPositionStreamConfig();
+      const baseDelay = accountActive || symbols.length
+        ? SERVICE_ACTIVE_DECISION_DELAY_MS
+        : SERVICE_IDLE_DECISION_DELAY_MS;
+      const backoffMultiplier = 2 ** Math.min(serviceState.consecutiveDecisionFailures, 5);
+      const targetDelay = Math.min(SERVICE_MAX_BACKOFF_MS, baseDelay * backoffMultiplier);
+      const sleepMs = Math.max(250, targetDelay - (Date.now() - cycleStartedMs));
+      serviceState.nextDecisionAt = new Date(Date.now() + sleepMs).toISOString();
+      persistStatus();
+      await sleep(sleepMs);
+    }
+  } finally {
+    clearInterval(heartbeat);
+    closeSockets();
+    serviceState.stoppedAt = new Date().toISOString();
+    serviceState.priceConnected = false;
+    try {
+      persistStatus();
+    } finally {
+      releaseServiceLock();
+    }
+  }
+}
+
+function selfTestTradingRule(symbol, marketType = "futures") {
+  return {
+    symbol,
+    marketType,
+    status: "TRADING",
+    tradable: true,
+    minQty: 0.001,
+    maxQty: 1_000_000,
+    stepSize: "0.001",
+    tickSize: "0.01",
+    minNotional: 5,
+    maxNotional: null,
+    leverageBrackets: marketType === "futures"
+      ? [{ bracket: 1, initialLeverage: 125, notionalFloor: 0, notionalCap: Number.MAX_VALUE }]
+      : [],
+    leverageExact: true,
+    ruleSource: marketType === "futures" ? "self-test-futures" : "self-test-spot",
+    leverageRuleSource: marketType === "futures" ? "self-test-bracket" : "spot-1x",
+    fetchedAt: "2026-01-01T00:00:00.000Z"
+  };
+}
+
+function runPaperEntryPauseSelfTest() {
+  const config = normalizeAccountConfig({ initialCapital: 1000, marketType: "futures", maxLeverage: 3 });
+  const account = createPaperAccount(config, "2026-07-19T00:00:00.000Z");
+  const signal = {
+    id: "ENTRY-PAUSE-BTC",
+    status: "passed",
+    symbol: "BTCUSDT",
+    side: "long",
+    candidateMode: "math_only",
+    entry: 100,
+    takeProfit: 110,
+    stopLoss: 90,
+    winRate: 0.6,
+    expectancyPct: 0.01,
+    expectancyR: 0.5,
+    eventImpactScore: 0,
+    relatedEvents: [],
+    accountControl: {
+      allowed: true,
+      appliedLeverage: 2,
+      modelSuggestedLeverage: 2,
+      leverageCapped: false,
+      notional: 100,
+      marginRequired: 50,
+      quantity: 1,
+      maxLossAmount: 10,
+      exchangeRule: selfTestTradingRule("BTCUSDT")
+    }
+  };
+  account.isActive = true;
+  updatePaperAccountForEntryState(
+    account,
+    [signal],
+    [signal],
+    { BTCUSDT: { latest: 100, fundingRate: 0 } }
+  );
+  const existing = account.lastRun.openedPositions[0];
+  if (!existing || !account.positions[existing.id]) {
+    throw new Error("active paper account did not open a passed actionable signal");
+  }
+  account.isActive = false;
+  const newSignal = {
+    ...signal,
+    id: "ENTRY-PAUSE-ETH",
+    symbol: "ETHUSDT",
+    entry: 50,
+    takeProfit: 55,
+    stopLoss: 45,
+    accountControl: {
+      ...signal.accountControl,
+      exchangeRule: selfTestTradingRule("ETHUSDT")
+    }
+  };
+  updatePaperAccountForEntryState(
+    account,
+    [newSignal],
+    [signal, newSignal],
+    { BTCUSDT: { latest: 101, fundingRate: 0 }, ETHUSDT: { latest: 50, fundingRate: 0 } }
+  );
+  if (
+    Object.keys(account.positions).length !== 1 ||
+    !account.positions[existing.id] ||
+    account.positions[existing.id].currentPrice !== 101 ||
+    account.lastRun.openedPositions.length !== 0
+  ) {
+    throw new Error("paused paper entries must reject new positions while continuing existing-position tracking");
+  }
+  console.log(JSON.stringify({
+    passed: true,
+    passedSignalOpened: true,
+    newEntriesPaused: true,
+    existingPositionTracked: true
+  }));
+}
+
+function runSignalLifecycleSelfTest() {
+  const now = Date.parse("2026-07-20T00:00:00.000Z");
+  const signal = (id, createdAt, overrides = {}) => ({
+    id,
+    status: "passed",
+    symbol: id.toUpperCase(),
+    side: "long",
+    candidateMode: "math_only",
+    createdAt,
+    entry: 100,
+    takeProfit: 110,
+    stopLoss: 90,
+    winRate: 0.6,
+    adaptiveWinRateThreshold: 0.55,
+    breakEvenWinRate: 0.45,
+    expectancyPct: 0.01,
+    expectancyR: 0.5,
+    rewardRiskRatio: 1,
+    factors: { trend: 0.4 },
+    calculation: { oversized: "must not survive compaction" },
+    ...overrides
+  });
+  const pending = signal("pending", "2026-07-19T23:00:00.000Z");
+  const takeProfit = signal("tp", "2026-07-19T00:00:00.000Z");
+  const stopLoss = signal("sl", "2026-07-19T00:00:00.000Z");
+  const expired = signal("expired", "2026-07-16T23:00:00.000Z");
+  const unresolved = signal("unresolved", "2026-07-16T23:00:00.000Z");
+  const state = createInitialState();
+  state.activeSignals = Object.fromEntries(
+    [pending, takeProfit, stopLoss, expired, unresolved].map((item) => [item.id, item])
+  );
+  state.closedSignals = Array.from({ length: SIGNAL_OUTCOME_HISTORY_LIMIT }, (_, index) => ({
+    ...signal(`old-${index}`, "2026-07-01T00:00:00.000Z"),
+    closedAt: "2026-07-02T00:00:00.000Z",
+    closePrice: 100,
+    outcome: "EXPIRED",
+    realizedR: 0,
+    review: "old"
+  }));
+  const closed = updateOpenSignalsAndReviews(
+    state,
+    [],
+    {
+      PENDING: { latest: 101 },
+      TP: { latest: 111 },
+      SL: { latest: 89 },
+      EXPIRED: { latest: 102 }
+    },
+    now
+  );
+  const byOutcome = Object.fromEntries(closed.map((item) => [item.outcome, item]));
+  if (
+    Object.keys(state.activeSignals).length !== 1 ||
+    !state.activeSignals.pending ||
+    closed.length !== 4 ||
+    !byOutcome.TP ||
+    !byOutcome.SL ||
+    !byOutcome.EXPIRED ||
+    !byOutcome.UNRESOLVED_EXPIRED ||
+    byOutcome.UNRESOLVED_EXPIRED.realizedR !== null ||
+    byOutcome.UNRESOLVED_EXPIRED.calibrationEligible !== false ||
+    state.calibration.samples !== 3 ||
+    state.calibration.wins !== 2 ||
+    state.calibration.losses !== 1 ||
+    state.closedSignals.length !== SIGNAL_OUTCOME_HISTORY_LIMIT ||
+    state.closedSignals.some((item) => Object.hasOwn(item, "calculation"))
+  ) {
+    throw new Error("signal expiration, calibration, or bounded compaction self-test failed");
+  }
+
+  const candidateState = createInitialState();
+  const freshCandidate = signal("fresh", null, { createdAt: undefined });
+  updateOpenSignalsAndReviews(candidateState, [freshCandidate], {}, now);
+  const stored = candidateState.activeSignals.fresh;
+  if (
+    !stored ||
+    Date.parse(stored.expiresAt) - Date.parse(stored.createdAt) !== OPEN_SIGNAL_MAX_AGE_MS
+  ) {
+    throw new Error("new signal expiration timestamp self-test failed");
+  }
+  console.log(JSON.stringify({
+    passed: true,
+    maxAgeHours: OPEN_SIGNAL_MAX_AGE_MS / 3_600_000,
+    resolvedOutcomes: closed.map((item) => item.outcome).sort(),
+    unresolvedExcludedFromCalibration: true,
+    boundedHistoryLimit: SIGNAL_OUTCOME_HISTORY_LIMIT
+  }));
+}
+
+function runCostModelSelfTest() {
+  const config = normalizeAccountConfig({
+    initialCapital: 1000,
+    marketType: "futures",
+    maxLeverage: 3
+  });
+  const account = createPaperAccount(config, "2026-06-05T00:01:00.000Z");
+  account.isActive = true;
+  const signal = {
+    id: "SELFTEST-LONG",
+    status: "passed",
+    symbol: "BTCUSDT",
+    side: "long",
+    candidateMode: "math_only",
+    entry: 100,
+    takeProfit: 110,
+    stopLoss: 90,
+    winRate: 0.6,
+    expectancyPct: 0.01,
+    expectancyR: 0.5,
+    eventImpactScore: 0,
+    relatedEvents: [],
+    accountControl: {
+      allowed: true,
+      appliedLeverage: 2,
+      modelSuggestedLeverage: 2,
+      leverageCapped: false,
+      notional: 100,
+      marginRequired: 50,
+      quantity: 1,
+      maxLossAmount: 10,
+      exchangeRule: selfTestTradingRule("BTCUSDT")
+    }
+  };
+  const opened = openPaperPosition(account, signal, "2026-06-05T00:01:00.000Z");
+  if (!opened || opened.entry <= signal.entry || account.tradingFees <= 0 || account.slippageCost <= 0) {
+    throw new Error("entry fee/slippage self-test failed");
+  }
+  opened.nextFundingAt = "2026-06-05T08:00:00.000Z";
+  const marketBySymbol = {
+    BTCUSDT: { latest: 100, fundingRate: 0.001 }
+  };
+  markPaperPositions(account, marketBySymbol, "2026-06-05T08:00:00.000Z");
+  if (!(account.fundingPnl < 0) || opened.fundingSettlements !== 1 || !(opened.estimatedExitFee > 0)) {
+    throw new Error("funding/estimated exit fee self-test failed");
+  }
+  const closed = closePaperPosition(
+    account,
+    opened.id,
+    110,
+    "TP",
+    "2026-06-05T08:01:00.000Z"
+  );
+  if (!closed || !(closed.exitPrice < 110) || !(closed.exitFee > 0) || !(closed.realizedPnl < closed.grossTradingPnl)) {
+    throw new Error("exit fee/slippage self-test failed");
+  }
+  console.log(
+    JSON.stringify({
+      passed: true,
+      entryFee: opened.entryFee,
+      entrySlippageCost: opened.entrySlippageCost,
+      fundingPnl: closed.fundingPnl,
+      exitFee: closed.exitFee,
+      exitSlippageCost: closed.exitSlippageCost,
+      netRealizedPnl: closed.realizedPnl
+    })
+  );
+}
+
+function runAdvancedModelsSelfTest() {
+  const returns = Array.from(
+    { length: 96 },
+    (_, index) => 0.0008 + Math.sin(index / 5) * 0.00045
+  );
+  const gbm = analyzeGeometricBrownianMotion(returns);
+  const garch = estimateGarch11(returns);
+  const hiddenMarkov = analyzeHiddenMarkovRegime(returns);
+  const poisson = analyzePoissonEventArrival(
+    { score: 72, direction: 0.8, eventCount: 4, events: [{}, {}, {}, {}] },
+    0.72,
+    true
+  );
+  const bayesian = bayesianWinRateUpdate({
+    priorWinRate: 0.58,
+    combinedDirection: 0.55,
+    eventScoreNorm: 0.72,
+    alignment: 1,
+    volatilityRegimeScore: 0.1,
+    advancedModelQualityBoost: 0.02,
+    poisson,
+    roundTripExecutionCostPct: 0.0016,
+    riskPct: 0.02
+  });
+  if (!(gbm.probabilityUp > 0.5) || !Number.isFinite(gbm.expectedReturn)) {
+    throw new Error("GBM self-test failed");
+  }
+  if (
+    !Number.isFinite(garch.forecastVolatility) ||
+    !(garch.alpha + garch.beta < 1) ||
+    !(garch.confidenceMultiplier > 0)
+  ) {
+    throw new Error("GARCH self-test failed");
+  }
+  if (
+    !(hiddenMarkov.bullProbability > hiddenMarkov.bearProbability) ||
+    Math.abs(
+      hiddenMarkov.bullProbability +
+        hiddenMarkov.bearProbability +
+        hiddenMarkov.rangeProbability -
+        1
+    ) > 1e-9
+  ) {
+    throw new Error("HMM self-test failed");
+  }
+  if (
+    !(poisson.tailProbability >= 0 && poisson.tailProbability <= 1) ||
+    !(poisson.burstSurprise >= 0 && poisson.burstSurprise <= 1)
+  ) {
+    throw new Error("Poisson self-test failed");
+  }
+  if (
+    !(bayesian.posteriorWinRate > bayesian.priorWinRate) ||
+    !(bayesian.likelihoodWin > bayesian.likelihoodLoss)
+  ) {
+    throw new Error("Bayesian self-test failed");
+  }
+
+  const candles = Array.from({ length: 120 }, (_, index) => ({
+    time: index * 900_000,
+    open: 100 + index * 0.05,
+    high: 100.2 + index * 0.05,
+    low: 99.8 + index * 0.05,
+    close: 100.1 + index * 0.05,
+    volume: index === 118 ? 300 : 100
+  }));
+  const orderFlowSnapshot = {
+    available: true,
+    signal: 0.8,
+    flow5s: { imbalance: 0.6 },
+    flow30s: { imbalance: 0.4 },
+    cumulativeVolumeDelta30s: 20_000,
+    volumeRateRatio: 1.5,
+    orderBookImbalance: 0.3,
+    spreadBps: 0.8,
+    bidDepthQuote: 500_000,
+    askDepthQuote: 350_000,
+    microPriceBiasBps: 0.4
+  };
+  const microstructureMarket = analyzeMarket(
+    "BTCUSDT",
+    candles,
+    candles,
+    0,
+    1_000,
+    null,
+    orderFlowSnapshot,
+    DEFAULT_DIRECTION_MODEL_WEIGHTS
+  );
+  const fallbackMarket = analyzeMarket(
+    "BTCUSDT",
+    candles,
+    candles,
+    0,
+    1_000,
+    null,
+    { available: false, signal: 1 },
+    DEFAULT_DIRECTION_MODEL_WEIGHTS
+  );
+  const fallbackWeightTotal = Object.keys(DEFAULT_DIRECTION_MODEL_WEIGHTS).reduce(
+    (sum, key) => sum + safeNumber(fallbackMarket.mathBreakdown.decisionWeights[key]),
+    0
+  );
+  if (!(microstructureMarket.volumeExpansion > 2.5) || !(microstructureMarket.orderFlowSignal > 0)) {
+    throw new Error("Volume/order-flow model self-test failed");
+  }
+  if (fallbackMarket.mathBreakdown.decisionWeights.orderFlow !== 0 || Math.abs(fallbackWeightTotal - 1) > 1e-9) {
+    throw new Error("Stale order-flow fallback self-test failed");
+  }
+
+  const config = normalizeAccountConfig({
+    initialCapital: 1000,
+    marketType: "futures",
+    maxLeverage: 5
+  });
+  const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
+  const candidates = symbols.map((symbol, index) => ({
+    symbol,
+    side: index === 1 ? "short" : "long",
+    entry: 100,
+    riskPct: 0.02,
+    positionRiskPct: 0.005,
+    winRate: 0.6,
+    expectancyPct: 0.006 - index * 0.001,
+    expectancyR: 0.3,
+    combinedDirection: index === 1 ? -0.5 : 0.5,
+    highImpactEvent: false,
+    factors: {},
+    calculation: { sizing: {} },
+    reasons: []
+  }));
+  const marketBySymbol = Object.fromEntries(
+    symbols.map((symbol, index) => [
+      symbol,
+      {
+        returns15m: returns.map((value, returnIndex) =>
+          value * (1 - index * 0.15) + Math.cos(returnIndex / (4 + index)) * 0.0002
+        ),
+        gbm: { expectedReturn: gbm.expectedReturn * (1 - index * 0.2) },
+        garch,
+        volatilityExpansion: 1
+      }
+    ])
+  );
+  const markowitz = applyMarkowitzSizing(
+    candidates,
+    marketBySymbol,
+    config,
+    Object.fromEntries(symbols.map((symbol) => [symbol, selfTestTradingRule(symbol)]))
+  );
+  const weightSum = Object.values(markowitz.portfolio.weights).reduce(
+    (sum, value) => sum + value,
+    0
+  );
+  if (Math.abs(weightSum - 1) > 1e-9 || markowitz.candidates.some((item) => !item.accountControl)) {
+    throw new Error("Markowitz self-test failed");
+  }
+  console.log(
+    JSON.stringify({
+      passed: true,
+      gbm: { probabilityUp: gbm.probabilityUp, signal: gbm.signal },
+      garch: {
+        alpha: garch.alpha,
+        beta: garch.beta,
+        volatilityRatio: garch.volatilityRatio
+      },
+      hiddenMarkov: {
+        regime: hiddenMarkov.regime,
+        bullProbability: hiddenMarkov.bullProbability
+      },
+      poisson: {
+        observedEvents: poisson.observedEvents,
+        tailProbability: poisson.tailProbability
+      },
+      bayesian: {
+        priorWinRate: bayesian.priorWinRate,
+        posteriorWinRate: bayesian.posteriorWinRate
+      },
+      microstructure: {
+        volumeExpansion: microstructureMarket.volumeExpansion,
+        orderFlowSignal: microstructureMarket.orderFlowSignal,
+        staleOrderFlowWeight: fallbackMarket.mathBreakdown.decisionWeights.orderFlow
+      },
+      markowitz: markowitz.portfolio
+    })
+  );
+}
+
+function runRiskProfileSelfTest() {
+  const stableGate = evaluateAdaptiveEntryGate({
+    riskProfile: "aggressive",
+    expectancyPct: 0.003,
+    riskPct: 0.02,
+    rewardRiskRatio: 1.5,
+    roundTripExecutionCostPct: 0.0016,
+    winRate: 0.58,
+    regime: "trend",
+    volatilityExpansion: 1,
+    alignment: 1,
+    candidateMode: "event_impact",
+    combinedDirection: 0.75,
+    calibration: { samples: 200, wins: 116, avgPredictedWinRate: 0.58 }
+  });
+  const unstableGate = evaluateAdaptiveEntryGate({
+    riskProfile: "conservative",
+    expectancyPct: 0.003,
+    riskPct: 0.02,
+    rewardRiskRatio: 1.5,
+    roundTripExecutionCostPct: 0.0016,
+    winRate: 0.58,
+    regime: "transition",
+    volatilityExpansion: 2,
+    alignment: -0.35,
+    candidateMode: "math_only",
+    combinedDirection: 0.3,
+    calibration: { samples: 0 }
+  });
+  const negativeEvGate = evaluateAdaptiveEntryGate({
+    riskProfile: "aggressive",
+    expectancyPct: -0.001,
+    riskPct: 0.02,
     rewardRiskRatio: 1.5,
     winRate: 0.9
   });
@@ -1134,4 +6317,3 @@ execution.catch((error) => {
   console.error(`${isSelfTestInvocation ? "Self-test" : "Event signal monitor"} failed: ${message}`);
   process.exitCode = 1;
 });
-

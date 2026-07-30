@@ -193,4 +193,3 @@ $("#factorBulkRestore").addEventListener("click", () => updateSelected("restore"
 
 loadFactors();
 setInterval(() => loadFactors({ quiet: true }), 5_000);
-

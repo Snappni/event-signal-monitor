@@ -113,4 +113,3 @@ const tickAligned = evaluateDynamicPositionProtection({ position: migrated, curr
 assert.ok(Math.abs(tickAligned.nextStopLoss * 10 - Math.round(tickAligned.nextStopLoss * 10)) < 1e-9);
 
 console.log(JSON.stringify({ passed: true, symmetricRatchet: true, singlePartialTakeProfit: true, tickAligned: true }));
-

@@ -428,4 +428,3 @@ window.addEventListener("resize", () => {
 });
 window.addEventListener("beforeunload", disposeSummaryCharts);
 loadSummary();
-

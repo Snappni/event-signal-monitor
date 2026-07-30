@@ -27,4 +27,3 @@
 - [x] No browser console errors observed during verification.
 
 final result: passed
-
