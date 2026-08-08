@@ -17,6 +17,11 @@ const evidenceLabels = {
   insufficient_samples: "样本不足",
   data_unavailable: "数据不可用"
 };
+const minedValidationLabels = {
+  validated: "已验证",
+  rejected: "已拒绝",
+  quarantine: "隔离验证"
+};
 
 function markDirty() {
   state.dirty = true;
@@ -32,7 +37,15 @@ function filteredFactors() {
     if (factor.archived !== showArchived) return false;
     if (category && factor.category !== category) return false;
     if (evidence && factor.evidenceStatus !== evidence) return false;
-    if (search && ![factor.name, factor.description, factor.source, factor.id].join(" ").toLowerCase().includes(search)) return false;
+    if (search && ![
+      factor.name,
+      factor.description,
+      factor.source,
+      factor.category,
+      factor.operatorLabel,
+      factor.formula,
+      factor.id
+    ].join(" ").toLowerCase().includes(search)) return false;
     return true;
   });
 }
@@ -57,8 +70,11 @@ function renderSummary() {
     ? data.mining.currentActivity || "idle"
     : `组合未就绪：${data.counts.decisionEligible || 0}/${data.decisionReadiness?.minimumActiveFactors || 10}`;
   $("#factorMiningDetails").innerHTML = [
-    ["运行次数", data.mining.runCount], ["隔离候选", data.counts.mined - data.counts.validatedMined],
+    ["运行次数", data.mining.runCount], ["活跃池", `${data.counts.mined}/${data.mining.activeLimit || 20}`],
+    ["隔离候选", data.counts.mined - data.counts.validatedMined],
     ["已验证", data.mining.validatedCount], ["已拒绝", data.mining.rejectedCount],
+    ["自动淘汰", data.mining.retiredCount || 0],
+    ["已合并重复", data.mining.mergedDuplicateCount || 0],
     ["待结算快照", data.pendingFrameCount], ["最近挖掘", time(data.mining.lastRunAt)]
   ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
 }
@@ -74,14 +90,17 @@ function renderCategories() {
 
 function renderFactors() {
   const factors = filteredFactors();
+  const selectableFactors = factors.filter((factor) => !factor.retired);
   $("#factorFilteredCount").textContent = `${factors.length} 项`;
-  $("#factorSelectAll").checked = factors.length > 0 && factors.every((factor) => state.selected.has(factor.id));
+  $("#factorSelectAll").checked = selectableFactors.length > 0 && selectableFactors.every((factor) => state.selected.has(factor.id));
   $("#factorList").innerHTML = factors.map((factor) => {
     const metric = factor.metrics?.[15];
-    const origin = factor.origin === "mined" ? `<span class="factor-origin mined">挖掘 · ${escapeHtml(factor.validationStatus)}</span>` : '<span class="factor-origin">内置</span>';
+    const origin = factor.origin === "mined"
+      ? `<span class="factor-origin mined">挖掘·${escapeHtml(factor.operatorLabel || "组合")} · ${escapeHtml(factor.retired ? "已淘汰" : minedValidationLabels[factor.validationStatus] || factor.validationStatus)}</span>`
+      : '<span class="factor-origin">内置</span>';
     return `<tr data-factor-id="${escapeHtml(factor.id)}" class="${factor.archived ? "is-archived" : ""}">
-      <td><input class="factor-select" type="checkbox" ${state.selected.has(factor.id) ? "checked" : ""} aria-label="选择${escapeHtml(factor.name)}" /></td>
-      <td><div class="factor-name">${escapeHtml(factor.name)} ${origin}</div><code>${escapeHtml(factor.id)}</code><p>${escapeHtml(factor.description)}</p>${factor.formula ? `<small>${escapeHtml(factor.formula)}</small>` : ""}</td>
+      <td><input class="factor-select" type="checkbox" ${state.selected.has(factor.id) ? "checked" : ""} ${factor.retired ? "disabled" : ""} aria-label="选择${escapeHtml(factor.name)}" /></td>
+      <td><div class="factor-name">${escapeHtml(factor.name)} ${origin}</div><code>${escapeHtml(factor.id)}</code><p>${escapeHtml(factor.description)}</p>${factor.formula ? `<small>${escapeHtml(factor.formula)}</small>` : ""}${factor.retiredAt ? `<small>淘汰于 ${escapeHtml(time(factor.retiredAt))} · 证据已压缩归档且禁止重复挖掘</small>` : ""}</td>
       <td><strong>${escapeHtml(factor.category)}</strong><span>${escapeHtml(factor.source)}</span><small>覆盖 ${(Number(factor.availability?.coverage || 0) * 100).toFixed(0)}%</small></td>
       <td><input class="factor-enabled" type="checkbox" ${factor.enabled ? "checked" : ""} ${factor.archived ? "disabled" : ""} /></td>
       <td><input class="factor-decision" type="checkbox" ${factor.useInDecision ? "checked" : ""} ${factor.archived || factor.role !== "direction" ? "disabled" : ""} /></td>
@@ -169,14 +188,15 @@ for (const selector of ["#factorSearch", "#factorCategory", "#factorEvidence", "
   $(selector).addEventListener(selector === "#factorSearch" ? "input" : "change", renderFactors);
 }
 $("#factorSelectAll").addEventListener("change", (event) => {
-  for (const factor of filteredFactors()) event.target.checked ? state.selected.add(factor.id) : state.selected.delete(factor.id);
+  for (const factor of filteredFactors().filter((item) => !item.retired)) event.target.checked ? state.selected.add(factor.id) : state.selected.delete(factor.id);
   renderFactors();
 });
 $("#factorList").addEventListener("change", (event) => {
   if (event.target.classList.contains("factor-select")) {
     const id = event.target.closest("tr").dataset.factorId;
     event.target.checked ? state.selected.add(id) : state.selected.delete(id);
-    $("#factorSelectAll").checked = filteredFactors().every((factor) => state.selected.has(factor.id));
+    const selectableFactors = filteredFactors().filter((factor) => !factor.retired);
+    $("#factorSelectAll").checked = selectableFactors.length > 0 && selectableFactors.every((factor) => state.selected.has(factor.id));
     return;
   }
   if (event.target.matches(".factor-enabled, .factor-decision, .factor-weight")) {

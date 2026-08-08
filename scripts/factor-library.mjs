@@ -1,7 +1,11 @@
-const FACTOR_LIBRARY_VERSION = 1;
+const FACTOR_LIBRARY_VERSION = 3;
 const PRIMARY_IC_HORIZON_MINUTES = 15;
 const MAX_PENDING_FRAMES = 90;
 const MAX_IC_OBSERVATIONS = 2304;
+const MAX_ACTIVE_MINED_FACTORS = 20;
+const MAX_RETIRED_MINED_FACTORS = 2048;
+const MIN_RETIRED_FACTOR_SAMPLES = 90;
+const MIN_REJECTED_FACTOR_AGE_MS = 6 * 60 * 60 * 1_000;
 const HISTORICAL_BACKFILL_VERSION = 2;
 const MIN_CROSS_SECTION_SYMBOLS = 5;
 const MIN_SMART_WEIGHT_SAMPLES = 30;
@@ -89,6 +93,132 @@ export const FACTOR_DEFINITIONS = Object.freeze([
 ]);
 
 const DEFINITION_BY_ID = new Map(FACTOR_DEFINITIONS.map((item) => [item.id, item]));
+
+const MINED_OPERATOR_META = Object.freeze({
+  difference: Object.freeze({
+    label: "差值",
+    category: "自动挖掘·差值",
+    symbol: "−",
+    explanation: "衡量左侧因子相对右侧因子的方向优势；正值表示左侧更强，负值表示右侧更强。"
+  }),
+  blend: Object.freeze({
+    label: "均值融合",
+    category: "自动挖掘·均值融合",
+    symbol: "+",
+    explanation: "对两个因子等权平均，用于提取共同方向并降低单因子噪声。"
+  }),
+  agreement: Object.freeze({
+    label: "一致性确认",
+    category: "自动挖掘·一致性确认",
+    symbol: "↔",
+    explanation: "先融合两个因子，再按二者分歧程度衰减；方向越一致，保留的信号越多。"
+  })
+});
+
+function minedPairKey(leftId, rightId) {
+  return [String(leftId || ""), String(rightId || "")].sort().join("|");
+}
+
+function minedSemanticKey(definition) {
+  return `${String(definition?.operator || "blend")}|${minedPairKey(definition?.leftId, definition?.rightId)}`;
+}
+
+function minedFactorPresentation(definition) {
+  const operator = String(definition?.operator || "blend");
+  const meta = MINED_OPERATOR_META[operator] || MINED_OPERATOR_META.blend;
+  const left = DEFINITION_BY_ID.get(definition?.leftId);
+  const right = DEFINITION_BY_ID.get(definition?.rightId);
+  const leftName = left?.name || definition?.leftId || "左因子";
+  const rightName = right?.name || definition?.rightId || "右因子";
+  return {
+    ...definition,
+    name: `挖掘·${meta.label}：${leftName} ${meta.symbol} ${rightName}`,
+    category: meta.category,
+    source: `受限DSL自动挖掘·${meta.label}`,
+    description: `${meta.explanation} 该候选保持隔离，必须通过样本量、IC、ICIR、覆盖率与多重检验后才可验证。`,
+    formula: `${operator}(${definition?.leftId}, ${definition?.rightId})`,
+    operator,
+    operatorLabel: meta.label,
+    semanticKey: minedSemanticKey(definition)
+  };
+}
+
+function minedEvidenceScore(definition, metrics) {
+  const validationRank = { validated: 3, quarantine: 2, rejected: 1 }[definition?.validationStatus] || 0;
+  const samples = safeNumber(
+    metrics?.[definition?.id]?.[PRIMARY_IC_HORIZON_MINUTES]?.samples,
+    safeNumber(definition?.validation?.samples)
+  );
+  return validationRank * 1e9 + samples * 1e3 - safeNumber(Date.parse(definition?.createdAt || ""), 0) / 1e12;
+}
+
+function normalizeMinedFactors(rawFactors, metrics) {
+  const groups = new Map();
+  for (const rawDefinition of Array.isArray(rawFactors) ? rawFactors : []) {
+    if (!rawDefinition?.id || !rawDefinition?.leftId || !rawDefinition?.rightId) continue;
+    const definition = minedFactorPresentation(rawDefinition);
+    const key = definition.semanticKey;
+    const current = groups.get(key);
+    if (!current) {
+      groups.set(key, definition);
+      continue;
+    }
+    const currentScore = minedEvidenceScore(current, metrics);
+    const nextScore = minedEvidenceScore(definition, metrics);
+    const kept = nextScore > currentScore ? definition : current;
+    const removed = nextScore > currentScore ? current : definition;
+    groups.set(key, {
+      ...kept,
+      mergedDuplicateIds: [...new Set([
+        ...(Array.isArray(kept.mergedDuplicateIds) ? kept.mergedDuplicateIds : []),
+        ...(Array.isArray(removed.mergedDuplicateIds) ? removed.mergedDuplicateIds : []),
+        removed.id
+      ])].filter((id) => id && id !== kept.id)
+    });
+  }
+  return [...groups.values()].slice(-MAX_ACTIVE_MINED_FACTORS);
+}
+
+function compactMetricEvidence(metric) {
+  if (!metric || typeof metric !== "object") return null;
+  return {
+    samples: safeNumber(metric.samples),
+    meanIc: metric.meanIc ?? null,
+    icStd: metric.icStd ?? null,
+    icir: metric.icir ?? null,
+    tStatistic: metric.tStatistic ?? null,
+    coverage: metric.coverage ?? null,
+    lastIc: metric.lastIc ?? null,
+    historySamples: safeNumber(metric.historySamples),
+    realtimeSamples: safeNumber(metric.realtimeSamples)
+  };
+}
+
+function normalizeRetiredMinedFactors(rawFactors = []) {
+  const groups = new Map();
+  for (const rawDefinition of Array.isArray(rawFactors) ? rawFactors : []) {
+    if (!rawDefinition?.id || !rawDefinition?.leftId || !rawDefinition?.rightId) continue;
+    const presentation = minedFactorPresentation(rawDefinition);
+    const definition = {
+      ...presentation,
+      description: `${presentation.description.replace(" 该候选保持隔离，必须通过样本量、IC、ICIR、覆盖率与多重检验后才可验证。", "")} 该候选在扩展观察期后仍未通过验证，已停止实时计算并保留压缩证据。`,
+      retired: true,
+      archived: true,
+      retiredAt: rawDefinition.retiredAt || null,
+      retirementReason: rawDefinition.retirementReason || "failed_validation_after_extended_observation",
+      retiredMetrics: rawDefinition.retiredMetrics && typeof rawDefinition.retiredMetrics === "object"
+        ? rawDefinition.retiredMetrics
+        : {}
+    };
+    const current = groups.get(definition.semanticKey);
+    if (!current || Date.parse(definition.retiredAt || "") > Date.parse(current.retiredAt || "")) {
+      groups.set(definition.semanticKey, definition);
+    }
+  }
+  return [...groups.values()]
+    .sort((left, right) => safeNumber(Date.parse(left.retiredAt || ""), 0) - safeNumber(Date.parse(right.retiredAt || ""), 0))
+    .slice(-MAX_RETIRED_MINED_FACTORS);
+}
 
 export const DEFAULT_FACTOR_LIBRARY_CONFIG = Object.freeze({
   version: FACTOR_LIBRARY_VERSION,
@@ -275,9 +405,23 @@ function allDefinitions(status) {
 export function normalizeFactorLibraryConfig(value = {}, extraDefinitions = []) {
   const raw = value && typeof value === "object" ? value : {};
   const definitions = [...FACTOR_DEFINITIONS, ...extraDefinitions];
+  const mergedDuplicateIds = new Set(
+    definitions.flatMap((definition) => Array.isArray(definition.mergedDuplicateIds) ? definition.mergedDuplicateIds : [])
+  );
   const settings = {};
   for (const definition of definitions) {
-    const override = raw.factorSettings?.[definition.id] || {};
+    const overrides = [definition.id, ...(definition.mergedDuplicateIds || [])]
+      .map((id) => raw.factorSettings?.[id])
+      .filter((override) => override && typeof override === "object");
+    const primary = overrides[0] || {};
+    const override = overrides.length > 1
+      ? {
+          enabled: overrides.some((item) => item.enabled === true),
+          useInDecision: overrides.some((item) => item.useInDecision === true),
+          weight: Math.max(...overrides.map((item) => safeNumber(item.weight, definition.defaultWeight))),
+          archived: overrides.every((item) => item.archived === true)
+        }
+      : primary;
     settings[definition.id] = {
       enabled: override.enabled ?? definition.defaultEnabled,
       useInDecision: override.useInDecision ?? definition.defaultUseInDecision,
@@ -286,6 +430,7 @@ export function normalizeFactorLibraryConfig(value = {}, extraDefinitions = []) 
     };
   }
   for (const [id, override] of Object.entries(raw.factorSettings || {})) {
+    if (mergedDuplicateIds.has(id)) continue;
     if (!settings[id]) settings[id] = {
       enabled: override.enabled === true,
       useInDecision: override.useInDecision === true,
@@ -350,7 +495,20 @@ export function createFactorLibraryStatus() {
     latestBySymbol: {},
     latestFactorAvailability: {},
     minedFactors: [],
-    mining: { enabled: false, lastRunAt: null, runCount: 0, rejectedCount: 0, validatedCount: 0, currentActivity: "idle" },
+    retiredMinedFactors: [],
+    mining: {
+      enabled: false,
+      lastRunAt: null,
+      runCount: 0,
+      rejectedCount: 0,
+      validatedCount: 0,
+      mergedDuplicateCount: 0,
+      retiredCount: 0,
+      lastRetiredAt: null,
+      activeLimit: MAX_ACTIVE_MINED_FACTORS,
+      archiveLimit: MAX_RETIRED_MINED_FACTORS,
+      currentActivity: "idle"
+    },
     dataSources: {},
     historicalBackfill: {
       version: HISTORICAL_BACKFILL_VERSION,
@@ -374,18 +532,77 @@ export function createFactorLibraryStatus() {
 export function normalizeFactorLibraryStatus(value = {}) {
   const base = createFactorLibraryStatus();
   const raw = value && typeof value === "object" ? value : {};
+  const rawMetrics = raw.metrics && typeof raw.metrics === "object" ? raw.metrics : {};
+  const rawMinedFactors = Array.isArray(raw.minedFactors) ? raw.minedFactors : [];
+  const minedFactors = normalizeMinedFactors(rawMinedFactors, rawMetrics);
+  const activeSemanticKeys = new Set(minedFactors.map(minedSemanticKey));
+  const retiredMinedFactors = normalizeRetiredMinedFactors(raw.retiredMinedFactors)
+    .filter((definition) => !activeSemanticKeys.has(definition.semanticKey));
+  const keptMinedIds = new Set(minedFactors.map((definition) => definition.id));
+  const removedMinedIds = new Set(
+    rawMinedFactors.map((definition) => definition?.id).filter((id) => id && !keptMinedIds.has(id))
+  );
+  const inactiveMinedIds = new Set([
+    ...removedMinedIds,
+    ...(Array.isArray(raw.retiredMinedFactors) ? raw.retiredMinedFactors : [])
+      .map((definition) => definition?.id)
+      .filter((id) => id && !keptMinedIds.has(id))
+  ]);
+  const metrics = Object.fromEntries(
+    Object.entries(rawMetrics).filter(([id]) => !inactiveMinedIds.has(id))
+  );
+  const effectiveWeights = Object.fromEntries(
+    Object.entries(raw.effectiveWeights && typeof raw.effectiveWeights === "object" ? raw.effectiveWeights : {})
+      .filter(([id]) => !inactiveMinedIds.has(id))
+  );
+  const latestFactorAvailability = Object.fromEntries(
+    Object.entries(raw.latestFactorAvailability && typeof raw.latestFactorAvailability === "object"
+      ? raw.latestFactorAvailability
+      : {})
+      .filter(([id]) => !inactiveMinedIds.has(id))
+  );
+  const stripInactiveValues = (values) => Object.fromEntries(
+    Object.entries(values && typeof values === "object" ? values : {})
+      .filter(([id]) => !inactiveMinedIds.has(id))
+  );
+  const pendingFrames = (Array.isArray(raw.pendingFrames) ? raw.pendingFrames : []).slice(-MAX_PENDING_FRAMES)
+    .map((frame) => ({
+      ...frame,
+      values: Object.fromEntries(
+        Object.entries(frame?.values && typeof frame.values === "object" ? frame.values : {})
+          .map(([symbol, values]) => [symbol, stripInactiveValues(values)])
+      )
+    }));
+  const latestBySymbol = Object.fromEntries(
+    Object.entries(raw.latestBySymbol && typeof raw.latestBySymbol === "object" ? raw.latestBySymbol : {})
+      .map(([symbol, snapshot]) => [symbol, {
+        ...snapshot,
+        values: stripInactiveValues(snapshot?.values)
+      }])
+  );
+  const mining = {
+    ...base.mining,
+    ...(raw.mining || {}),
+    validatedCount: minedFactors.filter((item) => item.validationStatus === "validated").length,
+    rejectedCount: minedFactors.filter((item) => item.validationStatus === "rejected").length,
+    mergedDuplicateCount: safeNumber(raw.mining?.mergedDuplicateCount) + removedMinedIds.size,
+    retiredCount: retiredMinedFactors.length,
+    activeLimit: MAX_ACTIVE_MINED_FACTORS,
+    archiveLimit: MAX_RETIRED_MINED_FACTORS
+  };
   return {
     ...base,
     ...raw,
     version: FACTOR_LIBRARY_VERSION,
     weightVersion: Math.max(1, Math.round(safeNumber(raw.weightVersion, 1))),
-    effectiveWeights: raw.effectiveWeights && typeof raw.effectiveWeights === "object" ? raw.effectiveWeights : {},
-    pendingFrames: Array.isArray(raw.pendingFrames) ? raw.pendingFrames.slice(-MAX_PENDING_FRAMES) : [],
-    metrics: raw.metrics && typeof raw.metrics === "object" ? raw.metrics : {},
-    latestBySymbol: raw.latestBySymbol && typeof raw.latestBySymbol === "object" ? raw.latestBySymbol : {},
-    latestFactorAvailability: raw.latestFactorAvailability && typeof raw.latestFactorAvailability === "object" ? raw.latestFactorAvailability : {},
-    minedFactors: Array.isArray(raw.minedFactors) ? raw.minedFactors.slice(-20) : [],
-    mining: { ...base.mining, ...(raw.mining || {}) },
+    effectiveWeights,
+    pendingFrames,
+    metrics,
+    latestBySymbol,
+    latestFactorAvailability,
+    minedFactors,
+    retiredMinedFactors,
+    mining,
     dataSources: raw.dataSources && typeof raw.dataSources === "object" ? raw.dataSources : {},
     historicalBackfill: { ...base.historicalBackfill, ...(raw.historicalBackfill || {}) }
   };
@@ -893,7 +1110,8 @@ function approximatePValue(tStatistic) {
   return clamp(Math.exp(-0.717 * value - 0.416 * value * value), 0, 1);
 }
 
-function updateMinedValidation(status) {
+function updateMinedValidation(status, nowMs) {
+  const now = new Date(nowMs).toISOString();
   const candidates = status.minedFactors || [];
   const tests = candidates.map((definition) => {
     const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
@@ -912,10 +1130,20 @@ function updateMinedValidation(status) {
       Math.abs(safeNumber(metric?.icir)) >= 0.3 &&
       safeNumber(metric?.coverage) >= 0.8 &&
       bhCutoff > 0 && pValue <= bhCutoff;
+    const validationStatus = validated
+      ? "validated"
+      : safeNumber(metric?.samples) >= MIN_MINED_FACTOR_SAMPLES
+        ? "rejected"
+        : "quarantine";
     return {
       ...definition,
-      orientation: validated && safeNumber(metric?.meanIc) < 0 ? -1 : safeNumber(definition.orientation, 1),
-      validationStatus: validated ? "validated" : safeNumber(metric?.samples) >= MIN_MINED_FACTOR_SAMPLES ? "rejected" : "quarantine",
+      orientation: validated
+        ? (safeNumber(metric?.meanIc) < 0 ? -1 : 1)
+        : safeNumber(definition.orientation, 1),
+      validationStatus,
+      firstRejectedAt: validationStatus === "rejected"
+        ? definition.firstRejectedAt || (definition.validationStatus === "rejected" ? definition.createdAt : null) || now
+        : null,
       validation: { samples: safeNumber(metric?.samples), meanIc: metric?.meanIc ?? null, icir: metric?.icir ?? null, tStatistic: metric?.tStatistic ?? null, pValue: round(pValue), bhCutoff: round(bhCutoff) }
     };
   });
@@ -923,8 +1151,64 @@ function updateMinedValidation(status) {
   status.mining.rejectedCount = status.minedFactors.filter((item) => item.validationStatus === "rejected").length;
 }
 
+function retireRejectedFactors(status, nowMs) {
+  const retired = [];
+  const active = [];
+  for (const definition of status.minedFactors || []) {
+    const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
+    const rejectedAtMs = Date.parse(definition.firstRejectedAt || "");
+    const eligible =
+      definition.validationStatus === "rejected" &&
+      safeNumber(metric?.samples) >= MIN_RETIRED_FACTOR_SAMPLES &&
+      Number.isFinite(rejectedAtMs) &&
+      nowMs - rejectedAtMs >= MIN_REJECTED_FACTOR_AGE_MS;
+    if (!eligible) {
+      active.push(definition);
+      continue;
+    }
+    retired.push({
+      ...definition,
+      retired: true,
+      archived: true,
+      retiredAt: new Date(nowMs).toISOString(),
+      retirementReason: "failed_validation_after_extended_observation",
+      retiredMetrics: Object.fromEntries(
+        Object.entries(status.metrics?.[definition.id] || {})
+          .map(([horizon, value]) => [horizon, compactMetricEvidence(value)])
+      ),
+      retiredAvailability: status.latestFactorAvailability?.[definition.id] || null
+    });
+  }
+  if (!retired.length) return new Set();
+
+  const retiredIds = new Set(retired.map((definition) => definition.id));
+  status.minedFactors = active;
+  status.retiredMinedFactors = normalizeRetiredMinedFactors([
+    ...(status.retiredMinedFactors || []),
+    ...retired
+  ]);
+  for (const id of retiredIds) {
+    delete status.metrics[id];
+    delete status.effectiveWeights[id];
+    delete status.latestFactorAvailability[id];
+  }
+  for (const frame of status.pendingFrames || []) {
+    for (const values of Object.values(frame.values || {})) {
+      for (const id of retiredIds) delete values[id];
+    }
+  }
+  for (const snapshot of Object.values(status.latestBySymbol || {})) {
+    for (const id of retiredIds) delete snapshot?.values?.[id];
+  }
+  status.mining.retiredCount = status.retiredMinedFactors.length;
+  status.mining.lastRetiredAt = new Date(nowMs).toISOString();
+  status.mining.rejectedCount = status.minedFactors.filter((item) => item.validationStatus === "rejected").length;
+  status.mining.currentActivity = `retired:${retired.length}`;
+  return retiredIds;
+}
+
 function mineFactor(status, config, definitions, nowMs) {
-  if (!config.miningEnabled || status.minedFactors.length >= 20) return;
+  if (!config.miningEnabled || status.minedFactors.length >= MAX_ACTIVE_MINED_FACTORS) return;
   const lastRunMs = Date.parse(status.mining.lastRunAt || "");
   if (Number.isFinite(lastRunMs) && nowMs - lastRunMs < config.miningIntervalMinutes * 60_000) return;
   const candidates = definitions.filter((definition) => definition.origin === "built_in" && definition.role === "direction");
@@ -932,43 +1216,75 @@ function mineFactor(status, config, definitions, nowMs) {
     definition,
     score: Math.abs(safeNumber(status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES]?.meanIc)) + (definition.defaultEnabled ? 0.01 : 0)
   })).sort((a, b) => b.score - a.score);
-  const existing = new Set(status.minedFactors.map((item) => `${item.leftId}|${item.rightId}|${item.operator}`));
+  const existing = new Set([
+    ...status.minedFactors.map(minedSemanticKey),
+    ...(status.retiredMinedFactors || []).map(minedSemanticKey)
+  ]);
+  const pairUsage = new Map();
+  const operatorUsage = new Map();
+  for (const definition of status.minedFactors) {
+    const pairKey = minedPairKey(definition.leftId, definition.rightId);
+    pairUsage.set(pairKey, safeNumber(pairUsage.get(pairKey)) + 1);
+    operatorUsage.set(definition.operator, safeNumber(operatorUsage.get(definition.operator)) + 1);
+  }
   const operators = ["agreement", "blend", "difference"];
-  let selected = null;
-  for (let leftIndex = 0; leftIndex < Math.min(scored.length, 12) && !selected; leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < Math.min(scored.length, 12) && !selected; rightIndex += 1) {
+  const candidateSpace = [];
+  for (let leftIndex = 0; leftIndex < Math.min(scored.length, 12); leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < Math.min(scored.length, 12); rightIndex += 1) {
       for (const operator of operators) {
-        const key = `${scored[leftIndex].definition.id}|${scored[rightIndex].definition.id}|${operator}`;
-        if (!existing.has(key)) selected = { left: scored[leftIndex].definition, right: scored[rightIndex].definition, operator };
+        const left = scored[leftIndex].definition;
+        const right = scored[rightIndex].definition;
+        const semanticKey = minedSemanticKey({ leftId: left.id, rightId: right.id, operator });
+        if (existing.has(semanticKey)) continue;
+        const pairKey = minedPairKey(left.id, right.id);
+        candidateSpace.push({
+          left,
+          right,
+          operator,
+          semanticKey,
+          pairUsage: safeNumber(pairUsage.get(pairKey)),
+          operatorUsage: safeNumber(operatorUsage.get(operator)),
+          parentScore: scored[leftIndex].score + scored[rightIndex].score
+        });
       }
     }
   }
+  candidateSpace.sort((left, right) =>
+    left.pairUsage - right.pairUsage ||
+    left.operatorUsage - right.operatorUsage ||
+    right.parentScore - left.parentScore ||
+    left.semanticKey.localeCompare(right.semanticKey)
+  );
+  const selected = candidateSpace[0] || null;
   status.mining.lastRunAt = new Date(nowMs).toISOString();
   status.mining.runCount += 1;
   if (!selected) {
     status.mining.currentActivity = "candidate_space_exhausted";
     return;
   }
-  const id = `mined_${selected.operator}_${selected.left.id}_${selected.right.id}`;
-  status.minedFactors.push({
+  const orderedParents = [selected.left, selected.right].sort((left, right) => left.id.localeCompare(right.id));
+  const left = orderedParents[0];
+  const right = orderedParents[1];
+  const id = `mined_${selected.operator}_${left.id}_${right.id}`;
+  status.minedFactors.push(minedFactorPresentation({
     id,
-    name: `挖掘：${selected.left.name} × ${selected.right.name}`,
-    category: "自动挖掘",
+    name: "",
+    category: "",
     role: "direction",
-    source: "受限DSL自动挖掘",
-    description: `由${selected.left.name}与${selected.right.name}通过${selected.operator}算子生成；进入隔离区等待IC验证。`,
+    source: "",
+    description: "",
     origin: "mined",
     orientation: 1,
     defaultEnabled: false,
     defaultUseInDecision: false,
     defaultWeight: 1,
-    formula: `${selected.operator}(${selected.left.id}, ${selected.right.id})`,
-    leftId: selected.left.id,
-    rightId: selected.right.id,
+    formula: "",
+    leftId: left.id,
+    rightId: right.id,
     operator: selected.operator,
     createdAt: new Date(nowMs).toISOString(),
     validationStatus: "quarantine"
-  });
+  }));
   status.mining.currentActivity = `generated:${id}`;
 }
 
@@ -1041,7 +1357,12 @@ export function updateFactorLibraryRuntime({ config: configValue, status: status
     status.historicalBackfill.endAt = historicalFrames.at(-1)?.capturedAt || null;
   }
   resolvePendingFrames(status, snapshots, nowMs, definitions, config.horizonsMinutes);
-  updateMinedValidation(status);
+  updateMinedValidation(status, nowMs);
+  const retiredIds = retireRejectedFactors(status, nowMs);
+  for (const snapshot of snapshots) {
+    for (const id of retiredIds) delete snapshot?.values?.[id];
+  }
+  definitions = allDefinitions(status);
   mineFactor(status, config, definitions, nowMs);
   definitions = allDefinitions(status);
   for (const snapshot of snapshots) {
@@ -1094,35 +1415,31 @@ export function updateFactorLibraryRuntime({ config: configValue, status: status
 }
 
 function publicMetric(metric) {
-  if (!metric) return null;
-  return {
-    samples: safeNumber(metric.samples),
-    meanIc: metric.meanIc ?? null,
-    icStd: metric.icStd ?? null,
-    icir: metric.icir ?? null,
-    tStatistic: metric.tStatistic ?? null,
-    coverage: metric.coverage ?? null,
-    lastIc: metric.lastIc ?? null,
-    historySamples: safeNumber(metric.historySamples),
-    realtimeSamples: safeNumber(metric.realtimeSamples)
-  };
+  return compactMetricEvidence(metric);
 }
 
 export function publicFactorLibrary(configValue, statusValue) {
   const status = normalizeFactorLibraryStatus(statusValue);
   const definitions = allDefinitions(status);
-  const config = normalizeFactorLibraryConfig(configValue, status.minedFactors);
+  const publicDefinitions = [...definitions, ...(status.retiredMinedFactors || [])];
+  const config = normalizeFactorLibraryConfig(configValue, [
+    ...status.minedFactors,
+    ...(status.retiredMinedFactors || [])
+  ]);
   const minimumActiveFactors = Math.max(4, Math.ceil(1 / Math.max(config.maxFactorWeight, 1e-9)));
   const eligibleDecisionIds = new Set(definitions.filter((definition) => {
     const setting = factorSetting(config, definition);
     return setting.enabled && setting.useInDecision && !setting.archived && definition.role === "direction" && evidenceOrientation(definition, status) != null;
   }).map((definition) => definition.id));
   const decisionReady = eligibleDecisionIds.size >= minimumActiveFactors;
-  const factors = definitions.map((definition) => {
+  const factors = publicDefinitions.map((definition) => {
     const setting = factorSetting(config, definition);
-    const metrics = Object.fromEntries(config.horizonsMinutes.map((horizon) => [horizon, publicMetric(status.metrics?.[definition.id]?.[horizon])]));
+    const metrics = Object.fromEntries(config.horizonsMinutes.map((horizon) => [
+      horizon,
+      publicMetric(status.metrics?.[definition.id]?.[horizon] || definition.retiredMetrics?.[horizon])
+    ]));
     const primary = metrics[PRIMARY_IC_HORIZON_MINUTES];
-    const availability = status.latestFactorAvailability?.[definition.id] || { availableSymbols: 0, totalSymbols: 0, coverage: 0, meanValue: null };
+    const availability = status.latestFactorAvailability?.[definition.id] || definition.retiredAvailability || { availableSymbols: 0, totalSymbols: 0, coverage: 0, meanValue: null };
     const primaryMeanIc = safeNumber(primary?.meanIc);
     const primaryIcIr = safeNumber(primary?.icir);
     const primaryT = safeNumber(primary?.tStatistic);
@@ -1137,6 +1454,9 @@ export function publicFactorLibrary(configValue, statusValue) {
     return {
       ...definition,
       ...setting,
+      enabled: definition.retired ? false : setting.enabled,
+      useInDecision: definition.retired ? false : setting.useInDecision,
+      archived: definition.retired === true || setting.archived,
       effectiveWeight: decisionReady && eligibleDecisionIds.has(definition.id)
         ? safeNumber(status.effectiveWeights?.[definition.id])
         : 0,
@@ -1156,7 +1476,8 @@ export function publicFactorLibrary(configValue, statusValue) {
       inDecision: factors.filter((item) => item.enabled && item.useInDecision && !item.archived).length,
       decisionEligible: eligibleDecisionIds.size,
       mined: factors.filter((item) => item.origin === "mined" && !item.archived).length,
-      validatedMined: factors.filter((item) => item.origin === "mined" && item.validationStatus === "validated" && !item.archived).length
+      validatedMined: factors.filter((item) => item.origin === "mined" && item.validationStatus === "validated" && !item.archived).length,
+      retiredMined: factors.filter((item) => item.origin === "mined" && item.retired === true).length
     },
     factors,
     mining: status.mining,
@@ -1179,6 +1500,7 @@ export function publicFactorLibrary(configValue, statusValue) {
     limitations: [
       "IC is a rolling predictive association, not proof of causality or future profitability.",
       "Mined factors remain quarantined until sample, ICIR, coverage, t-statistic and multiple-testing gates pass.",
+      "Rejected mined factors retire only after extended observation; compact evidence is archived and the same semantic formula is not mined again.",
       "Unavailable source data is represented as null and is never replaced with fabricated values."
     ]
   };

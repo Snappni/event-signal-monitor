@@ -6,6 +6,7 @@ import {
   createFactorLibraryStatus,
   factorDecisionForSnapshot,
   normalizeFactorLibraryConfig,
+  normalizeFactorLibraryStatus,
   publicFactorLibrary,
   updateFactorLibraryConfig,
   updateFactorLibraryRuntime
@@ -87,6 +88,260 @@ function marketResults(priceMultiplier = 1) {
 }
 
 assert.ok(FACTOR_DEFINITIONS.length >= 50, "factor library must ship with at least 50 built-in factors");
+
+const legacyDuplicateStatus = normalizeFactorLibraryStatus({
+  metrics: {
+    mined_difference_news_impact_decay_event_source_consensus: {
+      15: { samples: 40, meanIc: 0.03 }
+    },
+    mined_difference_event_source_consensus_news_impact_decay: {
+      15: { samples: 60, meanIc: -0.03 }
+    },
+    mined_blend_news_impact_decay_event_source_consensus: {
+      15: { samples: 45, meanIc: 0.02 }
+    }
+  },
+  minedFactors: [
+    {
+      id: "mined_difference_news_impact_decay_event_source_consensus",
+      leftId: "news_impact_decay",
+      rightId: "event_source_consensus",
+      operator: "difference",
+      origin: "mined",
+      role: "direction",
+      validationStatus: "rejected",
+      createdAt: "2026-07-30T00:00:00.000Z"
+    },
+    {
+      id: "mined_difference_event_source_consensus_news_impact_decay",
+      leftId: "event_source_consensus",
+      rightId: "news_impact_decay",
+      operator: "difference",
+      origin: "mined",
+      role: "direction",
+      validationStatus: "rejected",
+      createdAt: "2026-07-30T00:15:00.000Z"
+    },
+    {
+      id: "mined_blend_news_impact_decay_event_source_consensus",
+      leftId: "news_impact_decay",
+      rightId: "event_source_consensus",
+      operator: "blend",
+      origin: "mined",
+      role: "direction",
+      validationStatus: "rejected",
+      createdAt: "2026-07-30T00:30:00.000Z"
+    }
+  ]
+});
+assert.equal(legacyDuplicateStatus.minedFactors.length, 2, "reversed difference factors must merge semantically");
+assert.equal(legacyDuplicateStatus.mining.mergedDuplicateCount, 1);
+assert.equal(
+  new Set(legacyDuplicateStatus.minedFactors.map((item) => item.semanticKey)).size,
+  legacyDuplicateStatus.minedFactors.length,
+  "normalized mined factors must have unique semantic keys"
+);
+assert.ok(legacyDuplicateStatus.minedFactors.some((item) => item.operator === "blend"), "blend must remain distinct from difference");
+assert.ok(legacyDuplicateStatus.minedFactors.every((item) => item.operatorLabel && item.category.includes(item.operatorLabel)));
+assert.ok(legacyDuplicateStatus.minedFactors.every((item) => !item.name.includes(" × ")), "operator semantics must be visible in names");
+const legacyMergedFactor = legacyDuplicateStatus.minedFactors.find((item) => item.operator === "difference");
+assert.equal(
+  Object.hasOwn(legacyDuplicateStatus.metrics, legacyMergedFactor.mergedDuplicateIds[0]),
+  false,
+  "removed duplicate metric series must not remain orphaned"
+);
+const migratedConfig = normalizeFactorLibraryConfig({
+  factorSettings: {
+    mined_difference_news_impact_decay_event_source_consensus: {
+      enabled: true,
+      useInDecision: true,
+      weight: 2,
+      archived: false
+    },
+    mined_difference_event_source_consensus_news_impact_decay: {
+      enabled: false,
+      useInDecision: false,
+      weight: 1,
+      archived: false
+    }
+  }
+}, legacyDuplicateStatus.minedFactors);
+assert.equal(migratedConfig.factorSettings[legacyMergedFactor.id].enabled, true, "merged factor must preserve enabled intent");
+assert.equal(migratedConfig.factorSettings[legacyMergedFactor.id].useInDecision, true, "merged factor must preserve decision intent");
+assert.equal(
+  Object.hasOwn(migratedConfig.factorSettings, legacyMergedFactor.mergedDuplicateIds[0]),
+  false,
+  "removed duplicate settings must not remain orphaned"
+);
+
+const operatorStatus = normalizeFactorLibraryStatus({
+  minedFactors: ["difference", "blend", "agreement"].map((operator) => ({
+    id: `mined_${operator}_return_1m_return_5m`,
+    leftId: "return_1m",
+    rightId: "return_5m",
+    operator,
+    origin: "mined",
+    role: "direction",
+    validationStatus: "quarantine"
+  }))
+});
+const operatorSnapshot = buildFactorSnapshots({ marketResults: marketResults(), status: operatorStatus })[0];
+const operatorValues = ["difference", "blend", "agreement"].map(
+  (operator) => operatorSnapshot.values[`mined_${operator}_return_1m_return_5m`]
+);
+assert.equal(new Set(operatorValues).size, 3, "difference, blend and agreement must produce distinct values for unequal inputs");
+
+let diversityConfig = normalizeFactorLibraryConfig({ miningEnabled: true });
+let diversityStatus = createFactorLibraryStatus();
+for (let index = 0; index < 6; index += 1) {
+  ({ config: diversityConfig, status: diversityStatus } = updateFactorLibraryRuntime({
+    config: diversityConfig,
+    status: diversityStatus,
+    snapshots: [],
+    now: new Date(Date.parse("2026-07-30T00:00:00.000Z") + index * 16 * 60_000).toISOString()
+  }));
+}
+const diversityPairs = diversityStatus.minedFactors.map((item) => [item.leftId, item.rightId].sort().join("|"));
+assert.equal(new Set(diversityPairs).size, diversityPairs.length, "early mining must diversify parent pairs");
+assert.equal(new Set(diversityStatus.minedFactors.map((item) => item.operator)).size, 3, "mining must balance all three operators");
+
+const directionDefinitions = FACTOR_DEFINITIONS.filter((item) => item.role === "direction");
+const rejectedDefinitions = [];
+for (let leftIndex = 0; leftIndex < directionDefinitions.length && rejectedDefinitions.length < 20; leftIndex += 1) {
+  for (let rightIndex = leftIndex + 1; rightIndex < directionDefinitions.length && rejectedDefinitions.length < 20; rightIndex += 1) {
+    const operator = ["difference", "blend", "agreement"][rejectedDefinitions.length % 3];
+    const leftId = directionDefinitions[leftIndex].id;
+    const rightId = directionDefinitions[rightIndex].id;
+    rejectedDefinitions.push({
+      id: `mined_${operator}_${leftId}_${rightId}`,
+      leftId,
+      rightId,
+      operator,
+      origin: "mined",
+      role: "direction",
+      validationStatus: "rejected",
+      createdAt: "2026-07-30T00:00:00.000Z",
+      firstRejectedAt: "2026-07-30T06:00:00.000Z"
+    });
+  }
+}
+const rejectedMetrics = Object.fromEntries(rejectedDefinitions.map((definition) => [definition.id, {
+  15: {
+    samples: 90,
+    meanIc: 0.001,
+    icStd: 0.2,
+    icir: 0.005,
+    tStatistic: 0.05,
+    coverage: 1,
+    lastIc: 0.001,
+    historySamples: 60,
+    realtimeSamples: 30,
+    values: Array(90).fill(0.001),
+    coverageValues: Array(90).fill(1),
+    sourceValues: [...Array(60).fill(0), ...Array(30).fill(1)]
+  }
+}]));
+let recyclingConfig = normalizeFactorLibraryConfig({ miningEnabled: true });
+let recyclingStatus = normalizeFactorLibraryStatus({
+  minedFactors: rejectedDefinitions,
+  metrics: rejectedMetrics,
+  mining: { lastRunAt: "2026-07-30T00:00:00.000Z" }
+});
+const recyclingSnapshots = [{
+  symbol: "BTCUSDT",
+  price: 100,
+  capturedAt: "2026-07-31T00:00:00.000Z",
+  values: Object.fromEntries(rejectedDefinitions.map((definition) => [definition.id, 0.1])),
+  sources: {}
+}];
+({ config: recyclingConfig, status: recyclingStatus } = updateFactorLibraryRuntime({
+  config: recyclingConfig,
+  status: recyclingStatus,
+  snapshots: recyclingSnapshots,
+  now: "2026-07-31T00:00:00.000Z"
+}));
+assert.equal(recyclingStatus.retiredMinedFactors.length, 20, "mature rejected factors must move to compact retirement archive");
+assert.equal(recyclingStatus.mining.retiredCount, 20);
+assert.equal(recyclingStatus.minedFactors.length, 1, "retirement must immediately free one slot for a new candidate");
+assert.ok(
+  recyclingStatus.retiredMinedFactors.every((item) => item.retiredMetrics?.[15]?.samples === 90),
+  "retired factors must retain compact validation evidence"
+);
+assert.ok(
+  recyclingStatus.retiredMinedFactors.every((item) => !Object.hasOwn(recyclingStatus.metrics, item.id)),
+  "retired factors must release full rolling metric arrays"
+);
+assert.ok(
+  recyclingStatus.retiredMinedFactors.every((item) => !Object.hasOwn(recyclingSnapshots[0].values, item.id)),
+  "retired factor values must not be written back by the retirement cycle snapshot"
+);
+assert.ok(
+  !new Set(recyclingStatus.retiredMinedFactors.map((item) => item.semanticKey)).has(recyclingStatus.minedFactors[0].semanticKey),
+  "retired semantics must not be mined again"
+);
+const recyclingView = publicFactorLibrary(recyclingConfig, recyclingStatus);
+assert.equal(recyclingView.counts.retiredMined, 20);
+assert.ok(recyclingView.factors.filter((item) => item.retired).every((item) => item.archived && !item.enabled && !item.useInDecision));
+
+let graceStatus = normalizeFactorLibraryStatus({
+  minedFactors: [{ ...rejectedDefinitions[0], firstRejectedAt: "2026-07-30T23:00:00.000Z" }],
+  metrics: { [rejectedDefinitions[0].id]: rejectedMetrics[rejectedDefinitions[0].id] }
+});
+({ status: graceStatus } = updateFactorLibraryRuntime({
+  config: normalizeFactorLibraryConfig({ miningEnabled: false }),
+  status: graceStatus,
+  snapshots: [],
+  now: "2026-07-31T00:00:00.000Z"
+}));
+assert.equal(graceStatus.minedFactors.length, 1, "recently rejected factor must retain its observation grace period");
+assert.equal(graceStatus.retiredMinedFactors.length, 0);
+
+const validatedDefinition = {
+  ...rejectedDefinitions[1],
+  validationStatus: "validated",
+  orientation: -1,
+  firstRejectedAt: "2026-07-01T00:00:00.000Z"
+};
+let validatedStatus = normalizeFactorLibraryStatus({
+  minedFactors: [validatedDefinition],
+  metrics: {
+    [validatedDefinition.id]: {
+      15: {
+        ...rejectedMetrics[rejectedDefinitions[1].id][15],
+        meanIc: 0.05,
+        icStd: 0.1,
+        icir: 0.5,
+        tStatistic: 5
+      }
+    }
+  }
+});
+({ status: validatedStatus } = updateFactorLibraryRuntime({
+  config: normalizeFactorLibraryConfig({ miningEnabled: false }),
+  status: validatedStatus,
+  snapshots: [],
+  now: "2026-07-31T00:00:00.000Z"
+}));
+assert.equal(validatedStatus.minedFactors[0].validationStatus, "validated");
+assert.equal(validatedStatus.minedFactors[0].orientation, 1, "positive validated IC must clear a stale inverse orientation");
+assert.equal(validatedStatus.minedFactors[0].firstRejectedAt, null, "leaving rejected state must reset the continuous rejection clock");
+assert.equal(validatedStatus.retiredMinedFactors.length, 0, "validated factor must never be retired by rejected-factor recycling");
+
+const boundedRetirementStatus = normalizeFactorLibraryStatus({
+  retiredMinedFactors: Array.from({ length: 2050 }, (_, index) => ({
+    id: `mined_blend_synthetic_left_${index}_synthetic_right_${index}`,
+    leftId: `synthetic_left_${index}`,
+    rightId: `synthetic_right_${index}`,
+    operator: "blend",
+    origin: "mined",
+    role: "direction",
+    validationStatus: "rejected",
+    retired: true,
+    retiredAt: new Date(Date.parse("2026-07-01T00:00:00.000Z") + index * 1_000).toISOString()
+  }))
+});
+assert.equal(boundedRetirementStatus.retiredMinedFactors.length, 2048, "retirement archive must remain hard bounded");
+
 let config = normalizeFactorLibraryConfig({ miningEnabled: true, intelligentAdjustment: true });
 let status = createFactorLibraryStatus();
 const firstSnapshots = buildFactorSnapshots({ marketResults: marketResults(), status });
@@ -109,6 +364,8 @@ assert.ok(historicalFrames.length > 10, "historical factor frames must be constr
 }));
 assert.equal(status.minedFactors.length, 1, "enabled mining must create a quarantined candidate");
 assert.equal(status.minedFactors[0].validationStatus, "quarantine");
+assert.ok(status.minedFactors[0].operatorLabel);
+assert.ok(status.minedFactors[0].category.includes(status.minedFactors[0].operatorLabel));
 
 const laterSnapshots = buildFactorSnapshots({ marketResults: marketResults(1.002), status });
 ({ config, status } = updateFactorLibraryRuntime({
