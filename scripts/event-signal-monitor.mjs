@@ -95,7 +95,7 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.18.0";
+const MONITOR_VERSION = "0.18.1";
 const RUN_LAYER = "event-driven-hybrid";
 const LAYER_REPORT_PATH = REPORT_PATH;
 const MESSAGE_FEED_LIMIT = 200;
@@ -114,6 +114,11 @@ const SERVICE_IDLE_DECISION_DELAY_MS = toPositiveInt(
   30_000
 );
 const SERVICE_MAX_BACKOFF_MS = toPositiveInt(process.env.SIGNAL_MAX_DECISION_BACKOFF_MS, 120_000);
+const SERVICE_DECISION_CYCLE_TIMEOUT_MS = toPositiveInt(
+  process.env.SIGNAL_DECISION_CYCLE_TIMEOUT_MS,
+  120_000
+);
+const SERVICE_DECISION_TIMEOUT_EXIT_CODE = 70;
 const PRICE_EVENT_COALESCE_MS = toPositiveInt(process.env.SIGNAL_PRICE_EVENT_COALESCE_MS, 100);
 const ORDER_FLOW_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_ORDER_FLOW_SYMBOL_LIMIT, 12);
 const FACTOR_EXTERNAL_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_FACTOR_EXTERNAL_SYMBOL_LIMIT, 4);
@@ -372,6 +377,57 @@ function appendRuntimeLog(message) {
   } catch {
     // Logging must not stop the monitor.
   }
+}
+
+function updateDecisionStage(serviceState, stage) {
+  serviceState.decisionStage = String(stage || "unknown");
+  serviceState.decisionStageAt = new Date().toISOString();
+}
+
+function armDecisionCycleWatchdog({
+  serviceState,
+  cycleStartedMs,
+  timeoutMs,
+  persistStatus,
+  stopStreams,
+  appendLog = appendRuntimeLog,
+  exitProcess = (code) => process.exit(code)
+}) {
+  const timer = setTimeout(() => {
+    const timedOutAt = new Date().toISOString();
+    const stage = serviceState.decisionStage || "unknown";
+    const stageStartedMs = Date.parse(serviceState.decisionStageAt || "");
+    const elapsedMs = Math.max(0, Date.now() - cycleStartedMs);
+    const stageElapsedMs = Number.isFinite(stageStartedMs)
+      ? Math.max(0, Date.now() - stageStartedMs)
+      : null;
+    const message = `decision cycle exceeded ${timeoutMs}ms at stage=${stage}`;
+    serviceState.decisionHealth = "timed_out";
+    serviceState.lastDecisionTimedOutAt = timedOutAt;
+    serviceState.lastDecisionTimeoutMs = timeoutMs;
+    serviceState.lastDecisionDurationMs = elapsedMs;
+    serviceState.lastDecisionStageElapsedMs = stageElapsedMs;
+    serviceState.decisionTimeouts = safeNumber(serviceState.decisionTimeouts) + 1;
+    serviceState.consecutiveDecisionFailures = safeNumber(serviceState.consecutiveDecisionFailures) + 1;
+    serviceState.lastDecisionError = message;
+    try {
+      stopStreams();
+    } catch {
+      // The watchdog must still persist evidence and terminate the process.
+    }
+    try {
+      persistStatus();
+    } catch {
+      // The runtime log remains a second evidence path.
+    }
+    try {
+      appendLog(`[${timedOutAt}] watchdog: ${message}; exiting code=${SERVICE_DECISION_TIMEOUT_EXIT_CODE} for service restart`);
+    } catch {
+      // Termination is the final recovery mechanism even if logging fails.
+    }
+    exitProcess(SERVICE_DECISION_TIMEOUT_EXIT_CODE);
+  }, timeoutMs);
+  return () => clearTimeout(timer);
 }
 
 function createInitialState() {
@@ -4419,7 +4475,8 @@ function renderConsoleReport(report) {
   return lines.join("\n");
 }
 
-async function main() {
+async function main({ onStage = () => {} } = {}) {
+  onStage("runtime-state");
   ensureRuntimeDir();
   const state = readJsonIfExists(STATE_PATH, createInitialState());
   let factorStatus = normalizeFactorLibraryStatus(
@@ -4439,6 +4496,7 @@ async function main() {
   state.closedSignals = (Array.isArray(state.closedSignals) ? state.closedSignals : [])
     .map(compactClosedSignal)
     .slice(-SIGNAL_OUTCOME_HISTORY_LIMIT);
+  onStage("account-bootstrap");
   const releaseInitialAccountLock = await acquireAccountLock();
   let accountConfig;
   let accountSessionId;
@@ -4464,6 +4522,7 @@ async function main() {
     "仅模拟告警：脚本不会发送实盘订单。",
     "无证据表明新闻聚合、大模型推理或 Polymarket 赔率本身能稳定盈利。"
   ];
+  onStage("source-refresh");
   const [aggregatorFetch, gdeltFetch, polymarketFetch, binanceFetch, okxFetch, whaleFetch, tradingRulesFetch] =
     await Promise.all([
       fetchCachedSource(state, "aggregator", SOURCE_REFRESH_MS.aggregator, fetchMessageAggregator),
@@ -4538,6 +4597,7 @@ async function main() {
   const classifiedEvents = scoredEvents.filter((event) => event.impactScore >= 18);
   const eventsBySymbol = aggregateEventsBySymbol(classifiedEvents);
 
+  onStage("market-analysis");
   const marketResults = await mapWithConcurrency(SYMBOLS, MARKET_CONCURRENCY, async (symbol) => {
     try {
       return await analyzeSymbol(symbol, state, factorConfig);
@@ -4573,6 +4633,7 @@ async function main() {
     ) &&
     (historyRetryDue || historyNeedsMigration)
   ) {
+    onStage("factor-history-backfill");
     factorStatus.historicalBackfill = {
       ...historicalStatus,
       status: "processing",
@@ -4602,6 +4663,7 @@ async function main() {
       warnings.push(`因子历史回填暂不可用：${factorStatus.historicalBackfill.error}；继续使用实时样本。`);
     }
   }
+  onStage("factor-runtime");
   const factorRuntime = updateFactorLibraryRuntime({
     config: factorConfig,
     status: factorStatus,
@@ -4663,6 +4725,7 @@ async function main() {
     }
   }
 
+  onStage("candidate-evaluation");
   const marketBySymbol = Object.fromEntries(marketAnalyses.map((market) => [market.symbol, market]));
   const tradingRulesBySymbol = tradingRulesResult?.symbols || {};
   const rawCandidates = marketAnalyses
@@ -4690,6 +4753,7 @@ async function main() {
   const actionableSignals = candidates.filter((candidate) => candidate.status === "passed").slice(0, 5);
   const watchlist = candidates.filter((candidate) => candidate.status !== "passed").slice(0, 8);
   const closedSignals = updateOpenSignalsAndReviews(state, actionableSignals, marketBySymbol);
+  onStage("account-update");
   const releaseAccountLock = await acquireAccountLock();
   let finalAccountConfig;
   let updatedPaperAccount;
@@ -4829,6 +4893,7 @@ async function main() {
     postTradeReview: updatedPaperAccount.postTradeReview || null
   };
 
+  onStage("report-persist");
   let historyStorage;
   try {
     historyStorage = appendCompactHistory({
@@ -4859,12 +4924,13 @@ async function main() {
   console.log(renderConsoleReport(report));
 }
 
-async function run() {
+async function run({ onStage = () => {} } = {}) {
   const startedAt = Date.now();
   appendRuntimeLog(`[${new Date(startedAt).toISOString()}] signal:monitor run started`);
+  onStage("runtime-lock");
   const releaseLock = await acquireRuntimeLock();
   try {
-    await main();
+    await main({ onStage });
     appendRuntimeLog(`[${new Date().toISOString()}] signal:monitor run completed elapsedMs=${Date.now() - startedAt}`);
   } catch (error) {
     appendRuntimeLog(`[${new Date().toISOString()}] signal:monitor run failed elapsedMs=${Date.now() - startedAt} error=${error instanceof Error ? error.message : String(error)}`);
@@ -4972,7 +5038,7 @@ async function runPriceProtectionCycle(prices, serviceState) {
   }
 }
 
-async function runService() {
+async function runService({ decisionRunner = run } = {}) {
   ensureRuntimeDir();
   let releaseServiceLock;
   try {
@@ -5005,9 +5071,19 @@ async function runService() {
     protectionCycles: 0,
     protectionActions: 0,
     decisionCycles: 0,
+    decisionTimeouts: 0,
+    decisionCycleTimeoutMs: SERVICE_DECISION_CYCLE_TIMEOUT_MS,
+    decisionHealth: "starting",
+    decisionStage: "idle",
+    decisionStageAt: null,
+    decisionDeadlineAt: null,
     consecutiveDecisionFailures: 0,
     lastDecisionStartedAt: null,
     lastDecisionCompletedAt: null,
+    lastDecisionDurationMs: null,
+    lastDecisionTimedOutAt: null,
+    lastDecisionTimeoutMs: null,
+    lastDecisionStageElapsedMs: null,
     nextDecisionAt: null,
     lastDecisionError: null
   };
@@ -5232,15 +5308,40 @@ async function runService() {
     while (!stopping) {
       const cycleStartedMs = Date.now();
       serviceState.lastDecisionStartedAt = new Date(cycleStartedMs).toISOString();
+      serviceState.decisionDeadlineAt = new Date(
+        cycleStartedMs + SERVICE_DECISION_CYCLE_TIMEOUT_MS
+      ).toISOString();
+      serviceState.decisionHealth = "running";
+      updateDecisionStage(serviceState, "starting");
+      persistStatus();
+      const disarmDecisionWatchdog = armDecisionCycleWatchdog({
+        serviceState,
+        cycleStartedMs,
+        timeoutMs: SERVICE_DECISION_CYCLE_TIMEOUT_MS,
+        persistStatus,
+        stopStreams: closeSockets
+      });
       try {
-        await run();
+        await decisionRunner({
+          onStage: (stage) => updateDecisionStage(serviceState, stage)
+        });
+        disarmDecisionWatchdog();
         serviceState.decisionCycles += 1;
         serviceState.consecutiveDecisionFailures = 0;
         serviceState.lastDecisionError = null;
         serviceState.lastDecisionCompletedAt = new Date().toISOString();
+        serviceState.lastDecisionDurationMs = Date.now() - cycleStartedMs;
+        serviceState.decisionDeadlineAt = null;
+        serviceState.decisionHealth = "healthy";
+        updateDecisionStage(serviceState, "idle");
       } catch (error) {
+        disarmDecisionWatchdog();
         serviceState.consecutiveDecisionFailures += 1;
         serviceState.lastDecisionError = error instanceof Error ? error.message : String(error);
+        serviceState.lastDecisionDurationMs = Date.now() - cycleStartedMs;
+        serviceState.decisionDeadlineAt = null;
+        serviceState.decisionHealth = "degraded";
+        updateDecisionStage(serviceState, "failed");
       }
       if (stopping) break;
       ensurePriceStream();
@@ -5260,6 +5361,9 @@ async function runService() {
     closeSockets();
     serviceState.stoppedAt = new Date().toISOString();
     serviceState.priceConnected = false;
+    serviceState.decisionDeadlineAt = null;
+    serviceState.decisionHealth = "stopped";
+    updateDecisionStage(serviceState, "stopped");
     try {
       persistStatus();
     } finally {
@@ -6279,6 +6383,15 @@ function runCapitalRotationIntegrationSelfTest() {
 
 const execution = process.argv.includes("--service")
   ? runService()
+  : process.argv.includes("--self-test-decision-watchdog-child")
+    ? runService({
+      decisionRunner: async ({ onStage }) => {
+        await acquireRuntimeLock();
+        await acquireAccountLock();
+        onStage("self-test-stall");
+        await new Promise(() => {});
+      }
+    })
   : process.argv.includes("--self-test-isolation-probe")
     ? Promise.reject(new Error("intentional self-test isolation probe"))
   : process.argv.includes("--self-test-entry-pause")

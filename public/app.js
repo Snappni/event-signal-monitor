@@ -400,20 +400,25 @@ function renderSummary() {
       : `当前展示 ${displayedMessages} 条（上限 ${messageLimit}）`
   );
   setText("#modelValue", uiCounts.models ?? models.length);
-  const loopStatus = state.status?.loopRunning
-    ? `${state.status?.orderFlowConnected ? "订单流已连接" : state.status?.priceConnected ? "行情流已连接" : "决策服务已运行"} · ${text.running}`
-    : `事件驱动服务 ${text.stopped}`;
+  const decisionStalled = state.status?.decisionStalled === true;
+  const loopStatus = decisionStalled
+    ? `决策循环已停滞 · 阶段 ${state.status?.decisionStage || "未知"}`
+    : state.status?.loopRunning
+      ? `${state.status?.orderFlowConnected ? "订单流已连接" : state.status?.priceConnected ? "行情流已连接" : "决策服务已运行"} · ${text.running}`
+      : `事件驱动服务 ${text.stopped}`;
   setText("#loopValue", loopStatus);
   const healthStatus = $("#healthStatus");
   if (healthStatus) {
     healthStatus.classList.toggle("stopped", !state.status?.loopRunning);
-    healthStatus.lastChild.textContent = state.status?.loopRunning
-      ? state.status?.orderFlowConnected
-        ? "订单流监控中"
-        : state.status?.priceConnected
-          ? "行情流监控中"
-        : "决策服务运行中"
-      : "监控服务未运行";
+    healthStatus.lastChild.textContent = decisionStalled
+      ? "决策循环已停滞"
+      : state.status?.loopRunning
+        ? state.status?.orderFlowConnected
+          ? "订单流监控中"
+          : state.status?.priceConnected
+            ? "行情流监控中"
+            : "决策服务运行中"
+        : "监控服务未运行";
   }
   setText("#reportTime", fmtTimestamp(report.generatedAt));
   setText("#sourceCounts", `内置 RSS ${sourceCounts.rss || 0} | 热榜 ${sourceCounts.trend || 0} | GDELT ${sourceCounts.gdelt || 0} | Polymarket ${sourceCounts.polymarket || 0} | 交易所公告 ${(sourceCounts.binanceAnnouncements || 0) + (sourceCounts.okxAnnouncements || 0)} | 合并重复 ${sourceCounts.suppressedDuplicates || 0} | 市场计算 ${sourceCounts.marketAnalyses || 0}`);

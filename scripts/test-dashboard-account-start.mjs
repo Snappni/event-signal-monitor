@@ -177,6 +177,7 @@ try {
   assert.ok(appScript.includes("北京时间 UTC+8"), "dashboard timestamps must label their timezone");
   assert.ok(appScript.includes('setInterval(() => refreshLog().catch(showError), 1_000)'), "log page must poll incremental updates every second");
   assert.ok(appScript.includes('? 1_000\n      : 3_000'), "overview must refresh once per second");
+  assert.ok(appScript.includes("决策循环已停滞"), "overview must distinguish a stalled decision loop from a stopped process");
   assert.ok(appScript.includes("信号结果观察中（最长 72 小时，非仓位）"), "tracked signals must expose their bounded observation window");
   assert.ok(appScript.includes("清晰视图时间：北京时间 UTC+8"), "clean log view must label converted timestamps");
   assert.ok(summaryScript.includes('timeZone: "Asia/Shanghai"'));
@@ -198,6 +199,50 @@ try {
   assert.equal(serviceStatus.orderFlowConnected, false);
   assert.equal(serviceStatus.orderFlowDepthConnected, false);
   assert.equal(serviceStatus.orderFlowTradeConnected, false);
+
+  const statusPath = path.join(runtimeDir, "service-status.json");
+  const staleDecisionStartedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+  const staleDecisionCompletedAt = new Date(Date.now() - 11 * 60_000).toISOString();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    mode: "event-driven-hybrid",
+    pid: child.pid,
+    heartbeatAt: new Date().toISOString(),
+    decisionHealth: "running",
+    decisionStage: "market-analysis",
+    decisionStageAt: staleDecisionStartedAt,
+    decisionCycleTimeoutMs: 120_000,
+    lastDecisionStartedAt: staleDecisionStartedAt,
+    lastDecisionCompletedAt: staleDecisionCompletedAt
+  }), "utf8");
+  const stalledStatus = await (await fetch(`${baseUrl}/api/status`)).json();
+  assert.equal(stalledStatus.processRunning, true);
+  assert.equal(stalledStatus.decisionInFlight, true);
+  assert.equal(stalledStatus.decisionStalled, true);
+  assert.equal(stalledStatus.decisionHealthy, false);
+  assert.equal(stalledStatus.loopRunning, false);
+  assert.equal(stalledStatus.loopBackend, "decision-stalled");
+  assert.equal(stalledStatus.decisionStage, "market-analysis");
+
+  const healthyDecisionAt = new Date().toISOString();
+  fs.writeFileSync(statusPath, JSON.stringify({
+    mode: "event-driven-hybrid",
+    pid: child.pid,
+    heartbeatAt: healthyDecisionAt,
+    decisionHealth: "healthy",
+    decisionStage: "idle",
+    decisionStageAt: healthyDecisionAt,
+    decisionCycleTimeoutMs: 120_000,
+    lastDecisionStartedAt: healthyDecisionAt,
+    lastDecisionCompletedAt: healthyDecisionAt
+  }), "utf8");
+  const healthyStatus = await (await fetch(`${baseUrl}/api/status`)).json();
+  assert.equal(healthyStatus.processRunning, true);
+  assert.equal(healthyStatus.decisionInFlight, false);
+  assert.equal(healthyStatus.decisionStalled, false);
+  assert.equal(healthyStatus.decisionHealthy, true);
+  assert.equal(healthyStatus.loopRunning, true);
+  assert.equal(healthyStatus.loopBackend, "service-heartbeat");
+
   const [overviewText, signalsText, messagesText, modelsText, logsText] = await Promise.all(
     pageResponses.map((response) => response.text())
   );

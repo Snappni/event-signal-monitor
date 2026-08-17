@@ -57,6 +57,8 @@ const MONITOR_SUPERVISOR_PATH = path.join(__dirname, "supervise-event-signal-ser
 const ENV_PATH = path.join(ROOT_DIR, ".env");
 const PORT = Number(process.env.SIGNAL_DASHBOARD_PORT || 8788);
 const SERVICE_STALE_SECONDS = Math.max(3, Number(process.env.SIGNAL_SERVICE_STALE_SECONDS || 5));
+const DEFAULT_DECISION_CYCLE_TIMEOUT_MS = 120_000;
+const DECISION_STALL_GRACE_MS = 5_000;
 const AUTO_START_MONITOR_SERVICE = process.env.SIGNAL_DASHBOARD_AUTO_START_SERVICE !== "false";
 const SERVICE_ENSURE_INTERVAL_MS = Math.max(
   1_000,
@@ -769,13 +771,41 @@ function loopStatus(latestReportOverride = null) {
   const reportGeneratedAt = latestReport?.generatedAt || null;
   const reportTimestamp = Date.parse(reportGeneratedAt || "");
   const reportAgeMs = Number.isFinite(reportTimestamp) ? Math.max(0, Date.now() - reportTimestamp) : null;
+  const processRunning = pidRunning || serviceFresh;
+  const decisionTimeoutMs = Math.max(
+    1_000,
+    service?.decisionCycleTimeoutMs == null
+      ? DEFAULT_DECISION_CYCLE_TIMEOUT_MS
+      : safeNumber(service.decisionCycleTimeoutMs, DEFAULT_DECISION_CYCLE_TIMEOUT_MS)
+  );
+  const decisionStartedMs = Date.parse(service?.lastDecisionStartedAt || "");
+  const decisionCompletedMs = Date.parse(service?.lastDecisionCompletedAt || "");
+  const decisionStageMs = Date.parse(service?.decisionStageAt || "");
+  const decisionInFlight = Number.isFinite(decisionStartedMs) &&
+    (!Number.isFinite(decisionCompletedMs) || decisionStartedMs > decisionCompletedMs);
+  const decisionAgeMs = decisionInFlight ? Math.max(0, Date.now() - decisionStartedMs) : null;
+  const decisionStageAgeMs = Number.isFinite(decisionStageMs)
+    ? Math.max(0, Date.now() - decisionStageMs)
+    : null;
+  const decisionStalled = processRunning && (
+    service?.decisionHealth === "timed_out" ||
+    (decisionAgeMs !== null && decisionAgeMs > decisionTimeoutMs + DECISION_STALL_GRACE_MS)
+  );
+  const decisionHealthy = processRunning && !decisionStalled;
   return {
     generatedAt: new Date().toISOString(),
     loopMode: service?.mode || "event-driven-hybrid",
     loopPid: fastPid || null,
     servicePid: service?.pid || null,
-    loopRunning: pidRunning || serviceFresh,
-    loopBackend: serviceFresh ? "service-heartbeat" : pidRunning ? "process-pid" : "none",
+    processRunning,
+    loopRunning: decisionHealthy,
+    loopBackend: decisionStalled
+      ? "decision-stalled"
+      : serviceFresh
+        ? "service-heartbeat"
+        : pidRunning
+          ? "process-pid"
+          : "none",
     loopIntervalSeconds: null,
     decisionBackend: service?.decisionBackend || "adaptive-sequential-rest",
     priceBackend: service?.priceBackend || "binance-bookTicker-websocket",
@@ -791,6 +821,21 @@ function loopStatus(latestReportOverride = null) {
     lastProtectionAt: service?.lastProtectionAt || null,
     nextDecisionAt: service?.nextDecisionAt || null,
     decisionCycles: safeNumber(service?.decisionCycles),
+    decisionTimeouts: safeNumber(service?.decisionTimeouts),
+    decisionHealth: service?.decisionHealth || (decisionHealthy ? "healthy" : "unavailable"),
+    decisionHealthy,
+    decisionStalled,
+    decisionInFlight,
+    decisionStage: service?.decisionStage || null,
+    decisionStageAt: service?.decisionStageAt || null,
+    decisionStageAgeSeconds: decisionStageAgeMs === null ? null : Math.round(decisionStageAgeMs / 1_000),
+    decisionCycleTimeoutSeconds: Math.round(decisionTimeoutMs / 1_000),
+    lastDecisionStartedAt: service?.lastDecisionStartedAt || null,
+    lastDecisionCompletedAt: service?.lastDecisionCompletedAt || null,
+    lastDecisionTimedOutAt: service?.lastDecisionTimedOutAt || null,
+    lastDecisionDurationMs: service?.lastDecisionDurationMs == null
+      ? null
+      : safeNumber(service.lastDecisionDurationMs, null),
     protectionCycles: safeNumber(service?.protectionCycles),
     protectionActions: safeNumber(service?.protectionActions),
     consecutiveDecisionFailures: safeNumber(service?.consecutiveDecisionFailures),
@@ -799,6 +844,7 @@ function loopStatus(latestReportOverride = null) {
     loopLastReportAt: reportGeneratedAt,
     loopReportAgeSeconds: reportAgeMs === null ? null : Math.round(reportAgeMs / 1000),
     loopStaleAfterSeconds: SERVICE_STALE_SECONDS,
+    decisionStaleAfterSeconds: Math.round((decisionTimeoutMs + DECISION_STALL_GRACE_MS) / 1_000),
     runtimeDir: RUNTIME_DIR
   };
 }
@@ -806,7 +852,7 @@ function loopStatus(latestReportOverride = null) {
 let supervisorLaunchPending = false;
 
 function ensureMonitorSupervisor() {
-  if (!AUTO_START_MONITOR_SERVICE || supervisorLaunchPending || loopStatus().loopRunning) return;
+  if (!AUTO_START_MONITOR_SERVICE || supervisorLaunchPending || loopStatus().processRunning) return;
   supervisorLaunchPending = true;
   const supervisor = spawn(process.execPath, [MONITOR_SUPERVISOR_PATH], {
     cwd: ROOT_DIR,
