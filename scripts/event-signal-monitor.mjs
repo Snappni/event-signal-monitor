@@ -96,7 +96,7 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.19.0";
+const MONITOR_VERSION = "0.19.1";
 const RUN_LAYER = "event-driven-hybrid";
 const LAYER_REPORT_PATH = REPORT_PATH;
 const MESSAGE_FEED_LIMIT = 200;
@@ -5089,6 +5089,22 @@ function marketStreamConfig() {
   };
 }
 
+function marketStreamConnectionPlan(stream) {
+  const protectionSymbols = [...new Set(stream?.protectionSymbols || [])].sort();
+  const orderFlowSymbols = [...new Set(stream?.orderFlowSymbols || [])].sort();
+  const marketType = stream?.marketType === "spot" ? "spot" : "futures";
+  return {
+    marketType,
+    protectionSymbols,
+    orderFlowSymbols,
+    protectionStreams: protectionSymbols.map((symbol) => `${symbol.toLowerCase()}@bookTicker`),
+    depthStreams: orderFlowSymbols.map((symbol) => `${symbol.toLowerCase()}@depth5@100ms`),
+    tradeStreams: orderFlowSymbols.map((symbol) => `${symbol.toLowerCase()}@aggTrade`),
+    protectionKey: `${marketType}:${protectionSymbols.join(",")}`,
+    orderFlowKey: `${marketType}:${orderFlowSymbols.join(",")}`
+  };
+}
+
 async function runPriceProtectionCycle(prices, serviceState) {
   if (!prices.size) return;
   const releaseAccountLock = await acquireAccountLock();
@@ -5197,12 +5213,16 @@ async function runService({ decisionRunner = run } = {}) {
     lastDecisionError: null
   };
   let stopping = false;
-  let quoteSocket = null;
+  let protectionSocket = null;
+  let depthSocket = null;
   let tradeSocket = null;
-  let streamKey = "";
+  let protectionStreamKey = "";
+  let orderFlowStreamKey = "";
   let socketMarketType = null;
-  let activeStream = null;
-  let reconnectTimer = null;
+  let activeProtectionSymbols = [];
+  let activeOrderFlowSymbols = [];
+  let protectionReconnectTimer = null;
+  let orderFlowReconnectTimer = null;
   let protectionTimer = null;
   let protectionBusy = false;
   let shutdownTimer = null;
@@ -5217,12 +5237,13 @@ async function runService({ decisionRunner = run } = {}) {
   const socketReady = (socket) => socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState);
 
   const updateConnections = () => {
-    const quoteOpen = quoteSocket?.readyState === WebSocket.OPEN;
+    const protectionOpen = protectionSocket?.readyState === WebSocket.OPEN;
+    const depthOpen = depthSocket?.readyState === WebSocket.OPEN;
     const tradeOpen = tradeSocket?.readyState === WebSocket.OPEN;
-    const hasProtection = Boolean(activeStream?.protectionSymbols?.length);
-    const hasOrderFlow = Boolean(activeStream?.orderFlowSymbols?.length);
-    serviceState.priceConnected = hasProtection && quoteOpen;
-    serviceState.orderFlowDepthConnected = hasOrderFlow && quoteOpen;
+    const hasProtection = activeProtectionSymbols.length > 0;
+    const hasOrderFlow = activeOrderFlowSymbols.length > 0;
+    serviceState.priceConnected = hasProtection && protectionOpen;
+    serviceState.orderFlowDepthConnected = hasOrderFlow && depthOpen;
     serviceState.orderFlowTradeConnected = hasOrderFlow && tradeOpen;
     serviceState.orderFlowConnected =
       serviceState.orderFlowDepthConnected && serviceState.orderFlowTradeConnected;
@@ -5236,23 +5257,46 @@ async function runService({ decisionRunner = run } = {}) {
     else socket.terminate();
   };
 
-  const closeSockets = () => {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-    disposeSocket(quoteSocket);
-    disposeSocket(tradeSocket);
-    quoteSocket = null;
-    tradeSocket = null;
-    streamKey = "";
-    activeStream = null;
+  const closeProtectionStream = () => {
+    if (protectionReconnectTimer) clearTimeout(protectionReconnectTimer);
+    protectionReconnectTimer = null;
+    disposeSocket(protectionSocket);
+    protectionSocket = null;
+    protectionStreamKey = "";
+    activeProtectionSymbols = [];
     updateConnections();
   };
 
-  const scheduleReconnect = () => {
-    if (stopping || reconnectTimer) return;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      ensurePriceStream(true);
+  const closeOrderFlowStreams = () => {
+    if (orderFlowReconnectTimer) clearTimeout(orderFlowReconnectTimer);
+    orderFlowReconnectTimer = null;
+    disposeSocket(depthSocket);
+    disposeSocket(tradeSocket);
+    depthSocket = null;
+    tradeSocket = null;
+    orderFlowStreamKey = "";
+    activeOrderFlowSymbols = [];
+    updateConnections();
+  };
+
+  const closeSockets = () => {
+    closeProtectionStream();
+    closeOrderFlowStreams();
+  };
+
+  const scheduleProtectionReconnect = () => {
+    if (stopping || protectionReconnectTimer) return;
+    protectionReconnectTimer = setTimeout(() => {
+      protectionReconnectTimer = null;
+      ensurePriceStream({ forceProtection: true });
+    }, 1_000);
+  };
+
+  const scheduleOrderFlowReconnect = () => {
+    if (stopping || orderFlowReconnectTimer) return;
+    orderFlowReconnectTimer = setTimeout(() => {
+      orderFlowReconnectTimer = null;
+      ensurePriceStream({ forceOrderFlow: true });
     }, 1_000);
   };
 
@@ -5276,68 +5320,36 @@ async function runService({ decisionRunner = run } = {}) {
     }
   };
 
-  const ensurePriceStream = (force = false) => {
-    const stream = marketStreamConfig();
-    serviceState.subscribedSymbols = stream.symbols;
-    serviceState.orderFlowSymbols = stream.orderFlowSymbols;
-    if (!stream.symbols.length) {
-      closeSockets();
+  const ensureProtectionStream = (plan, force = false) => {
+    if (!plan.protectionSymbols.length) {
+      closeProtectionStream();
       return;
     }
-    const quoteNames = [
-      ...stream.protectionSymbols.map((symbol) => `${symbol.toLowerCase()}@bookTicker`),
-      ...stream.orderFlowSymbols.map((symbol) => `${symbol.toLowerCase()}@depth5@100ms`)
-    ].join("/");
-    const tradeNames = stream.orderFlowSymbols
-      .map((symbol) => `${symbol.toLowerCase()}@aggTrade`)
-      .join("/");
-    const spotBase = "wss://stream.binance.com:9443/stream?streams=";
-    const quoteBase = stream.marketType === "spot"
-      ? spotBase
-      : "wss://fstream.binance.com/public/stream?streams=";
-    const tradeBase = stream.marketType === "spot"
-      ? spotBase
-      : "wss://fstream.binance.com/market/stream?streams=";
-    const nextKey = `${stream.marketType}:${quoteNames}:${tradeNames}`;
     if (
       !force &&
-      streamKey === nextKey &&
-      socketReady(quoteSocket) &&
-      (!tradeNames || socketReady(tradeSocket))
+      protectionStreamKey === plan.protectionKey &&
+      socketReady(protectionSocket)
     ) {
       return;
     }
-    if (socketMarketType && socketMarketType !== stream.marketType) marketMicrostructure.clear();
-    closeSockets();
-    socketMarketType = stream.marketType;
-    streamKey = nextKey;
-    activeStream = stream;
-
-    const currentQuoteSocket = new WebSocket(`${quoteBase}${quoteNames}`, { handshakeTimeout: 8_000 });
-    quoteSocket = currentQuoteSocket;
-    currentQuoteSocket.on("open", () => {
+    closeProtectionStream();
+    protectionStreamKey = plan.protectionKey;
+    activeProtectionSymbols = plan.protectionSymbols;
+    const base = plan.marketType === "spot"
+      ? "wss://stream.binance.com:9443/stream?streams="
+      : "wss://fstream.binance.com/public/stream?streams=";
+    const currentSocket = new WebSocket(`${base}${plan.protectionStreams.join("/")}`, { handshakeTimeout: 8_000 });
+    protectionSocket = currentSocket;
+    currentSocket.on("open", () => {
       updateConnections();
       serviceState.lastPriceError = null;
       persistStatus();
     });
-    currentQuoteSocket.on("message", (raw) => {
+    currentSocket.on("message", (raw) => {
       try {
         const payload = JSON.parse(String(raw));
         const data = payload?.data || payload;
-        const streamName = String(payload?.stream || "");
         const symbol = String(data?.s || "").toUpperCase();
-        const eventType = String(data?.e || "");
-        if (eventType === "depthUpdate" || streamName.includes("@depth")) {
-          if (marketMicrostructure.updateBook({
-            symbol,
-            bids: data?.b || data?.bids,
-            asks: data?.a || data?.asks,
-            time: data?.E
-          })) {
-            serviceState.lastOrderFlowEventAt = new Date().toISOString();
-          }
-          return;
-        }
         const bid = safeNumber(data?.b);
         const ask = safeNumber(data?.a);
         marketMicrostructure.updateTopQuote({
@@ -5349,7 +5361,7 @@ async function runService({ decisionRunner = run } = {}) {
           time: data?.E
         });
         const price = bid > 0 && ask > 0 ? (bid + ask) / 2 : safeNumber(data?.c || data?.p);
-        if (!symbol || !(price > 0) || !stream.protectionSymbols.includes(symbol)) return;
+        if (!symbol || !(price > 0) || !plan.protectionSymbols.includes(symbol)) return;
         pendingPrices.set(symbol, price);
         serviceState.lastPriceEventAt = new Date().toISOString();
         if (!protectionTimer) protectionTimer = setTimeout(flushProtection, PRICE_EVENT_COALESCE_MS);
@@ -5357,20 +5369,74 @@ async function runService({ decisionRunner = run } = {}) {
         // Ignore malformed public-stream frames; the next valid quote replaces them.
       }
     });
-    currentQuoteSocket.on("error", (error) => {
+    currentSocket.on("error", (error) => {
       serviceState.lastPriceError = error instanceof Error ? error.message : String(error);
     });
-    currentQuoteSocket.on("close", () => {
-      if (quoteSocket === currentQuoteSocket) quoteSocket = null;
+    currentSocket.on("close", () => {
+      if (protectionSocket === currentSocket) protectionSocket = null;
       updateConnections();
-      scheduleReconnect();
+      scheduleProtectionReconnect();
     });
+  };
 
-    if (!tradeNames) {
-      updateConnections();
+  const ensureOrderFlowStreams = (plan, force = false) => {
+    if (!plan.orderFlowSymbols.length) {
+      closeOrderFlowStreams();
       return;
     }
-    const currentTradeSocket = new WebSocket(`${tradeBase}${tradeNames}`, { handshakeTimeout: 8_000 });
+    if (
+      !force &&
+      orderFlowStreamKey === plan.orderFlowKey &&
+      socketReady(depthSocket) &&
+      socketReady(tradeSocket)
+    ) {
+      return;
+    }
+    closeOrderFlowStreams();
+    orderFlowStreamKey = plan.orderFlowKey;
+    activeOrderFlowSymbols = plan.orderFlowSymbols;
+    const spotBase = "wss://stream.binance.com:9443/stream?streams=";
+    const depthBase = plan.marketType === "spot"
+      ? spotBase
+      : "wss://fstream.binance.com/public/stream?streams=";
+    const tradeBase = plan.marketType === "spot"
+      ? spotBase
+      : "wss://fstream.binance.com/market/stream?streams=";
+
+    const currentDepthSocket = new WebSocket(`${depthBase}${plan.depthStreams.join("/")}`, { handshakeTimeout: 8_000 });
+    depthSocket = currentDepthSocket;
+    currentDepthSocket.on("open", () => {
+      updateConnections();
+      serviceState.lastOrderFlowError = null;
+      persistStatus();
+    });
+    currentDepthSocket.on("message", (raw) => {
+      try {
+        const payload = JSON.parse(String(raw));
+        const data = payload?.data || payload;
+        const symbol = String(data?.s || "").toUpperCase();
+        if (marketMicrostructure.updateBook({
+          symbol,
+          bids: data?.b || data?.bids,
+          asks: data?.a || data?.asks,
+          time: data?.E
+        })) {
+          serviceState.lastOrderFlowEventAt = new Date().toISOString();
+        }
+      } catch {
+        // Ignore malformed depth frames; the next valid update replaces them.
+      }
+    });
+    currentDepthSocket.on("error", (error) => {
+      serviceState.lastOrderFlowError = error instanceof Error ? error.message : String(error);
+    });
+    currentDepthSocket.on("close", () => {
+      if (depthSocket === currentDepthSocket) depthSocket = null;
+      updateConnections();
+      scheduleOrderFlowReconnect();
+    });
+
+    const currentTradeSocket = new WebSocket(`${tradeBase}${plan.tradeStreams.join("/")}`, { handshakeTimeout: 8_000 });
     tradeSocket = currentTradeSocket;
     currentTradeSocket.on("open", () => {
       updateConnections();
@@ -5401,8 +5467,22 @@ async function runService({ decisionRunner = run } = {}) {
     currentTradeSocket.on("close", () => {
       if (tradeSocket === currentTradeSocket) tradeSocket = null;
       updateConnections();
-      scheduleReconnect();
+      scheduleOrderFlowReconnect();
     });
+  };
+
+  const ensurePriceStream = ({ forceProtection = false, forceOrderFlow = false } = {}) => {
+    const stream = marketStreamConfig();
+    serviceState.subscribedSymbols = stream.symbols;
+    serviceState.orderFlowSymbols = stream.orderFlowSymbols;
+    const plan = marketStreamConnectionPlan(stream);
+    if (socketMarketType && socketMarketType !== plan.marketType) {
+      marketMicrostructure.clear();
+      closeSockets();
+    }
+    socketMarketType = plan.marketType;
+    ensureProtectionStream(plan, forceProtection);
+    ensureOrderFlowStreams(plan, forceOrderFlow);
   };
 
   const stop = (signal) => {
@@ -6569,6 +6649,45 @@ async function runFactorHistoryBackfillSchedulingSelfTest() {
   console.log(JSON.stringify({ passed: true, nonBlocking: true, duplicateSuppressed: true, failureIsolated: true }));
 }
 
+function runMarketStreamIsolationSelfTest() {
+  const first = marketStreamConnectionPlan({
+    marketType: "futures",
+    protectionSymbols: ["BTCUSDT"],
+    orderFlowSymbols: ["BTCUSDT", "ETHUSDT"]
+  });
+  const candidateChanged = marketStreamConnectionPlan({
+    marketType: "futures",
+    protectionSymbols: ["BTCUSDT"],
+    orderFlowSymbols: ["BTCUSDT", "SOLUSDT"]
+  });
+  const positionChanged = marketStreamConnectionPlan({
+    marketType: "futures",
+    protectionSymbols: ["BTCUSDT", "ETHUSDT"],
+    orderFlowSymbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+  });
+  if (first.protectionKey !== candidateChanged.protectionKey) {
+    throw new Error("order-flow candidate changes must not rebuild the position protection stream");
+  }
+  if (first.orderFlowKey === candidateChanged.orderFlowKey) {
+    throw new Error("order-flow candidate changes must rebuild only the order-flow streams");
+  }
+  if (first.protectionKey === positionChanged.protectionKey) {
+    throw new Error("position changes must rebuild the position protection stream");
+  }
+  if (first.protectionStreams.join(",") !== "btcusdt@bookTicker") {
+    throw new Error("position protection stream must contain only bookTicker subscriptions");
+  }
+  if (first.depthStreams.some((stream) => stream.includes("bookTicker"))) {
+    throw new Error("order-flow depth streams must remain isolated from position protection");
+  }
+  console.log(JSON.stringify({
+    passed: true,
+    protectionStableAcrossCandidateChanges: true,
+    orderFlowRebuildIsolated: true,
+    positionChangesStillResubscribe: true
+  }));
+}
+
 const execution = process.argv.includes("--service")
   ? runService()
   : process.argv.includes("--self-test-service-shutdown-child")
@@ -6598,6 +6717,8 @@ const execution = process.argv.includes("--service")
     ? Promise.resolve().then(runSignalLifecycleSelfTest)
   : process.argv.includes("--self-test-factor-history-backfill")
     ? Promise.resolve().then(runFactorHistoryBackfillSchedulingSelfTest)
+  : process.argv.includes("--self-test-stream-isolation")
+    ? Promise.resolve().then(runMarketStreamIsolationSelfTest)
   : process.argv.includes("--self-test-costs")
     ? Promise.resolve().then(runCostModelSelfTest)
   : process.argv.includes("--self-test-models")
