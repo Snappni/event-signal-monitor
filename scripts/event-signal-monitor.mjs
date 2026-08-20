@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHmac, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import {
   normalizeMessageAggregatorConfig,
@@ -67,10 +69,10 @@ import { closePaperPosition } from "./paper-position-settlement.mjs";
 import { classifyMarketSession, limitSessionEntryCandidates } from "./market-session-policy.mjs";
 import {
   buildFactorSnapshots,
-  buildHistoricalFactorFrames,
   createFactorLibraryStatus,
   FACTOR_HISTORICAL_SAMPLING_MODE,
   factorDecisionForSnapshot,
+  mergeHistoricalFactorEvidence,
   normalizeFactorLibraryConfig,
   normalizeFactorLibraryStatus,
   publicFactorLibrary,
@@ -96,7 +98,7 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.19.1";
+const MONITOR_VERSION = "0.19.2";
 const RUN_LAYER = "event-driven-hybrid";
 const LAYER_REPORT_PATH = REPORT_PATH;
 const MESSAGE_FEED_LIMIT = 200;
@@ -131,6 +133,12 @@ const FACTOR_HISTORY_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_FACTOR_HIST
 const FACTOR_HISTORY_LOOKBACK_MONTHS = toPositiveInt(process.env.SIGNAL_FACTOR_HISTORY_MONTHS, 3);
 const FACTOR_HISTORY_INTERVAL_MINUTES = 15;
 const FACTOR_HISTORY_SOURCE_POLICY = "okx_binance_futures_node_v4";
+const FACTOR_HISTORY_MIN_SYMBOLS = toPositiveInt(process.env.SIGNAL_FACTOR_HISTORY_MIN_SYMBOLS, 8);
+const FACTOR_HISTORY_WORKER_TIMEOUT_MS = toPositiveInt(
+  process.env.SIGNAL_FACTOR_HISTORY_WORKER_TIMEOUT_MS,
+  20 * 60_000
+);
+const FACTOR_HISTORY_WORKER_PATH = fileURLToPath(new URL("./factor-history-worker.mjs", import.meta.url));
 const DEFAULT_SYMBOLS = [
   "BTCUSDT",
   "ETHUSDT",
@@ -1412,97 +1420,143 @@ async function fetchFunding(symbol) {
   ]);
 }
 
-async function fetchOkxHistoricalCandles(symbol, intervalMinutes, fromMs, toMs) {
-  const instId = okxInstrumentId(symbol);
-  const bar = intervalMinutes === 60 ? "1H" : `${intervalMinutes}m`;
-  const rows = [];
-  let cursor = String(toMs);
-  for (let page = 0; page < 40; page += 1) {
-    const url = `https://www.okx.com/api/v5/market/history-candles?instId=${instId}&bar=${bar}&limit=300&after=${cursor}`;
-    const payload = await fetchJsonWithNode(url);
-    if (String(payload?.code ?? "0") !== "0") throw new Error(payload?.msg || `OKX historical ${symbol} error`);
-    const batch = (Array.isArray(payload?.data) ? payload.data : [])
-      .map(parseOkxCandle)
-      .filter((candle) => candle.close > 0 && candle.time >= fromMs && candle.time <= toMs);
-    rows.push(...batch);
-    const allTimes = (Array.isArray(payload?.data) ? payload.data : []).map((row) => safeNumber(row?.[0])).filter((time) => time > 0);
-    if (!allTimes.length) break;
-    const oldest = Math.min(...allTimes);
-    if (oldest <= fromMs || oldest >= Number(cursor)) break;
-    cursor = String(oldest - 1);
-    await sleep(120);
-  }
-  return [...new Map(rows.map((candle) => [candle.time, candle])).values()]
-    .sort((left, right) => left.time - right.time);
-}
-
-async function fetchBinanceHistoricalCandles(symbol, intervalMinutes, fromMs, toMs) {
-  const interval = intervalMinutes === 60 ? "1h" : `${intervalMinutes}m`;
-  const intervalMs = intervalMinutes * 60_000;
-  const rows = [];
-  let cursor = fromMs;
-  for (let page = 0; page < 10; page += 1) {
-    const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&startTime=${cursor}&endTime=${toMs}&limit=1500`;
-    const payload = await fetchJsonWithNode(url);
-    if (!Array.isArray(payload)) throw new Error(`Binance historical ${symbol} error`);
-    const batch = payload
-      .map(parseBinanceKline)
-      .filter((candle) => candle.close > 0 && candle.time >= fromMs && candle.time <= toMs);
-    rows.push(...batch);
-    const newest = Math.max(0, ...batch.map((candle) => candle.time));
-    if (!batch.length || newest >= toMs || newest < cursor) break;
-    const nextCursor = newest + intervalMs;
-    if (nextCursor > toMs) break;
-    cursor = nextCursor;
-    await sleep(80);
-  }
-  return [...new Map(rows.map((candle) => [candle.time, candle])).values()]
-    .sort((left, right) => left.time - right.time);
-}
-
-async function fetchFactorHistory(symbols) {
-  const toMs = Date.now() - 2 * 24 * 60 * 60 * 1_000;
-  const fromMs = toMs - FACTOR_HISTORY_LOOKBACK_MONTHS * 31 * 24 * 60 * 60 * 1_000;
-  const results = await mapWithConcurrency(symbols, 3, async (symbol) => {
-    try {
-      const candles = await firstSuccessful(`${symbol} historical candles`, [
-        () => fetchBinanceHistoricalCandles(symbol, FACTOR_HISTORY_INTERVAL_MINUTES, fromMs, toMs),
-        () => fetchOkxHistoricalCandles(symbol, FACTOR_HISTORY_INTERVAL_MINUTES, fromMs, toMs)
-      ]);
-      return { symbol, candles, error: null };
-    } catch (error) {
-      return { symbol, candles: [], error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-  const seriesBySymbol = Object.fromEntries(results
-    .filter(({ candles }) => candles.length >= 50)
-    .map(({ symbol, candles }) => [symbol, candles]));
-  Object.defineProperty(seriesBySymbol, "failures", {
-    value: results.filter(({ candles }) => candles.length < 50).map(({ symbol, error }) => ({ symbol, error })),
-    enumerable: false
-  });
-  return seriesBySymbol;
-}
-
 let factorHistoryBackfillJob = null;
 let factorHistoryBackfillResult = null;
+let factorHistoryBackfillChild = null;
 
 function factorHistoryBackfillRunning() {
   return factorHistoryBackfillJob !== null;
 }
 
-function startFactorHistoryBackfill(symbols, loader = fetchFactorHistory) {
+function stopFactorHistoryBackfill() {
+  if (factorHistoryBackfillChild?.exitCode === null) {
+    factorHistoryBackfillChild.kill("SIGKILL");
+  }
+}
+
+function cleanupStaleFactorHistoryJobFiles(runtimeDir, nowMs = Date.now()) {
+  for (const name of fs.readdirSync(runtimeDir)) {
+    const match = name.match(/^factor-history-job-(\d+)-.+\.(?:input|output)\.json$/);
+    if (!match) continue;
+    const ownerPid = Number(match[1]);
+    const filePath = path.join(runtimeDir, name);
+    let oldEnough = false;
+    try {
+      oldEnough = nowMs - fs.statSync(filePath).mtimeMs >= 60_000;
+    } catch {
+      continue;
+    }
+    if (!oldEnough || isProcessRunning(ownerPid)) continue;
+    try {
+      fs.unlinkSync(filePath);
+    } catch {
+      // A surviving worker may still be completing its atomic result write.
+    }
+  }
+}
+
+async function runFactorHistoryWorker({
+  symbols,
+  config,
+  status,
+  runtimeDir = RUNTIME_DIR,
+  timeoutMs = FACTOR_HISTORY_WORKER_TIMEOUT_MS,
+  testMode = null
+}) {
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  cleanupStaleFactorHistoryJobFiles(runtimeDir);
+  const jobId = `${process.pid}-${Date.now()}-${randomUUID()}`;
+  const inputPath = path.join(runtimeDir, `factor-history-job-${jobId}.input.json`);
+  const outputPath = path.join(runtimeDir, `factor-history-job-${jobId}.output.json`);
+  writeJson(inputPath, {
+    parentPid: process.pid,
+    symbols,
+    intervalMinutes: FACTOR_HISTORY_INTERVAL_MINUTES,
+    lookbackMonths: FACTOR_HISTORY_LOOKBACK_MONTHS,
+    minimumSymbols: FACTOR_HISTORY_MIN_SYMBOLS,
+    sourcePolicy: FACTOR_HISTORY_SOURCE_POLICY,
+    config,
+    status: { minedFactors: Array.isArray(status?.minedFactors) ? status.minedFactors : [] },
+    testMode
+  });
+  let stderr = "";
+  try {
+    const payload = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [FACTOR_HISTORY_WORKER_PATH, inputPath, outputPath], {
+        cwd: path.resolve("."),
+        env: process.env,
+        stdio: ["ignore", "ignore", "pipe"],
+        windowsHide: true
+      });
+      factorHistoryBackfillChild = child;
+      let settled = false;
+      let timeoutError = null;
+      const finish = (callback) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        callback();
+      };
+      child.stderr.on("data", (chunk) => {
+        stderr = `${stderr}${String(chunk)}`.slice(-16_000);
+      });
+      const timeout = setTimeout(() => {
+        timeoutError = new Error(`factor history worker exceeded ${timeoutMs}ms`);
+        child.kill("SIGKILL");
+      }, timeoutMs);
+      child.once("error", (error) => finish(() => reject(error)));
+      child.once("exit", (code, signal) => finish(() => {
+        if (timeoutError) {
+          reject(timeoutError);
+          return;
+        }
+        let result = null;
+        try {
+          result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+        } catch {
+          // Exit evidence below includes the bounded stderr tail.
+        }
+        if (code !== 0 || !result?.ok) {
+          reject(new Error(result?.error || stderr.trim() || `factor history worker exited code=${code} signal=${signal || "none"}`));
+          return;
+        }
+        resolve(result);
+      }));
+    });
+    return payload;
+  } finally {
+    factorHistoryBackfillChild = null;
+    for (const filePath of [inputPath, outputPath]) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // Job files are unique and may not exist after an early spawn failure.
+      }
+    }
+  }
+}
+
+function startFactorHistoryBackfill(symbols, options = {}) {
   if (factorHistoryBackfillJob || factorHistoryBackfillResult) return false;
   const startedAt = new Date().toISOString();
+  const legacyLoader = typeof options === "function" ? options : null;
   factorHistoryBackfillJob = Promise.resolve()
-    .then(() => loader(symbols))
-    .then((seriesBySymbol) => {
-      factorHistoryBackfillResult = {
-        ok: true,
-        startedAt,
-        completedAt: new Date().toISOString(),
-        seriesBySymbol
-      };
+    .then(() => legacyLoader ? legacyLoader(symbols) : runFactorHistoryWorker({ symbols, ...options }))
+    .then((result) => {
+      factorHistoryBackfillResult = legacyLoader
+        ? {
+          ok: true,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          seriesBySymbol: result
+        }
+        : {
+          ok: true,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          evidence: result.evidence,
+          diagnostics: result.diagnostics
+        };
     })
     .catch((error) => {
       factorHistoryBackfillResult = {
@@ -1522,6 +1576,22 @@ function takeFactorHistoryBackfillResult() {
   const result = factorHistoryBackfillResult;
   factorHistoryBackfillResult = null;
   return result;
+}
+
+function retainFactorHistoryAfterFailure(status, error) {
+  const history = status.historicalBackfill || {};
+  const message = error instanceof Error ? error.message : String(error);
+  const retained = safeNumber(history.version) > 0 && safeNumber(history.resolvedSamples) > 0;
+  status.historicalBackfill = {
+    ...history,
+    status: retained ? "complete" : "failed",
+    background: false,
+    error: retained ? null : message,
+    lastFailureAt: new Date().toISOString(),
+    lastFailure: message,
+    retainedAfterFailure: retained
+  };
+  return message;
 }
 
 async function cachedFactorSource(key, ttlMs, fetcher, fallback) {
@@ -4701,38 +4771,18 @@ async function main({ onStage = () => {} } = {}) {
     sessionContext: currentMarketSession,
     status: factorStatus
   });
-  let historicalFrames = [];
   const completedBackfill = takeFactorHistoryBackfillResult();
   if (completedBackfill?.ok) {
     try {
-      historicalFrames = buildHistoricalFactorFrames({
-        seriesBySymbol: completedBackfill.seriesBySymbol,
-        intervalMinutes: FACTOR_HISTORY_INTERVAL_MINUTES,
-        status: factorStatus,
-        stride: 1
-      });
-      const historySymbolCount = Object.keys(completedBackfill.seriesBySymbol || {}).length;
-      if (!historicalFrames.length || historySymbolCount < 8) {
-        const failureSummary = (completedBackfill.seriesBySymbol?.failures || [])
-          .slice(0, 4)
-          .map(({ symbol, error }) => `${symbol}: ${error || "样本不足"}`)
-          .join("；");
-        throw new Error(`历史 K 线有效标的不足：${historySymbolCount}${failureSummary ? `；${failureSummary}` : ""}`);
-      }
-      factorStatus.historicalBackfill.symbols = historySymbolCount;
-      factorStatus.historicalBackfill.sourcePolicy = FACTOR_HISTORY_SOURCE_POLICY;
-      factorStatus.historicalBackfill.background = false;
+      factorStatus = mergeHistoricalFactorEvidence(factorStatus, completedBackfill.evidence);
+      factorStatus.historicalBackfill.diagnostics = completedBackfill.diagnostics || null;
     } catch (error) {
-      factorStatus.historicalBackfill.status = "failed";
-      factorStatus.historicalBackfill.background = false;
-      factorStatus.historicalBackfill.error = error instanceof Error ? error.message : String(error);
-      warnings.push(`因子历史回填暂不可用：${factorStatus.historicalBackfill.error}；继续使用实时样本。`);
+      const message = retainFactorHistoryAfterFailure(factorStatus, error);
+      warnings.push(`因子历史回填暂不可用：${message}；继续使用既有历史与实时样本。`);
     }
   } else if (completedBackfill) {
-    factorStatus.historicalBackfill.status = "failed";
-    factorStatus.historicalBackfill.background = false;
-    factorStatus.historicalBackfill.error = completedBackfill.error;
-    warnings.push(`因子历史回填暂不可用：${completedBackfill.error}；继续使用实时样本。`);
+    const message = retainFactorHistoryAfterFailure(factorStatus, completedBackfill.error);
+    warnings.push(`因子历史回填暂不可用：${message}；继续使用既有历史与实时样本。`);
   }
   const historicalStatus = factorStatus.historicalBackfill || {};
   const lastHistoryAttemptMs = Date.parse(historicalStatus.lastAttemptAt || "");
@@ -4754,7 +4804,7 @@ async function main({ onStage = () => {} } = {}) {
     (historyRetryDue || !attemptedCurrentMode || !attemptedCurrentSource || orphanedProcessing)
   ) {
     const historySymbols = SYMBOLS.slice(0, FACTOR_HISTORY_SYMBOL_LIMIT);
-    if (startFactorHistoryBackfill(historySymbols)) {
+    if (startFactorHistoryBackfill(historySymbols, { config: factorConfig, status: factorStatus })) {
       factorStatus.historicalBackfill = {
         ...historicalStatus,
         status: "processing",
@@ -4777,7 +4827,7 @@ async function main({ onStage = () => {} } = {}) {
     config: factorConfig,
     status: factorStatus,
     snapshots: factorSnapshots,
-    historicalFrames,
+    historicalFrames: [],
     now: new Date().toISOString()
   });
   factorConfig = factorRuntime.config;
@@ -5231,6 +5281,8 @@ async function runService({ decisionRunner = run } = {}) {
 
   const persistStatus = () => {
     serviceState.heartbeatAt = new Date().toISOString();
+    serviceState.factorHistoryWorkerPid = factorHistoryBackfillChild?.pid || null;
+    serviceState.factorHistoryWorkerRunning = factorHistoryBackfillRunning();
     writeJson(SERVICE_STATUS_PATH, serviceState);
   };
 
@@ -5492,6 +5544,7 @@ async function runService({ decisionRunner = run } = {}) {
       disarmActiveDecisionWatchdog();
       disarmActiveDecisionWatchdog = null;
     }
+    stopFactorHistoryBackfill();
     closeSockets();
     if (protectionTimer) clearTimeout(protectionTimer);
     serviceState.shutdownRequestedAt = new Date().toISOString();
@@ -5543,7 +5596,10 @@ async function runService({ decisionRunner = run } = {}) {
         cycleStartedMs,
         timeoutMs: SERVICE_DECISION_CYCLE_TIMEOUT_MS,
         persistStatus,
-        stopStreams: closeSockets
+        stopStreams: () => {
+          stopFactorHistoryBackfill();
+          closeSockets();
+        }
       });
       disarmActiveDecisionWatchdog = disarmDecisionWatchdog;
       try {
@@ -5586,6 +5642,7 @@ async function runService({ decisionRunner = run } = {}) {
   } finally {
     if (shutdownTimer) clearTimeout(shutdownTimer);
     clearInterval(heartbeat);
+    stopFactorHistoryBackfill();
     closeSockets();
     serviceState.stoppedAt = new Date().toISOString();
     serviceState.priceConnected = false;
@@ -6646,7 +6703,86 @@ async function runFactorHistoryBackfillSchedulingSelfTest() {
   if (failure?.ok !== false || failure?.error !== "expected history failure") {
     throw new Error("factor history scheduling self-test did not isolate a background failure");
   }
-  console.log(JSON.stringify({ passed: true, nonBlocking: true, duplicateSuppressed: true, failureIsolated: true }));
+  const retainedStatus = createFactorLibraryStatus();
+  retainedStatus.historicalBackfill = {
+    ...retainedStatus.historicalBackfill,
+    version: 2,
+    status: "processing",
+    resolvedSamples: 100
+  };
+  retainFactorHistoryAfterFailure(retainedStatus, failure.error);
+  if (
+    retainedStatus.historicalBackfill.status !== "complete" ||
+    retainedStatus.historicalBackfill.retainedAfterFailure !== true ||
+    retainedStatus.historicalBackfill.lastFailure !== "expected history failure"
+  ) {
+    throw new Error("factor history scheduling self-test discarded prior valid evidence after failure");
+  }
+  console.log(JSON.stringify({
+    passed: true,
+    nonBlocking: true,
+    duplicateSuppressed: true,
+    failureIsolated: true,
+    previousEvidenceRetained: true
+  }));
+}
+
+async function runFactorHistoryWorkerIsolationSelfTest() {
+  const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "factor-history-worker-test-"));
+  let ticks = 0;
+  const heartbeat = setInterval(() => {
+    ticks += 1;
+  }, 20);
+  let timeoutObserved = false;
+  try {
+    await runFactorHistoryWorker({
+      symbols: ["BTCUSDT"],
+      config: {},
+      status: createFactorLibraryStatus(),
+      runtimeDir,
+      timeoutMs: 300,
+      testMode: "hang"
+    });
+  } catch (error) {
+    timeoutObserved = /exceeded 300ms/.test(error instanceof Error ? error.message : String(error));
+  } finally {
+    clearInterval(heartbeat);
+    stopFactorHistoryBackfill();
+  }
+  const leftovers = fs.readdirSync(runtimeDir).filter((name) => name.startsWith("factor-history-job-"));
+  fs.rmSync(runtimeDir, { recursive: true, force: true });
+  if (!timeoutObserved || ticks < 8 || factorHistoryBackfillChild || leftovers.length) {
+    throw new Error(`factor history worker isolation self-test failed: ${JSON.stringify({
+      timeoutObserved,
+      ticks,
+      childCleared: !factorHistoryBackfillChild,
+      leftovers
+    })}`);
+  }
+  console.log(JSON.stringify({
+    passed: true,
+    childTimeoutIsolated: true,
+    parentHeartbeatTicks: ticks,
+    jobFilesCleaned: true
+  }));
+}
+
+function runFactorHistoryServiceIsolationChild() {
+  let workerStarted = false;
+  return runService({
+    decisionRunner: async ({ onStage }) => {
+      onStage("self-test-factor-history-worker");
+      if (!workerStarted) {
+        workerStarted = startFactorHistoryBackfill(["BTCUSDT"], {
+          config: {},
+          status: createFactorLibraryStatus(),
+          timeoutMs: 10_000,
+          testMode: "hang"
+        });
+      }
+      await sleep(25);
+    }
+  });
 }
 
 function runMarketStreamIsolationSelfTest() {
@@ -6690,6 +6826,8 @@ function runMarketStreamIsolationSelfTest() {
 
 const execution = process.argv.includes("--service")
   ? runService()
+  : process.argv.includes("--self-test-factor-history-service-child")
+    ? runFactorHistoryServiceIsolationChild()
   : process.argv.includes("--self-test-service-shutdown-child")
     ? runService({
       decisionRunner: async ({ onStage }) => {
@@ -6717,6 +6855,8 @@ const execution = process.argv.includes("--service")
     ? Promise.resolve().then(runSignalLifecycleSelfTest)
   : process.argv.includes("--self-test-factor-history-backfill")
     ? Promise.resolve().then(runFactorHistoryBackfillSchedulingSelfTest)
+  : process.argv.includes("--self-test-factor-history-worker")
+    ? Promise.resolve().then(runFactorHistoryWorkerIsolationSelfTest)
   : process.argv.includes("--self-test-stream-isolation")
     ? Promise.resolve().then(runMarketStreamIsolationSelfTest)
   : process.argv.includes("--self-test-costs")

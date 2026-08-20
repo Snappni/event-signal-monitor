@@ -829,6 +829,10 @@ function loopStatus(latestReportOverride = null) {
     decisionStage: service?.decisionStage || null,
     decisionStageAt: service?.decisionStageAt || null,
     decisionStageAgeSeconds: decisionStageAgeMs === null ? null : Math.round(decisionStageAgeMs / 1_000),
+    factorHistoryWorkerPid: service?.factorHistoryWorkerPid == null
+      ? null
+      : safeNumber(service.factorHistoryWorkerPid, null),
+    factorHistoryWorkerRunning: service?.factorHistoryWorkerRunning === true,
     decisionCycleTimeoutSeconds: Math.round(decisionTimeoutMs / 1_000),
     lastDecisionStartedAt: service?.lastDecisionStartedAt || null,
     lastDecisionCompletedAt: service?.lastDecisionCompletedAt || null,

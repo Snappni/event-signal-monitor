@@ -1466,6 +1466,98 @@ function removeHistoricalMetricObservations(status) {
   }
 }
 
+function metricObservations(metric, source) {
+  const values = Array.isArray(metric?.values) ? metric.values : [];
+  const coverageValues = Array.isArray(metric?.coverageValues) ? metric.coverageValues : [];
+  const sourceValues = Array.isArray(metric?.sourceValues) && metric.sourceValues.length === values.length
+    ? metric.sourceValues
+    : values.map(() => 1);
+  return sourceValues
+    .map((item, index) => ({ source: item === 0 ? 0 : 1, value: values[index], coverage: coverageValues[index] }))
+    .filter((item) => item.source === source && Number.isFinite(item.value));
+}
+
+export function buildHistoricalFactorEvidence({
+  config: configValue,
+  status: statusValue,
+  historicalFrames = [],
+  now = new Date().toISOString(),
+  sourcePolicy = null,
+  source = "Binance Futures + OKX public historical candles",
+  lookbackMonths = null
+}) {
+  if (!historicalFrames.length) throw new Error("historical factor frames are empty");
+  const status = normalizeFactorLibraryStatus(statusValue);
+  const config = normalizeFactorLibraryConfig(configValue, status.minedFactors);
+  status.metrics = {};
+  const definitions = allDefinitions(status);
+  const symbols = new Set(historicalFrames.flatMap((frame) => Object.keys(frame.prices || {}))).size;
+  const resolvedSamples = resolveHistoricalFrames(status, historicalFrames, definitions, config.horizonsMinutes);
+  const historicalBackfill = {
+    ...status.historicalBackfill,
+    version: HISTORICAL_BACKFILL_VERSION,
+    samplingMode: FACTOR_HISTORICAL_SAMPLING_MODE,
+    sourcePolicy,
+    status: "complete",
+    background: false,
+    source,
+    lookbackMonths,
+    symbols,
+    frames: historicalFrames.length,
+    intervalMinutes: safeNumber(historicalFrames[0]?.intervalMinutes, 60),
+    resolvedSamples,
+    completedAt: now,
+    startAt: historicalFrames[0]?.capturedAt || null,
+    endAt: historicalFrames.at(-1)?.capturedAt || null,
+    error: null
+  };
+  return {
+    version: 1,
+    generatedAt: now,
+    historicalBackfill,
+    metrics: Object.fromEntries(Object.entries(status.metrics).map(([id, horizons]) => [
+      id,
+      Object.fromEntries(Object.entries(horizons || {}).map(([horizon, metric]) => {
+        const historical = metricObservations(metric, 0);
+        return [horizon, metricSummary(
+          historical.map((item) => item.value),
+          historical.map((item) => item.coverage),
+          historical.map(() => 0)
+        )];
+      }))
+    ]))
+  };
+}
+
+export function mergeHistoricalFactorEvidence(statusValue, evidence) {
+  if (safeNumber(evidence?.version) !== 1 || evidence?.historicalBackfill?.status !== "complete") {
+    throw new Error("invalid historical factor evidence");
+  }
+  const status = normalizeFactorLibraryStatus(statusValue);
+  const activeIds = new Set(allDefinitions(status).map((definition) => definition.id));
+  removeHistoricalMetricObservations(status);
+  for (const [id, horizons] of Object.entries(evidence.metrics || {})) {
+    if (!activeIds.has(id)) continue;
+    status.metrics[id] = status.metrics[id] || {};
+    for (const [horizon, historicalMetric] of Object.entries(horizons || {})) {
+      const historical = metricObservations(historicalMetric, 0);
+      const realtime = metricObservations(status.metrics[id][horizon], 1);
+      status.metrics[id][horizon] = metricSummary(
+        [...historical, ...realtime].map((item) => item.value),
+        [...historical, ...realtime].map((item) => item.coverage),
+        [...historical.map(() => 0), ...realtime.map(() => 1)]
+      );
+    }
+  }
+  status.historicalBackfill = {
+    ...status.historicalBackfill,
+    ...evidence.historicalBackfill,
+    background: false,
+    error: null
+  };
+  return status;
+}
+
 function factorIcTarget(definition, forwardReturn) {
   return definition?.role === "direction" ? forwardReturn : Math.abs(forwardReturn);
 }

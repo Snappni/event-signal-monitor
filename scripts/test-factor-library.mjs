@@ -4,12 +4,14 @@ import {
   FACTOR_DEFINITIONS,
   FACTOR_HISTORICAL_SAMPLING_MODE,
   FACTOR_RESEARCH_REFERENCES,
+  buildHistoricalFactorEvidence,
   buildHistoricalFactorFrames,
   buildFactorSnapshots,
   createFactorLibraryStatus,
   factorDecisionForSnapshot,
   normalizeFactorLibraryConfig,
   normalizeFactorLibraryStatus,
+  mergeHistoricalFactorEvidence,
   publicFactorLibrary,
   updateFactorLibraryConfig,
   updateFactorLibraryRuntime
@@ -398,6 +400,31 @@ const historicalFrames = buildHistoricalFactorFrames({
   stride: 1
 });
 assert.ok(historicalFrames.length > 10, "historical factor frames must be constructed");
+const isolatedEvidence = buildHistoricalFactorEvidence({
+  config,
+  status,
+  historicalFrames,
+  now: "2026-07-29T23:59:00.000Z",
+  sourcePolicy: "self-test-isolated-worker",
+  lookbackMonths: 3
+});
+const liveDuringBackfill = normalizeFactorLibraryStatus({
+  metrics: {
+    return_15m: {
+      15: {
+        values: [0.123],
+        coverageValues: [1],
+        sourceValues: [1]
+      }
+    }
+  }
+});
+const mergedEvidence = mergeHistoricalFactorEvidence(liveDuringBackfill, isolatedEvidence);
+assert.equal(mergedEvidence.historicalBackfill.status, "complete");
+assert.equal(mergedEvidence.historicalBackfill.samplingMode, FACTOR_HISTORICAL_SAMPLING_MODE);
+assert.ok(mergedEvidence.metrics.return_15m[15].historySamples > 0, "isolated evidence must retain historical IC observations");
+assert.equal(mergedEvidence.metrics.return_15m[15].realtimeSamples, 1, "isolated evidence merge must preserve realtime observations created during backfill");
+assert.equal(mergedEvidence.metrics.return_15m[15].values.at(-1), 0.123);
 ({ config, status } = updateFactorLibraryRuntime({
   config,
   status,
