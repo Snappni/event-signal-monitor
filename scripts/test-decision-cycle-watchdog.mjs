@@ -26,6 +26,20 @@ function runStalledChild() {
   });
 }
 
+function runShutdownChild() {
+  return spawnSync(process.execPath, [monitorPath, "--self-test-service-shutdown-child"], {
+    cwd: path.resolve(__dirname, ".."),
+    env: {
+      ...process.env,
+      SIGNAL_RUNTIME_DIR: runtimeDir,
+      SIGNAL_DECISION_CYCLE_TIMEOUT_MS: "5000",
+      SIGNAL_SERVICE_SHUTDOWN_GRACE_MS: "250"
+    },
+    encoding: "utf8",
+    timeout: 5_000
+  });
+}
+
 try {
   const first = runStalledChild();
   assert.equal(first.error, undefined, first.error?.message);
@@ -54,6 +68,25 @@ try {
   const secondStatus = JSON.parse(fs.readFileSync(statusPath, "utf8"));
   assert.notEqual(secondStatus.pid, firstPid);
   assert.equal(secondStatus.decisionHealth, "timed_out");
+
+  const shutdownStartedAt = Date.now();
+  const shutdownChild = runShutdownChild();
+  assert.equal(shutdownChild.error, undefined, shutdownChild.error?.message);
+  assert.equal(shutdownChild.signal, null);
+  assert.equal(shutdownChild.status, 0, shutdownChild.stderr);
+  assert.ok(Date.now() - shutdownStartedAt < 2_000);
+  const shutdownStatus = JSON.parse(fs.readFileSync(statusPath, "utf8"));
+  assert.equal(shutdownStatus.decisionHealth, "stopped");
+  assert.equal(shutdownStatus.shutdownSignal, "SIGTERM");
+  assert.equal(shutdownStatus.shutdownGraceMs, 250);
+
+  const afterShutdown = runStalledChild();
+  assert.equal(afterShutdown.error, undefined, afterShutdown.error?.message);
+  assert.equal(afterShutdown.signal, null);
+  assert.equal(afterShutdown.status, 70, `shutdown locks blocked restart: ${afterShutdown.stderr}`);
+  const afterShutdownStatus = JSON.parse(fs.readFileSync(statusPath, "utf8"));
+  assert.notEqual(afterShutdownStatus.pid, shutdownStatus.pid);
+  assert.equal(afterShutdownStatus.decisionHealth, "timed_out");
 
   console.log("decision cycle watchdog test passed");
 } finally {

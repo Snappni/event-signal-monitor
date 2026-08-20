@@ -1,6 +1,6 @@
 {
   "name": "event-signal-monitor",
-  "version": "0.18.1",
+  "version": "0.18.2",
   "description": "Local paper-alert crypto event and quantitative signal monitor.",
   "private": true,
   "type": "module",

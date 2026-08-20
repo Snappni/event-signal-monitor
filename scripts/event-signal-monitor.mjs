@@ -95,7 +95,7 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.18.1";
+const MONITOR_VERSION = "0.18.2";
 const RUN_LAYER = "event-driven-hybrid";
 const LAYER_REPORT_PATH = REPORT_PATH;
 const MESSAGE_FEED_LIMIT = 200;
@@ -117,6 +117,10 @@ const SERVICE_MAX_BACKOFF_MS = toPositiveInt(process.env.SIGNAL_MAX_DECISION_BAC
 const SERVICE_DECISION_CYCLE_TIMEOUT_MS = toPositiveInt(
   process.env.SIGNAL_DECISION_CYCLE_TIMEOUT_MS,
   120_000
+);
+const SERVICE_SHUTDOWN_GRACE_MS = toPositiveInt(
+  process.env.SIGNAL_SERVICE_SHUTDOWN_GRACE_MS,
+  2_000
 );
 const SERVICE_DECISION_TIMEOUT_EXIT_CODE = 70;
 const PRICE_EVENT_COALESCE_MS = toPositiveInt(process.env.SIGNAL_PRICE_EVENT_COALESCE_MS, 100);
@@ -5096,6 +5100,8 @@ async function runService({ decisionRunner = run } = {}) {
   let reconnectTimer = null;
   let protectionTimer = null;
   let protectionBusy = false;
+  let shutdownTimer = null;
+  let disarmActiveDecisionWatchdog = null;
   const pendingPrices = new Map();
 
   const persistStatus = () => {
@@ -5294,13 +5300,46 @@ async function runService({ decisionRunner = run } = {}) {
     });
   };
 
-  const stop = () => {
+  const stop = (signal) => {
+    if (stopping) return;
     stopping = true;
+    if (disarmActiveDecisionWatchdog) {
+      disarmActiveDecisionWatchdog();
+      disarmActiveDecisionWatchdog = null;
+    }
     closeSockets();
     if (protectionTimer) clearTimeout(protectionTimer);
+    serviceState.shutdownRequestedAt = new Date().toISOString();
+    serviceState.shutdownSignal = signal;
+    serviceState.shutdownGraceMs = SERVICE_SHUTDOWN_GRACE_MS;
+    serviceState.decisionHealth = "stopping";
+    updateDecisionStage(serviceState, "stopping");
+    try {
+      persistStatus();
+    } catch {
+      // The bounded exit still prevents systemd from reaching TimeoutStopSec.
+    }
+    shutdownTimer = setTimeout(() => {
+      serviceState.stoppedAt = new Date().toISOString();
+      serviceState.decisionDeadlineAt = null;
+      serviceState.decisionHealth = "stopped";
+      updateDecisionStage(serviceState, "stopped");
+      try {
+        persistStatus();
+      } catch {
+        // The runtime log remains a second shutdown evidence path.
+      }
+      try {
+        appendRuntimeLog(
+          `[${new Date().toISOString()}] service: bounded ${signal} shutdown after ${SERVICE_SHUTDOWN_GRACE_MS}ms`
+        );
+      } finally {
+        process.exit(0);
+      }
+    }, SERVICE_SHUTDOWN_GRACE_MS);
   };
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+  process.once("SIGINT", () => stop("SIGINT"));
+  process.once("SIGTERM", () => stop("SIGTERM"));
   const heartbeat = setInterval(persistStatus, 1_000);
   persistStatus();
 
@@ -5321,11 +5360,13 @@ async function runService({ decisionRunner = run } = {}) {
         persistStatus,
         stopStreams: closeSockets
       });
+      disarmActiveDecisionWatchdog = disarmDecisionWatchdog;
       try {
         await decisionRunner({
           onStage: (stage) => updateDecisionStage(serviceState, stage)
         });
         disarmDecisionWatchdog();
+        disarmActiveDecisionWatchdog = null;
         serviceState.decisionCycles += 1;
         serviceState.consecutiveDecisionFailures = 0;
         serviceState.lastDecisionError = null;
@@ -5336,6 +5377,7 @@ async function runService({ decisionRunner = run } = {}) {
         updateDecisionStage(serviceState, "idle");
       } catch (error) {
         disarmDecisionWatchdog();
+        disarmActiveDecisionWatchdog = null;
         serviceState.consecutiveDecisionFailures += 1;
         serviceState.lastDecisionError = error instanceof Error ? error.message : String(error);
         serviceState.lastDecisionDurationMs = Date.now() - cycleStartedMs;
@@ -5357,6 +5399,7 @@ async function runService({ decisionRunner = run } = {}) {
       await sleep(sleepMs);
     }
   } finally {
+    if (shutdownTimer) clearTimeout(shutdownTimer);
     clearInterval(heartbeat);
     closeSockets();
     serviceState.stoppedAt = new Date().toISOString();
@@ -6383,6 +6426,16 @@ function runCapitalRotationIntegrationSelfTest() {
 
 const execution = process.argv.includes("--service")
   ? runService()
+  : process.argv.includes("--self-test-service-shutdown-child")
+    ? runService({
+      decisionRunner: async ({ onStage }) => {
+        await acquireRuntimeLock();
+        await acquireAccountLock();
+        onStage("self-test-stall");
+        setTimeout(() => process.emit("SIGTERM"), 25);
+        await new Promise(() => {});
+      }
+    })
   : process.argv.includes("--self-test-decision-watchdog-child")
     ? runService({
       decisionRunner: async ({ onStage }) => {
