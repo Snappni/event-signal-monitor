@@ -258,6 +258,7 @@ export function createMarketMicrostructure(options = {}) {
         bookFlowConfidence,
         orderBookImbalance,
         topBookImbalance,
+        topDepthQuote,
         bidDepthQuote,
         askDepthQuote,
         bookSlope,

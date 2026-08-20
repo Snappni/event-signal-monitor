@@ -69,6 +69,7 @@ import {
   buildFactorSnapshots,
   buildHistoricalFactorFrames,
   createFactorLibraryStatus,
+  FACTOR_HISTORICAL_SAMPLING_MODE,
   factorDecisionForSnapshot,
   normalizeFactorLibraryConfig,
   normalizeFactorLibraryStatus,
@@ -95,7 +96,7 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.18.3";
+const MONITOR_VERSION = "0.19.0";
 const RUN_LAYER = "event-driven-hybrid";
 const LAYER_REPORT_PATH = REPORT_PATH;
 const MESSAGE_FEED_LIMIT = 200;
@@ -126,9 +127,10 @@ const SERVICE_DECISION_TIMEOUT_EXIT_CODE = 70;
 const PRICE_EVENT_COALESCE_MS = toPositiveInt(process.env.SIGNAL_PRICE_EVENT_COALESCE_MS, 100);
 const ORDER_FLOW_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_ORDER_FLOW_SYMBOL_LIMIT, 12);
 const FACTOR_EXTERNAL_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_FACTOR_EXTERNAL_SYMBOL_LIMIT, 4);
-const FACTOR_HISTORY_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_FACTOR_HISTORY_SYMBOL_LIMIT, 6);
+const FACTOR_HISTORY_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_FACTOR_HISTORY_SYMBOL_LIMIT, 12);
 const FACTOR_HISTORY_LOOKBACK_MONTHS = toPositiveInt(process.env.SIGNAL_FACTOR_HISTORY_MONTHS, 3);
 const FACTOR_HISTORY_INTERVAL_MINUTES = 15;
+const FACTOR_HISTORY_SOURCE_POLICY = "okx_binance_futures_node_v4";
 const DEFAULT_SYMBOLS = [
   "BTCUSDT",
   "ETHUSDT",
@@ -1417,7 +1419,7 @@ async function fetchOkxHistoricalCandles(symbol, intervalMinutes, fromMs, toMs) 
   let cursor = String(toMs);
   for (let page = 0; page < 40; page += 1) {
     const url = `https://www.okx.com/api/v5/market/history-candles?instId=${instId}&bar=${bar}&limit=300&after=${cursor}`;
-    const payload = await fetchJson(url);
+    const payload = await fetchJsonWithNode(url);
     if (String(payload?.code ?? "0") !== "0") throw new Error(payload?.msg || `OKX historical ${symbol} error`);
     const batch = (Array.isArray(payload?.data) ? payload.data : [])
       .map(parseOkxCandle)
@@ -1434,17 +1436,92 @@ async function fetchOkxHistoricalCandles(symbol, intervalMinutes, fromMs, toMs) 
     .sort((left, right) => left.time - right.time);
 }
 
+async function fetchBinanceHistoricalCandles(symbol, intervalMinutes, fromMs, toMs) {
+  const interval = intervalMinutes === 60 ? "1h" : `${intervalMinutes}m`;
+  const intervalMs = intervalMinutes * 60_000;
+  const rows = [];
+  let cursor = fromMs;
+  for (let page = 0; page < 10; page += 1) {
+    const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&startTime=${cursor}&endTime=${toMs}&limit=1500`;
+    const payload = await fetchJsonWithNode(url);
+    if (!Array.isArray(payload)) throw new Error(`Binance historical ${symbol} error`);
+    const batch = payload
+      .map(parseBinanceKline)
+      .filter((candle) => candle.close > 0 && candle.time >= fromMs && candle.time <= toMs);
+    rows.push(...batch);
+    const newest = Math.max(0, ...batch.map((candle) => candle.time));
+    if (!batch.length || newest >= toMs || newest < cursor) break;
+    const nextCursor = newest + intervalMs;
+    if (nextCursor > toMs) break;
+    cursor = nextCursor;
+    await sleep(80);
+  }
+  return [...new Map(rows.map((candle) => [candle.time, candle])).values()]
+    .sort((left, right) => left.time - right.time);
+}
+
 async function fetchFactorHistory(symbols) {
   const toMs = Date.now() - 2 * 24 * 60 * 60 * 1_000;
   const fromMs = toMs - FACTOR_HISTORY_LOOKBACK_MONTHS * 31 * 24 * 60 * 60 * 1_000;
   const results = await mapWithConcurrency(symbols, 3, async (symbol) => {
     try {
-      return [symbol, await fetchOkxHistoricalCandles(symbol, FACTOR_HISTORY_INTERVAL_MINUTES, fromMs, toMs)];
+      const candles = await firstSuccessful(`${symbol} historical candles`, [
+        () => fetchBinanceHistoricalCandles(symbol, FACTOR_HISTORY_INTERVAL_MINUTES, fromMs, toMs),
+        () => fetchOkxHistoricalCandles(symbol, FACTOR_HISTORY_INTERVAL_MINUTES, fromMs, toMs)
+      ]);
+      return { symbol, candles, error: null };
     } catch (error) {
-      return [symbol, []];
+      return { symbol, candles: [], error: error instanceof Error ? error.message : String(error) };
     }
   });
-  return Object.fromEntries(results.filter(([, candles]) => candles.length >= 50));
+  const seriesBySymbol = Object.fromEntries(results
+    .filter(({ candles }) => candles.length >= 50)
+    .map(({ symbol, candles }) => [symbol, candles]));
+  Object.defineProperty(seriesBySymbol, "failures", {
+    value: results.filter(({ candles }) => candles.length < 50).map(({ symbol, error }) => ({ symbol, error })),
+    enumerable: false
+  });
+  return seriesBySymbol;
+}
+
+let factorHistoryBackfillJob = null;
+let factorHistoryBackfillResult = null;
+
+function factorHistoryBackfillRunning() {
+  return factorHistoryBackfillJob !== null;
+}
+
+function startFactorHistoryBackfill(symbols, loader = fetchFactorHistory) {
+  if (factorHistoryBackfillJob || factorHistoryBackfillResult) return false;
+  const startedAt = new Date().toISOString();
+  factorHistoryBackfillJob = Promise.resolve()
+    .then(() => loader(symbols))
+    .then((seriesBySymbol) => {
+      factorHistoryBackfillResult = {
+        ok: true,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        seriesBySymbol
+      };
+    })
+    .catch((error) => {
+      factorHistoryBackfillResult = {
+        ok: false,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        error: error instanceof Error ? error.message : String(error)
+      };
+    })
+    .finally(() => {
+      factorHistoryBackfillJob = null;
+    });
+  return true;
+}
+
+function takeFactorHistoryBackfillResult() {
+  const result = factorHistoryBackfillResult;
+  factorHistoryBackfillResult = null;
+  return result;
 }
 
 async function cachedFactorSource(key, ttlMs, fetcher, fallback) {
@@ -4625,47 +4702,75 @@ async function main({ onStage = () => {} } = {}) {
     status: factorStatus
   });
   let historicalFrames = [];
-  const historicalStatus = factorStatus.historicalBackfill || {};
-  const lastHistoryAttemptMs = Date.parse(historicalStatus.lastAttemptAt || "");
-  const historyRetryDue = !Number.isFinite(lastHistoryAttemptMs) || Date.now() - lastHistoryAttemptMs >= 6 * 60 * 60 * 1_000;
-  const historyNeedsMigration = historicalStatus.samplingMode !== "hourly_anchors_non_overlapping_v2";
-  if (
-    factorConfig.enabled &&
-    (
-      historicalStatus.status !== "complete" ||
-      historyNeedsMigration
-    ) &&
-    (historyRetryDue || historyNeedsMigration)
-  ) {
-    onStage("factor-history-backfill");
-    factorStatus.historicalBackfill = {
-      ...historicalStatus,
-      status: "processing",
-      lastAttemptAt: new Date().toISOString(),
-      error: null,
-      lookbackMonths: FACTOR_HISTORY_LOOKBACK_MONTHS,
-      intervalMinutes: FACTOR_HISTORY_INTERVAL_MINUTES
-    };
-    writeJson(FACTOR_LIBRARY_STATUS_PATH, factorStatus);
+  const completedBackfill = takeFactorHistoryBackfillResult();
+  if (completedBackfill?.ok) {
     try {
-      const historySymbols = SYMBOLS.slice(0, FACTOR_HISTORY_SYMBOL_LIMIT);
-      const seriesBySymbol = await fetchFactorHistory(historySymbols);
       historicalFrames = buildHistoricalFactorFrames({
-        seriesBySymbol,
+        seriesBySymbol: completedBackfill.seriesBySymbol,
         intervalMinutes: FACTOR_HISTORY_INTERVAL_MINUTES,
         status: factorStatus,
         stride: 1
       });
-      if (historicalFrames.length && Object.keys(seriesBySymbol).length >= 5) {
-        factorStatus.historicalBackfill.symbols = Object.keys(seriesBySymbol).length;
-      } else {
-        throw new Error(`历史 K 线有效标的不足：${Object.keys(seriesBySymbol).length}`);
+      const historySymbolCount = Object.keys(completedBackfill.seriesBySymbol || {}).length;
+      if (!historicalFrames.length || historySymbolCount < 8) {
+        const failureSummary = (completedBackfill.seriesBySymbol?.failures || [])
+          .slice(0, 4)
+          .map(({ symbol, error }) => `${symbol}: ${error || "样本不足"}`)
+          .join("；");
+        throw new Error(`历史 K 线有效标的不足：${historySymbolCount}${failureSummary ? `；${failureSummary}` : ""}`);
       }
+      factorStatus.historicalBackfill.symbols = historySymbolCount;
+      factorStatus.historicalBackfill.sourcePolicy = FACTOR_HISTORY_SOURCE_POLICY;
+      factorStatus.historicalBackfill.background = false;
     } catch (error) {
       factorStatus.historicalBackfill.status = "failed";
+      factorStatus.historicalBackfill.background = false;
       factorStatus.historicalBackfill.error = error instanceof Error ? error.message : String(error);
       warnings.push(`因子历史回填暂不可用：${factorStatus.historicalBackfill.error}；继续使用实时样本。`);
     }
+  } else if (completedBackfill) {
+    factorStatus.historicalBackfill.status = "failed";
+    factorStatus.historicalBackfill.background = false;
+    factorStatus.historicalBackfill.error = completedBackfill.error;
+    warnings.push(`因子历史回填暂不可用：${completedBackfill.error}；继续使用实时样本。`);
+  }
+  const historicalStatus = factorStatus.historicalBackfill || {};
+  const lastHistoryAttemptMs = Date.parse(historicalStatus.lastAttemptAt || "");
+  const historyRetryDue = !Number.isFinite(lastHistoryAttemptMs) || Date.now() - lastHistoryAttemptMs >= 6 * 60 * 60 * 1_000;
+  const historyNeedsMigration = historicalStatus.samplingMode !== FACTOR_HISTORICAL_SAMPLING_MODE;
+  const attemptedCurrentMode = historicalStatus.attemptedSamplingMode === FACTOR_HISTORICAL_SAMPLING_MODE;
+  const historySourceNeedsMigration = historicalStatus.sourcePolicy !== FACTOR_HISTORY_SOURCE_POLICY;
+  const attemptedCurrentSource = historicalStatus.attemptedSourcePolicy === FACTOR_HISTORY_SOURCE_POLICY;
+  const orphanedProcessing = historicalStatus.status === "processing" && !factorHistoryBackfillRunning();
+  if (
+    !completedBackfill &&
+    factorConfig.enabled &&
+    (
+      historicalStatus.status !== "complete" ||
+      historyNeedsMigration ||
+      historySourceNeedsMigration
+    ) &&
+    !factorHistoryBackfillRunning() &&
+    (historyRetryDue || !attemptedCurrentMode || !attemptedCurrentSource || orphanedProcessing)
+  ) {
+    const historySymbols = SYMBOLS.slice(0, FACTOR_HISTORY_SYMBOL_LIMIT);
+    if (startFactorHistoryBackfill(historySymbols)) {
+      factorStatus.historicalBackfill = {
+        ...historicalStatus,
+        status: "processing",
+        background: true,
+        lastAttemptAt: new Date().toISOString(),
+        attemptedSamplingMode: FACTOR_HISTORICAL_SAMPLING_MODE,
+        attemptedSourcePolicy: FACTOR_HISTORY_SOURCE_POLICY,
+        error: null,
+        source: "Binance Futures + OKX public historical candles",
+        lookbackMonths: FACTOR_HISTORY_LOOKBACK_MONTHS,
+        intervalMinutes: FACTOR_HISTORY_INTERVAL_MINUTES
+      };
+    }
+  }
+  if (factorHistoryBackfillRunning()) {
+    warnings.push("因子历史行情正在后台回填；实时行情、实时 IC 与交易决策继续独立运行。");
   }
   onStage("factor-runtime");
   const factorRuntime = updateFactorLibraryRuntime({
@@ -6424,6 +6529,46 @@ function runCapitalRotationIntegrationSelfTest() {
   console.log(JSON.stringify({ passed: true, partialAccounting: true, replacementOpenedAtFullSize: true }));
 }
 
+async function runFactorHistoryBackfillSchedulingSelfTest() {
+  let releaseLoader;
+  let loadCount = 0;
+  const loader = () => {
+    loadCount += 1;
+    return new Promise((resolve) => {
+      releaseLoader = resolve;
+    });
+  };
+  if (!startFactorHistoryBackfill(["BTCUSDT"], loader)) {
+    throw new Error("factor history scheduling self-test failed to start");
+  }
+  await Promise.resolve();
+  if (!factorHistoryBackfillRunning() || takeFactorHistoryBackfillResult() !== null) {
+    throw new Error("factor history scheduling self-test blocked while background work was pending");
+  }
+  if (startFactorHistoryBackfill(["ETHUSDT"], loader) || loadCount !== 1) {
+    throw new Error("factor history scheduling self-test allowed duplicate work");
+  }
+  releaseLoader({ BTCUSDT: [{ time: 1, close: 1 }] });
+  const successfulJob = factorHistoryBackfillJob;
+  await successfulJob;
+  const success = takeFactorHistoryBackfillResult();
+  if (!success?.ok || factorHistoryBackfillRunning() || !success.seriesBySymbol?.BTCUSDT) {
+    throw new Error("factor history scheduling self-test did not publish a completed result");
+  }
+  if (!startFactorHistoryBackfill(["BTCUSDT"], async () => {
+    throw new Error("expected history failure");
+  })) {
+    throw new Error("factor history scheduling self-test could not start failure case");
+  }
+  const failedJob = factorHistoryBackfillJob;
+  await failedJob;
+  const failure = takeFactorHistoryBackfillResult();
+  if (failure?.ok !== false || failure?.error !== "expected history failure") {
+    throw new Error("factor history scheduling self-test did not isolate a background failure");
+  }
+  console.log(JSON.stringify({ passed: true, nonBlocking: true, duplicateSuppressed: true, failureIsolated: true }));
+}
+
 const execution = process.argv.includes("--service")
   ? runService()
   : process.argv.includes("--self-test-service-shutdown-child")
@@ -6451,6 +6596,8 @@ const execution = process.argv.includes("--service")
     ? Promise.resolve().then(runPaperEntryPauseSelfTest)
   : process.argv.includes("--self-test-signal-lifecycle")
     ? Promise.resolve().then(runSignalLifecycleSelfTest)
+  : process.argv.includes("--self-test-factor-history-backfill")
+    ? Promise.resolve().then(runFactorHistoryBackfillSchedulingSelfTest)
   : process.argv.includes("--self-test-costs")
     ? Promise.resolve().then(runCostModelSelfTest)
   : process.argv.includes("--self-test-models")

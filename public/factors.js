@@ -22,6 +22,9 @@ const minedValidationLabels = {
   rejected: "已拒绝",
   quarantine: "隔离验证"
 };
+const miningAlgorithmLabels = {
+  deterministic_typed_beam_search_v1: "确定性类型束搜索 v1"
+};
 
 function markDirty() {
   state.dirty = true;
@@ -52,9 +55,9 @@ function filteredFactors() {
 
 function renderSummary() {
   const data = state.data;
-  $("#factorCount").textContent = data.counts.total;
+  $("#factorCount").textContent = `${data.counts.builtIn || 0} / ${data.counts.total}`;
   $("#factorEnabledCount").textContent = data.counts.enabled;
-  $("#factorDecisionCount").textContent = `${data.counts.decisionEligible || 0} / ${data.counts.inDecision}`;
+  $("#factorDecisionCount").textContent = `${data.counts.empiricalValidatedBuiltIn || 0} / ${data.counts.decisionEligible || 0}`;
   $("#factorMinedCount").textContent = `${data.counts.mined} / ${data.counts.validatedMined}`;
   $("#factorWeightVersion").textContent = `v${data.weightVersion}`;
   $("#factorGeneratedAt").textContent = time(data.generatedAt);
@@ -70,7 +73,7 @@ function renderSummary() {
     ? data.mining.currentActivity || "idle"
     : `组合未就绪：${data.counts.decisionEligible || 0}/${data.decisionReadiness?.minimumActiveFactors || 10}`;
   $("#factorMiningDetails").innerHTML = [
-    ["运行次数", data.mining.runCount], ["活跃池", `${data.counts.mined}/${data.mining.activeLimit || 20}`],
+    ["算法", miningAlgorithmLabels[data.mining.algorithm] || data.mining.algorithm || "受限 DSL"], ["运行次数", data.mining.runCount], ["活跃池", `${data.counts.mined}/${data.mining.activeLimit || 20}`],
     ["隔离候选", data.counts.mined - data.counts.validatedMined],
     ["已验证", data.mining.validatedCount], ["已拒绝", data.mining.rejectedCount],
     ["自动淘汰", data.mining.retiredCount || 0],
@@ -97,16 +100,22 @@ function renderFactors() {
     const metric = factor.metrics?.[15];
     const origin = factor.origin === "mined"
       ? `<span class="factor-origin mined">挖掘·${escapeHtml(factor.operatorLabel || "组合")} · ${escapeHtml(factor.retired ? "已淘汰" : minedValidationLabels[factor.validationStatus] || factor.validationStatus)}</span>`
-      : '<span class="factor-origin">内置</span>';
+      : `<span class="factor-origin">内置·${factor.empiricalStage === "out_of_sample_validated" ? "样本外通过" : "观察中"}</span>`;
+    const holdout = metric?.holdout;
+    const holdoutLine = holdout?.hasHoldout
+      ? `<small>训练 ${number(holdout.train?.meanIc)} / 验证 ${number(holdout.validation?.meanIc)} / 测试 ${number(holdout.test?.meanIc)}</small>`
+      : '<small>尚未形成完整时间样本外切分</small>';
+    const referenceId = Array.isArray(factor.referenceIds) ? factor.referenceIds[0] : null;
+    const reference = state.data?.researchReferences?.[referenceId];
     return `<tr data-factor-id="${escapeHtml(factor.id)}" class="${factor.archived ? "is-archived" : ""}">
       <td><input class="factor-select" type="checkbox" ${state.selected.has(factor.id) ? "checked" : ""} ${factor.retired ? "disabled" : ""} aria-label="选择${escapeHtml(factor.name)}" /></td>
       <td><div class="factor-name">${escapeHtml(factor.name)} ${origin}</div><code>${escapeHtml(factor.id)}</code><p>${escapeHtml(factor.description)}</p>${factor.formula ? `<small>${escapeHtml(factor.formula)}</small>` : ""}${factor.retiredAt ? `<small>淘汰于 ${escapeHtml(time(factor.retiredAt))} · 证据已压缩归档且禁止重复挖掘</small>` : ""}</td>
-      <td><strong>${escapeHtml(factor.category)}</strong><span>${escapeHtml(factor.source)}</span><small>覆盖 ${(Number(factor.availability?.coverage || 0) * 100).toFixed(0)}%</small></td>
+      <td><strong>${escapeHtml(factor.category)}</strong><span>${escapeHtml(factor.source)}</span><small>数据：${escapeHtml((factor.dataRequirements || []).join(" + "))}</small><small>覆盖 ${(Number(factor.availability?.coverage || 0) * 100).toFixed(0)}%</small></td>
       <td><input class="factor-enabled" type="checkbox" ${factor.enabled ? "checked" : ""} ${factor.archived ? "disabled" : ""} /></td>
       <td><input class="factor-decision" type="checkbox" ${factor.useInDecision ? "checked" : ""} ${factor.archived || factor.role !== "direction" ? "disabled" : ""} /></td>
       <td><input class="factor-weight" type="number" min="0" max="100" step="0.1" value="${escapeHtml(factor.weight)}" ${factor.archived ? "disabled" : ""} /><small>当前决策占比 ${number(factor.effectiveWeight * 100, 1)}%</small></td>
-      <td><strong>${number(metric?.meanIc)}</strong><span>ICIR ${number(metric?.icir)}</span><small>n=${metric?.samples || 0} · 历史 ${metric?.historySamples || 0} / 实时 ${metric?.realtimeSamples || 0}</small></td>
-      <td><span class="factor-evidence ${escapeHtml(factor.evidenceStatus)}">${escapeHtml(evidenceLabels[factor.evidenceStatus] || factor.evidenceStatus)}</span></td>
+      <td><strong>${number(metric?.meanIc)}</strong><span>ICIR ${number(metric?.icir)}</span><small>n=${metric?.samples || 0} · 历史 ${metric?.historySamples || 0} / 实时 ${metric?.realtimeSamples || 0}</small>${holdoutLine}</td>
+      <td><span class="factor-evidence ${escapeHtml(factor.evidenceStatus)}">${escapeHtml(evidenceLabels[factor.evidenceStatus] || factor.evidenceStatus)}</span><small>目录：机制已校验</small>${reference ? `<small title="${escapeHtml(reference.scope)}">依据：<a href="${escapeHtml(reference.url)}" target="_blank" rel="noreferrer">${escapeHtml(reference.title)}</a></small>` : ""}</td>
     </tr>`;
   }).join("") || '<tr><td colspan="8" class="empty-state">当前筛选条件下没有因子</td></tr>';
 }

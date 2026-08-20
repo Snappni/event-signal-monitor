@@ -28,9 +28,9 @@
         <span id="factorRuntimeState" class="live-state"><i></i>因子引擎独立运行</span>
       </section>
       <section class="summary-grid detail-summary factor-summary" aria-label="因子摘要">
-        <div class="metric"><span>有效因子</span><strong id="factorCount">0</strong></div>
+        <div class="metric"><span>内置 / 总活跃</span><strong id="factorCount">0 / 0</strong></div>
         <div class="metric"><span>已启用</span><strong id="factorEnabledCount">0</strong></div>
-        <div class="metric"><span>证据通过 / 候选</span><strong id="factorDecisionCount">0 / 0</strong></div>
+        <div class="metric"><span>样本外通过 / 当前可交易</span><strong id="factorDecisionCount">0 / 0</strong></div>
         <div class="metric"><span>挖掘 / 已验证</span><strong id="factorMinedCount">0 / 0</strong></div>
         <div class="metric"><span>权重版本</span><strong id="factorWeightVersion">v1</strong></div>
         <div class="metric"><span>数据时间</span><strong id="factorGeneratedAt" class="metric-time">-</strong></div>
@@ -45,21 +45,11 @@
           <label>参与原决策的最大占比<input id="factorDecisionInfluence" type="number" min="0" max="40" step="1" /><span class="input-suffix">%</span></label>
           <button id="saveFactorConfig" type="button">保存全部设置</button>
         </div>
-        <p class="factor-policy-note">智能调整需至少 30 个 15 分钟横截面 IC 样本；单因子、单分类和单次调权均有硬上限。自动挖掘只生成受限公式，候选先隔离，不会自动取得交易权。持续拒绝且证据充分的候选会压缩归档并让出活跃池名额，同一语义不会重复挖掘。</p>
       </section>
 
       <section class="panel detail-panel">
         <div class="section-title"><h2>自动挖掘状态</h2><span id="factorMiningActivity">未启用</span></div>
         <div id="factorMiningDetails" class="factor-mining-grid"></div>
-      </section>
-
-      <section class="panel detail-panel factor-help-panel">
-        <div class="section-title"><h2>指标口径</h2><span>实时行情与历史公共 K 线合并统计；不依赖纸面开仓</span></div>
-        <div class="factor-help-grid">
-          <div><strong>权重 / 当前决策占比 3.3%</strong><p>“权重 1”是手动相对权重，不是最终占比。“当前决策占比 3.3%”是经过分类上限、单因子上限和归一化后，本因子在当前决策因子集合中的实际权重；它不代表收益率，也不代表胜率。</p></div>
-          <div><strong>15m IC / ICIR / n</strong><p>15m IC 是因子值与未来 15 分钟横截面收益的 Spearman 相关，范围约为 -1 到 1：正值偏向同向、负值偏向反向、接近 0 表示没有稳定线性排序关系。ICIR=平均 IC/IC 标准差；n 是已结算的横截面样本数。下方会同时显示历史与实时样本数。</p></div>
-          <div><strong>证据</strong><p>“数据不可用”表示当前无任何标的有值；“样本不足”表示有数据但 n&lt;30；“不稳定”表示样本达到门槛但 IC、ICIR、t 统计或覆盖率不足；这两类因子的当前决策占比为 0。“当前有效”按同向使用，“反向有效”按反向使用。证据状态不是盈利承诺。</p></div>
-        </div>
       </section>
 
       <section class="panel detail-panel">

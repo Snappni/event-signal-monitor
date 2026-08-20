@@ -31,9 +31,15 @@ try {
   const page = await waitFor(`http://127.0.0.1:${port}/factors.html`);
   const apiResponse = await fetch(`http://127.0.0.1:${port}/api/factors`);
   const api = await apiResponse.json();
+  const pageHtml = await page.text();
   assert.equal(page.status, 200);
+  assert.match(pageHtml, /id="factorMiningDetails"/);
+  assert.doesNotMatch(pageHtml, />指标口径</);
+  assert.doesNotMatch(pageHtml, /内置目录已通过机制来源/);
   assert.equal(apiResponse.status, 200);
-  assert.ok(api.counts.total >= 50);
+  assert.equal(api.counts.builtIn, 100);
+  assert.equal(api.catalogAudit.passed, true);
+  assert.equal(api.samplingPolicy.observationRetention.sourcePartitioned, true);
   const payload = {
     decisionInfluence: 0.33,
     miningEnabled: true,

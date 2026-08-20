@@ -2691,11 +2691,18 @@ main,
 
 .factor-mining-grid > div {
   display: grid;
+  min-width: 0;
   gap: 5px;
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: 9px;
   background: rgba(7, 23, 37, 0.72);
+}
+
+.factor-mining-grid strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.3;
 }
 
 .factor-help-grid {
@@ -2722,6 +2729,10 @@ main,
 .factor-table span,
 .factor-table small {
   color: var(--muted);
+}
+
+.factor-table small a {
+  color: #67e8f9;
 }
 
 .factor-toolbar,

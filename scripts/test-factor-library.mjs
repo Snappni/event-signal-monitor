@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import {
+  FACTOR_CATALOG_AUDIT,
   FACTOR_DEFINITIONS,
+  FACTOR_HISTORICAL_SAMPLING_MODE,
+  FACTOR_RESEARCH_REFERENCES,
   buildHistoricalFactorFrames,
   buildFactorSnapshots,
   createFactorLibraryStatus,
@@ -11,8 +14,13 @@ import {
   updateFactorLibraryConfig,
   updateFactorLibraryRuntime
 } from "./factor-library.mjs";
+import {
+  canonicalExpression,
+  chronologicalFactorEvidence,
+  evaluateExpression
+} from "./factor-research.mjs";
 
-const symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"];
+const symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT"];
 
 function candles(base, slope, count = 100) {
   return Array.from({ length: count }, (_, index) => {
@@ -45,20 +53,20 @@ function marketResults(priceMultiplier = 1) {
         atrPct: 0.008,
         returns15m: Array.from({ length: 30 }, (_, offset) => slope * (offset + 1)),
         oiChange: slope * 10,
-        hiddenMarkov: { signal: index / 5 * 2 - 1 },
+        hiddenMarkov: { signal: index / (symbols.length - 1) * 2 - 1 },
         microstructure: {
           available: true,
           bookAvailable: true,
           tradeAvailable: true,
-          signal: index / 5 * 2 - 1,
+          signal: index / (symbols.length - 1) * 2 - 1,
           spreadBps: 1.2,
           microPriceBiasBps: index / 3,
-          topBookImbalance: index / 5 * 2 - 1,
-          orderBookImbalance: index / 6,
+          topBookImbalance: index / (symbols.length - 1) * 2 - 1,
+          orderBookImbalance: index / (symbols.length - 1),
           cumulativeVolumeDelta30s: 25_000 * (index + 1),
-          flow30s: { imbalance: index / 5 * 2 - 1, totalQuoteVolume: 200_000, tradeCount: 30 },
+          flow30s: { imbalance: index / (symbols.length - 1) * 2 - 1, totalQuoteVolume: 200_000, tradeCount: 30 },
           bookFlow30s: {
-            imbalance: index / 5 * 2 - 1,
+            imbalance: index / (symbols.length - 1) * 2 - 1,
             bidAddedQuote: 50_000,
             askAddedQuote: 40_000,
             bidCancelledQuote: 10_000,
@@ -73,12 +81,12 @@ function marketResults(priceMultiplier = 1) {
         candles15m: fifteenMinute,
         candles1h: hourly,
         derivatives: {
-          fundingZScore: index / 3,
+          fundingZScore: index / (symbols.length - 1) * 2 - 1,
           perpetualBasis: slope,
-          takerImbalance: index / 5 * 2 - 1,
-          depthImbalanceL20: index / 5 * 2 - 1,
-          liquidationImbalance: index / 5 * 2 - 1,
-          longShortContrarian: 1 - index / 5 * 2,
+          takerImbalance: index / (symbols.length - 1) * 2 - 1,
+          depthImbalanceL20: index / (symbols.length - 1) * 2 - 1,
+          liquidationImbalance: index / (symbols.length - 1) * 2 - 1,
+          longShortContrarian: 1 - index / (symbols.length - 1) * 2,
           basisVolatility: 0.1,
           sources: { okx: { available: true, updatedAt: "2026-07-30T00:00:00.000Z" } }
         }
@@ -87,7 +95,37 @@ function marketResults(priceMultiplier = 1) {
   });
 }
 
-assert.ok(FACTOR_DEFINITIONS.length >= 50, "factor library must ship with at least 50 built-in factors");
+assert.equal(FACTOR_DEFINITIONS.length, 100, "reviewed built-in catalog should remain near the requested size without silent inflation");
+assert.equal(FACTOR_CATALOG_AUDIT.passed, true, FACTOR_CATALOG_AUDIT.errors.join(", "));
+assert.equal(FACTOR_CATALOG_AUDIT.factorCount, 100);
+assert.ok(Object.keys(FACTOR_RESEARCH_REFERENCES).length >= 8);
+assert.ok(FACTOR_DEFINITIONS.every((item) => item.catalogStatus === "mechanism_validated"));
+assert.ok(FACTOR_DEFINITIONS.every((item) => item.referenceIds.length > 0 && item.dataRequirements.length > 0));
+
+const expressionLeft = { type: "operator", operator: "blend", children: [{ type: "factor", id: "return_5m" }, { type: "factor", id: "return_15m" }] };
+const expressionRight = { type: "operator", operator: "blend", children: [...expressionLeft.children].reverse() };
+assert.equal(canonicalExpression(expressionLeft), canonicalExpression(expressionRight), "commutative DSL expressions must deduplicate canonically");
+assert.ok(Math.abs(evaluateExpression(expressionLeft, { return_5m: 0.8, return_15m: -0.2 }) - 0.3) < 1e-12);
+
+const stableHoldoutValues = Array.from({ length: 120 }, (_, index) => 0.025 + (index % 3 - 1) * 0.004);
+const stableHoldout = chronologicalFactorEvidence({
+  values: stableHoldoutValues,
+  coverageValues: Array(120).fill(1),
+  sourceValues: Array(120).fill(0)
+});
+assert.equal(stableHoldout.passed, true, "stable chronological evidence should pass the holdout gate");
+const signFlipHoldout = chronologicalFactorEvidence({
+  values: [...Array(72).fill(0.03), ...Array(24).fill(-0.03), ...Array(24).fill(0.03)],
+  coverageValues: Array(120).fill(1),
+  sourceValues: Array(120).fill(0)
+});
+assert.equal(signFlipHoldout.passed, false, "validation sign reversal must fail even when aggregate IC is positive");
+const contradictedHoldout = chronologicalFactorEvidence({
+  values: [...stableHoldoutValues, ...Array(30).fill(-0.03)],
+  coverageValues: Array(150).fill(1),
+  sourceValues: [...Array(120).fill(0), ...Array(30).fill(1)]
+});
+assert.equal(contradictedHoldout.passed, false, "sustained realtime contradiction must block validation");
 
 const legacyDuplicateStatus = normalizeFactorLibraryStatus({
   metrics: {
@@ -175,7 +213,7 @@ assert.equal(
 );
 
 const operatorStatus = normalizeFactorLibraryStatus({
-  minedFactors: ["difference", "blend", "agreement"].map((operator) => ({
+  minedFactors: ["difference", "blend", "agreement", "signed_product"].map((operator) => ({
     id: `mined_${operator}_return_1m_return_5m`,
     leftId: "return_1m",
     rightId: "return_5m",
@@ -186,10 +224,10 @@ const operatorStatus = normalizeFactorLibraryStatus({
   }))
 });
 const operatorSnapshot = buildFactorSnapshots({ marketResults: marketResults(), status: operatorStatus })[0];
-const operatorValues = ["difference", "blend", "agreement"].map(
+const operatorValues = ["difference", "blend", "agreement", "signed_product"].map(
   (operator) => operatorSnapshot.values[`mined_${operator}_return_1m_return_5m`]
 );
-assert.equal(new Set(operatorValues).size, 3, "difference, blend and agreement must produce distinct values for unequal inputs");
+assert.equal(new Set(operatorValues).size, 4, "typed DSL operators must produce distinct values for unequal inputs");
 
 let diversityConfig = normalizeFactorLibraryConfig({ miningEnabled: true });
 let diversityStatus = createFactorLibraryStatus();
@@ -203,13 +241,13 @@ for (let index = 0; index < 6; index += 1) {
 }
 const diversityPairs = diversityStatus.minedFactors.map((item) => [item.leftId, item.rightId].sort().join("|"));
 assert.equal(new Set(diversityPairs).size, diversityPairs.length, "early mining must diversify parent pairs");
-assert.equal(new Set(diversityStatus.minedFactors.map((item) => item.operator)).size, 3, "mining must balance all three operators");
+assert.equal(new Set(diversityStatus.minedFactors.map((item) => item.operator)).size, 4, "mining must balance all typed DSL operators");
 
 const directionDefinitions = FACTOR_DEFINITIONS.filter((item) => item.role === "direction");
 const rejectedDefinitions = [];
 for (let leftIndex = 0; leftIndex < directionDefinitions.length && rejectedDefinitions.length < 20; leftIndex += 1) {
   for (let rightIndex = leftIndex + 1; rightIndex < directionDefinitions.length && rejectedDefinitions.length < 20; rightIndex += 1) {
-    const operator = ["difference", "blend", "agreement"][rejectedDefinitions.length % 3];
+    const operator = ["difference", "blend", "agreement", "signed_product"][rejectedDefinitions.length % 4];
     const leftId = directionDefinitions[leftIndex].id;
     const rightId = directionDefinitions[rightIndex].id;
     rejectedDefinitions.push({
@@ -311,7 +349,10 @@ let validatedStatus = normalizeFactorLibraryStatus({
         meanIc: 0.05,
         icStd: 0.1,
         icir: 0.5,
-        tStatistic: 5
+        tStatistic: 5,
+        values: Array.from({ length: 90 }, (_, index) => index % 2 ? 0.04 : 0.06),
+        coverageValues: Array(90).fill(1),
+        sourceValues: [...Array(60).fill(0), ...Array(30).fill(1)]
       }
     }
   }
@@ -345,6 +386,8 @@ assert.equal(boundedRetirementStatus.retiredMinedFactors.length, 2048, "retireme
 let config = normalizeFactorLibraryConfig({ miningEnabled: true, intelligentAdjustment: true });
 let status = createFactorLibraryStatus();
 const firstSnapshots = buildFactorSnapshots({ marketResults: marketResults(), status });
+assert.ok(firstSnapshots.every((snapshot) => FACTOR_DEFINITIONS.every((definition) => Object.hasOwn(snapshot.values, definition.id))), "every catalog factor must have an explicit value or null");
+assert.ok(firstSnapshots.every((snapshot) => Object.values(snapshot.values).every((value) => value == null || value >= -1 && value <= 1)), "all factor outputs must stay in the normalized range");
 const historicalSeries = Object.fromEntries(
   marketResults().map((item) => [item.market.symbol, item.factorContext.candles15m])
 );
@@ -379,7 +422,62 @@ assert.ok(Number.isFinite(status.metrics.return_1m[15].meanIc));
 assert.ok(status.metrics.return_15m?.[15]?.historySamples > 0, "historical public candles must feed 15-minute IC");
 assert.ok(status.metrics.return_15m[15].historySamples <= status.metrics.return_15m[15].samples);
 assert.equal(status.historicalBackfill.status, "complete");
-assert.equal(status.historicalBackfill.samplingMode, "hourly_anchors_non_overlapping_v2");
+assert.equal(status.historicalBackfill.samplingMode, FACTOR_HISTORICAL_SAMPLING_MODE);
+
+const partitionedStatus = normalizeFactorLibraryStatus({
+  metrics: {
+    return_15m: {
+      15: {
+        samples: 2304,
+        meanIc: 0.01,
+        icStd: 0.1,
+        icir: 0.1,
+        tStatistic: 4.8,
+        coverage: 1,
+        values: [...Array(1536).fill(0.01), ...Array(768).fill(0.02)],
+        coverageValues: Array(2304).fill(1),
+        sourceValues: [...Array(1536).fill(0), ...Array(768).fill(1)]
+      }
+    }
+  },
+  pendingFrames: [{
+    capturedAt: "2026-07-30T00:00:00.000Z",
+    prices: Object.fromEntries(symbols.map((symbol) => [symbol, 100])),
+    values: Object.fromEntries(symbols.map((symbol, index) => [symbol, { return_15m: index / (symbols.length - 1) * 2 - 1 }])),
+    resolvedHorizons: []
+  }]
+});
+const partitionedSnapshots = symbols.map((symbol, index) => ({
+  symbol,
+  price: 100 * (1 + index * 0.001),
+  capturedAt: "2026-07-30T00:15:01.000Z",
+  values: { return_15m: index / (symbols.length - 1) * 2 - 1 },
+  sources: {}
+}));
+const partitionedResult = updateFactorLibraryRuntime({
+  config: normalizeFactorLibraryConfig({ miningEnabled: false }),
+  status: partitionedStatus,
+  snapshots: partitionedSnapshots,
+  now: "2026-07-30T00:15:01.000Z"
+});
+assert.equal(partitionedResult.status.metrics.return_15m[15].historySamples, 1536, "realtime observations must never evict the bounded historical partition");
+assert.equal(partitionedResult.status.metrics.return_15m[15].realtimeSamples, 768, "realtime partition must remain independently bounded");
+assert.equal(partitionedResult.status.metrics.return_15m[15].samples, 2304, "partitioned retention must not increase the previous per-metric storage bound");
+const overlappingStatus = partitionedResult.status;
+overlappingStatus.pendingFrames.push({
+  capturedAt: "2026-07-30T00:01:00.000Z",
+  prices: Object.fromEntries(symbols.map((symbol) => [symbol, 100])),
+  values: Object.fromEntries(symbols.map((symbol, index) => [symbol, { return_15m: index / (symbols.length - 1) * 2 - 1 }])),
+  resolvedHorizons: []
+});
+overlappingStatus.pendingFrames.sort((left, right) => Date.parse(left.capturedAt) - Date.parse(right.capturedAt));
+const overlapResult = updateFactorLibraryRuntime({
+  config: normalizeFactorLibraryConfig({ miningEnabled: false }),
+  status: overlappingStatus,
+  snapshots: partitionedSnapshots,
+  now: "2026-07-30T00:16:01.000Z"
+});
+assert.equal(overlapResult.status.lastRealtimeIcAt[15], "2026-07-30T00:00:00.000Z", "overlapping forward-return labels must not create a second IC observation");
 
 for (const id of ["return_15m", "return_1h", "ema_spread_5_20", "donchian_breakout"]) {
   status.metrics[id] ||= {};
@@ -395,10 +493,38 @@ for (const id of ["return_15m", "return_1h", "ema_spread_5_20", "donchian_breako
 }
 
 const decision = factorDecisionForSnapshot(laterSnapshots[0], config, status);
-assert.ok(decision.requestedFactors >= 4);
+assert.equal(decision.requestedFactors, 0, "mixed aggregate IC must not bypass the chronological holdout gate");
 assert.ok(decision.activeFactors.every((item) => !item.id.startsWith("mined_")), "quarantined factors must not trade");
 assert.ok(decision.activeFactors.every((item) => Math.abs(item.orientation) === 1));
-assert.equal(decision.sufficient, false, "fewer than ten validated factors must not influence trading");
+assert.equal(decision.sufficient, false, "unvalidated factor evidence must not influence trading");
+
+const validatedDirectionIds = FACTOR_DEFINITIONS
+  .filter((item) => item.role === "direction" && item.defaultEnabled)
+  .slice(0, 10)
+  .map((item) => item.id);
+const strictEvidenceStatus = normalizeFactorLibraryStatus({
+  metrics: Object.fromEntries(validatedDirectionIds.map((id) => [id, {
+    15: {
+      samples: stableHoldoutValues.length,
+      meanIc: 0.025,
+      icStd: 0.004,
+      icir: 6.25,
+      tStatistic: 60,
+      coverage: 1,
+      values: stableHoldoutValues,
+      coverageValues: Array(stableHoldoutValues.length).fill(1),
+      sourceValues: Array(stableHoldoutValues.length).fill(0)
+    }
+  }]))
+});
+const strictDecision = factorDecisionForSnapshot(
+  laterSnapshots[0],
+  normalizeFactorLibraryConfig({ enabled: true }),
+  strictEvidenceStatus
+);
+assert.equal(strictDecision.requestedFactors, 10);
+assert.equal(strictDecision.sufficient, true, "ten direction factors with stable holdout evidence may influence the original decision");
+assert.ok(strictDecision.influence > 0);
 
 config = updateFactorLibraryConfig(config, {
   factorUpdates: [{ id: "return_1m", enabled: false, useInDecision: false, weight: 3 }],
@@ -410,7 +536,9 @@ assert.equal(config.factorSettings[status.minedFactors[0].id].archived, true);
 assert.equal(config.decisionInfluence, 0.4, "factor influence must remain capped");
 
 const view = publicFactorLibrary(config, status);
-assert.ok(view.counts.total >= 50);
+assert.ok(view.counts.total >= 100);
+assert.equal(view.catalogAudit.passed, true);
+assert.equal(view.samplingPolicy.observationRetention.sourcePartitioned, true);
 assert.equal(Object.hasOwn(view.factors[0].metrics[15] || {}, "values"), false, "public API must not expose rolling raw IC arrays");
 assert.ok(view.limitations.length >= 3);
 assert.equal(view.samplingPolicy.usesPaperPositions, false);

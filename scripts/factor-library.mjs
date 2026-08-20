@@ -1,17 +1,123 @@
-const FACTOR_LIBRARY_VERSION = 3;
+import { createHash } from "node:crypto";
+import {
+  MINING_OPERATOR_META as MINED_OPERATOR_META,
+  canonicalExpression,
+  chronologicalFactorEvidence,
+  chooseMiningCandidate,
+  evaluateExpression,
+  metricEvidenceCorrelation,
+  validateResearchCatalog
+} from "./factor-research.mjs";
+
+const FACTOR_LIBRARY_VERSION = 4;
 const PRIMARY_IC_HORIZON_MINUTES = 15;
 const MAX_PENDING_FRAMES = 90;
-const MAX_IC_OBSERVATIONS = 2304;
+const MAX_HISTORICAL_IC_OBSERVATIONS = 1536;
+const MAX_REALTIME_IC_OBSERVATIONS = 768;
 const MAX_ACTIVE_MINED_FACTORS = 20;
 const MAX_RETIRED_MINED_FACTORS = 2048;
 const MIN_RETIRED_FACTOR_SAMPLES = 90;
 const MIN_REJECTED_FACTOR_AGE_MS = 6 * 60 * 60 * 1_000;
-const HISTORICAL_BACKFILL_VERSION = 2;
-const MIN_CROSS_SECTION_SYMBOLS = 5;
+const HISTORICAL_BACKFILL_VERSION = 3;
+export const FACTOR_HISTORICAL_SAMPLING_MODE = "hourly_anchors_non_overlapping_partitioned_v3";
+const MIN_CROSS_SECTION_SYMBOLS = 8;
 const MIN_SMART_WEIGHT_SAMPLES = 30;
-const MIN_MINED_FACTOR_SAMPLES = 30;
+const MIN_MINED_FACTOR_SAMPLES = 90;
+
+export const FACTOR_RESEARCH_REFERENCES = Object.freeze({
+  formulaic_alpha: Object.freeze({
+    title: "101 Formulaic Alphas",
+    url: "https://arxiv.org/abs/1601.00991",
+    scope: "价格、成交量和横截面公式因子的公开机制基线"
+  }),
+  range_volatility: Object.freeze({
+    title: "The Extreme Value Method for Estimating the Variance of the Rate of Return",
+    url: "https://doi.org/10.1086/296071",
+    scope: "高低价区间波动估计"
+  }),
+  rogers_satchell: Object.freeze({
+    title: "Estimating Variance From High, Low and Closing Prices",
+    url: "https://doi.org/10.1214/aoap/1177005835",
+    scope: "允许价格漂移的OHLC区间波动估计"
+  }),
+  yang_zhang: Object.freeze({
+    title: "Drift-Independent Volatility Estimation Based on High, Low, Open, and Close Prices",
+    url: "https://doi.org/10.1086/209650",
+    scope: "漂移无关并处理开盘跳跃的OHLC波动估计"
+  }),
+  realized_jumps: Object.freeze({
+    title: "Realized Volatility and Bipower Variation",
+    url: "https://public.econ.duke.edu/~boller/Published_Papers/joe_07.pdf",
+    scope: "实现波动、双幂变差和跳跃分解"
+  }),
+  order_flow_imbalance: Object.freeze({
+    title: "The Price Impact of Order Book Events",
+    url: "https://arxiv.org/abs/1011.6402",
+    scope: "订单流不平衡、盘口深度与短期价格冲击"
+  }),
+  illiquidity: Object.freeze({
+    title: "Illiquidity and Stock Returns: Cross-section and Time-series Effects",
+    url: "https://doi.org/10.1016/S0304-405X(01)00024-6",
+    scope: "收益相对成交额的非流动性代理"
+  }),
+  perpetual_markets: Object.freeze({
+    title: "Reconciling Open Interest with Traded Volume in Perpetual Swaps",
+    url: "https://arxiv.org/abs/2310.14973",
+    scope: "永续合约、资金费率、未平仓量和强平数据的适用边界"
+  }),
+  factor_evaluation: Object.freeze({
+    title: "Alphalens Reloaded",
+    url: "https://github.com/stefan-jansen/alphalens-reloaded",
+    scope: "IC、分组收益、换手率和因子诊断方法"
+  }),
+  factor_pipeline: Object.freeze({
+    title: "Microsoft Qlib",
+    url: "https://github.com/microsoft/qlib",
+    scope: "时点一致的数据、因子表达式、研究与回测工作流"
+  }),
+  technical_analysis: Object.freeze({
+    title: "Foundations of Technical Analysis",
+    url: "https://www.nber.org/papers/w7613",
+    scope: "将主观图形和技术信号转化为可重复统计检验"
+  }),
+  ta_lib: Object.freeze({
+    title: "TA-Lib",
+    url: "https://github.com/TA-Lib/ta-lib",
+    scope: "常见技术指标的开源实现参照；本项目未引入其运行时依赖"
+  }),
+  crypto_factors: Object.freeze({
+    title: "Common Risk Factors in Cryptocurrency",
+    url: "https://economics.yale.edu/research/common-risk-factors-cryptocurrency",
+    scope: "加密资产横截面市场、规模与动量因子"
+  }),
+  openfe: Object.freeze({
+    title: "OpenFE",
+    url: "https://github.com/IIIS-Li-Group/OpenFE",
+    scope: "扩展—缩减、粗筛—精筛的自动特征生成流程"
+  }),
+  gplearn: Object.freeze({
+    title: "gplearn SymbolicTransformer",
+    url: "https://github.com/trevorstephens/gplearn",
+    scope: "以相关性为目标并从优胜表达式中去除高度相关候选"
+  }),
+  alphagen: Object.freeze({
+    title: "AlphaGen",
+    url: "https://github.com/ICT-FinD-Lab/alphagen",
+    scope: "协同公式因子集合与增量组合评价；仅借鉴研究思想，未复制无明确许可代码"
+  })
+});
+
+const FACTOR_CATEGORY_RESEARCH = Object.freeze({
+  "价格与趋势": Object.freeze({ basis: "可解释的价格路径、趋势与均值回归变换", references: ["formulaic_alpha", "technical_analysis", "ta_lib", "factor_evaluation"], data: ["public_ohlcv"] }),
+  "波动率与分布": Object.freeze({ basis: "收益分布、区间估计与连续/跳跃波动分解", references: ["range_volatility", "realized_jumps", "factor_evaluation"], data: ["public_ohlcv"] }),
+  "成交量与成交流": Object.freeze({ basis: "价格与成交量、主动成交方向的可检验联合关系", references: ["formulaic_alpha", "ta_lib", "order_flow_imbalance", "factor_evaluation"], data: ["public_ohlcv", "public_trades"] }),
+  "订单簿与微观结构": Object.freeze({ basis: "盘口供需、订单事件和流动性对短期价格的影响", references: ["order_flow_imbalance", "illiquidity", "factor_evaluation"], data: ["public_order_book", "public_trades"] }),
+  "合约衍生品": Object.freeze({ basis: "永续合约拥挤、基差、未平仓量与强平的状态代理", references: ["perpetual_markets", "factor_evaluation"], data: ["public_derivatives"] }),
+  "市场状态与跨资产": Object.freeze({ basis: "横截面相对价值、共同风险暴露与市场状态", references: ["crypto_factors", "factor_pipeline", "factor_evaluation"], data: ["multi_symbol_public_ohlcv"] })
+});
 
 function factor(id, name, category, role, source, description, options = {}) {
+  const research = FACTOR_CATEGORY_RESEARCH[category] || FACTOR_CATEGORY_RESEARCH["价格与趋势"];
   return Object.freeze({
     id,
     name,
@@ -24,7 +130,13 @@ function factor(id, name, category, role, source, description, options = {}) {
     defaultEnabled: options.defaultEnabled === true,
     defaultUseInDecision: options.defaultUseInDecision === true,
     defaultWeight: Number.isFinite(options.defaultWeight) ? options.defaultWeight : 1,
-    formula: options.formula || null
+    formula: options.formula || null,
+    implementationKey: id,
+    researchBasis: options.researchBasis || research.basis,
+    referenceIds: Object.freeze([...(options.referenceIds || research.references)]),
+    dataRequirements: Object.freeze([...(options.dataRequirements || research.data)]),
+    catalogStatus: "mechanism_validated",
+    catalogValidation: "公开机制依据 + 数据可得性 + 公式静态校验；交易有效性仍需本项目样本外证据"
   });
 }
 
@@ -39,6 +151,18 @@ export const FACTOR_DEFINITIONS = Object.freeze([
   factor("adx_strength", "ADX趋势强度", "价格与趋势", "risk", "K线计算", "方向运动强度，只用于置信和行情状态，不直接决定多空。"),
   factor("donchian_breakout", "Donchian突破", "价格与趋势", "direction", "K线计算", "价格相对最近20根K线通道的位置。", { defaultEnabled: true, defaultUseInDecision: true }),
   factor("rsi_reversal", "RSI反转", "价格与趋势", "direction", "K线计算", "极端RSI后的均值回归信号。", { defaultEnabled: true, defaultUseInDecision: true }),
+  factor("return_3m", "3分钟收益率", "价格与趋势", "direction", "公共K线", "三分钟价格动量；短于可用K线粒度时保持不可用。"),
+  factor("return_10m", "10分钟收益率", "价格与趋势", "direction", "公共K线", "十分钟价格动量；短于可用K线粒度时保持不可用。"),
+  factor("return_30m", "30分钟收益率", "价格与趋势", "direction", "公共K线", "三十分钟价格动量。"),
+  factor("ema_spread_10_50", "EMA 10/50差值", "价格与趋势", "direction", "K线计算", "中短周期与长周期指数均线的波动归一化差值。"),
+  factor("price_acceleration_5_20", "价格加速度 5/20", "价格与趋势", "direction", "K线计算", "短期动量相对中期动量的变化，识别趋势加速与衰减。"),
+  factor("linear_trend_slope_20", "线性趋势斜率", "价格与趋势", "direction", "K线计算", "最近20根对数价格的最小二乘斜率，经波动归一化。"),
+  factor("trend_fit_r2_20", "趋势拟合度 R²", "价格与趋势", "risk", "K线计算", "最近20根价格线性趋势的拟合度，只衡量趋势可解释度，不决定方向。"),
+  factor("stochastic_reversal", "随机指标反转", "价格与趋势", "direction", "K线计算", "收盘价在近期高低区间的位置，经反向处理用于检验均值回归。"),
+  factor("williams_r_reversal", "Williams %R反转", "价格与趋势", "direction", "K线计算", "Williams %R的居中反向信号，与随机指标采用不同的平滑区间。"),
+  factor("bollinger_reversal", "布林偏离反转", "价格与趋势", "direction", "K线计算", "价格相对20期均值的标准化偏离，反向检验均值回归。"),
+  factor("cci_reversal", "CCI反转", "价格与趋势", "direction", "K线计算", "典型价格相对滚动均值和平均绝对偏差的反向信号。"),
+  factor("aroon_oscillator", "Aroon振荡", "价格与趋势", "direction", "K线计算", "近期最高点和最低点出现时间差形成的趋势方向信号。"),
 
   factor("realized_volatility", "实现波动率", "波动率与分布", "risk", "K线计算", "滚动实现波动率。"),
   factor("volatility_zscore", "波动率Z分数", "波动率与分布", "risk", "K线计算", "短期波动相对历史基线的偏离。"),
@@ -48,6 +172,14 @@ export const FACTOR_DEFINITIONS = Object.freeze([
   factor("garman_klass_volatility", "Garman-Klass波动率", "波动率与分布", "risk", "K线计算", "使用开高低收估算的波动率。"),
   factor("downside_semivolatility", "下行半波动率", "波动率与分布", "risk", "K线计算", "只统计负收益的半波动率。"),
   factor("jump_intensity", "跳跃强度", "波动率与分布", "risk", "K线计算", "异常大收益出现频率与幅度。"),
+  factor("rogers_satchell_volatility", "Rogers-Satchell波动率", "波动率与分布", "risk", "公共OHLC K线", "考虑开收方向且对非零漂移更稳健的区间波动估计。", { referenceIds: ["rogers_satchell", "factor_evaluation"] }),
+  factor("yang_zhang_volatility", "Yang-Zhang波动率", "波动率与分布", "risk", "公共OHLC K线", "融合隔夜、开收和区间分量的波动估计；连续市场中隔夜项通常较小。", { referenceIds: ["yang_zhang", "factor_evaluation"] }),
+  factor("upside_semivolatility", "上行半波动率", "波动率与分布", "risk", "K线计算", "只统计正收益的半波动率，与下行半波动率共同描述不对称。"),
+  factor("realized_skewness", "实现偏度", "波动率与分布", "risk", "K线计算", "近期收益分布的标准化三阶矩。"),
+  factor("realized_kurtosis", "实现超额峰度", "波动率与分布", "risk", "K线计算", "近期收益分布的超额四阶矩，反映厚尾风险。"),
+  factor("bipower_jump_ratio", "双幂跳跃占比", "波动率与分布", "risk", "K线计算", "实现方差超过双幂变差的比例，作为跳跃成分代理。"),
+  factor("volatility_of_volatility", "波动率的波动", "波动率与分布", "risk", "K线计算", "多个滚动窗口实现波动率的离散程度。"),
+  factor("return_entropy", "收益符号熵", "波动率与分布", "risk", "K线计算", "近期涨跌与近零收益状态的离散熵，衡量路径不确定性。"),
 
   factor("volume_zscore", "成交量Z分数", "成交量与成交流", "context", "K线成交量", "当前成交量相对滚动均值的标准分。"),
   factor("volume_roc", "成交量变化率", "成交量与成交流", "context", "K线成交量", "短期成交量变化速度。"),
@@ -59,6 +191,14 @@ export const FACTOR_DEFINITIONS = Object.freeze([
   factor("average_trade_size", "平均单笔成交量", "成交量与成交流", "context", "实时聚合成交", "单位时间内平均成交名义金额。"),
   factor("buy_sell_volume_divergence", "买卖量背离", "成交量与成交流", "direction", "K线主动成交量", "K线主动买量与卖量的差异。"),
   factor("price_volume_correlation", "价格成交量相关", "成交量与成交流", "direction", "K线计算", "收益率与成交量变化的滚动相关。"),
+  factor("money_flow_index", "资金流量指标", "成交量与成交流", "direction", "公共OHLCV K线", "典型价格方向加权成交量形成的资金流强弱，并居中为方向信号。"),
+  factor("chaikin_money_flow", "Chaikin资金流", "成交量与成交流", "direction", "公共OHLCV K线", "收盘价在高低区间的位置乘以成交量，衡量累积买卖压力。"),
+  factor("accumulation_distribution_slope", "累积派发线斜率", "成交量与成交流", "direction", "公共OHLCV K线", "资金流量乘数累计值的近期归一化斜率。"),
+  factor("force_index", "Force Index", "成交量与成交流", "direction", "公共OHLCV K线", "价格变化与成交量的乘积，经近期绝对规模归一化。"),
+  factor("ease_of_movement", "Ease of Movement", "成交量与成交流", "direction", "公共OHLCV K线", "中间价变化相对成交量和区间宽度的移动便利度。"),
+  factor("volume_weighted_momentum", "成交量加权动量", "成交量与成交流", "direction", "公共OHLCV K线", "近期收益按相对成交量加权，区分放量与缩量价格变化。"),
+  factor("volume_trend_confirmation", "量价趋势确认", "成交量与成交流", "direction", "公共OHLCV K线", "价格动量与成交量变化方向的交互确认。"),
+  factor("signed_trade_intensity", "有向成交强度", "成交量与成交流", "direction", "实时公共成交", "主动买卖不平衡乘以成交频率置信度。", { dataRequirements: ["public_trades"] }),
 
   factor("spread_bps", "买卖价差", "订单簿与微观结构", "risk", "实时盘口", "最优买卖价差，单位为基点。"),
   factor("microprice_bias", "Microprice偏离", "订单簿与微观结构", "direction", "实时盘口", "按最优档数量加权的微价格偏离。", { defaultEnabled: true, defaultUseInDecision: true }),
@@ -72,6 +212,12 @@ export const FACTOR_DEFINITIONS = Object.freeze([
   factor("liquidity_void", "流动性空洞", "订单簿与微观结构", "risk", "实时五档盘口", "近端盘口深度不足和集中度异常。"),
   factor("kyle_lambda_proxy", "Kyle Lambda近似", "订单簿与微观结构", "risk", "实时成交", "单位成交量造成价格变化的近似冲击。"),
   factor("amihud_illiquidity", "Amihud非流动性", "订单簿与微观结构", "risk", "K线成交额", "绝对收益率除以成交额的非流动性近似。"),
+  factor("quoted_depth", "可见报价深度", "订单簿与微观结构", "context", "实时五档盘口", "买卖两侧可见名义深度的对数缩放值。", { dataRequirements: ["public_order_book"] }),
+  factor("depth_concentration", "盘口深度集中度", "订单簿与微观结构", "risk", "实时五档盘口", "最优档深度占可见总深度的比例，识别表层流动性集中。", { dataRequirements: ["public_order_book"] }),
+  factor("weighted_book_pressure", "深度加权盘口压力", "订单簿与微观结构", "direction", "实时五档盘口", "L1与L5不平衡按近端权重融合。", { dataRequirements: ["public_order_book"] }),
+  factor("order_flow_persistence", "订单流持续性", "订单簿与微观结构", "direction", "实时公共成交", "5秒与30秒主动成交方向一致时保留信号，分歧时衰减。", { dataRequirements: ["public_trades"] }),
+  factor("cancel_to_add_ratio", "撤单/挂单比", "订单簿与微观结构", "risk", "实时五档盘口", "近期撤单名义量相对新增挂单名义量的比例。", { dataRequirements: ["public_order_book"] }),
+  factor("depth_adjusted_ofi", "深度调整订单流", "订单簿与微观结构", "direction", "实时成交与盘口", "订单流不平衡按可见深度和数据置信度调整。", { dataRequirements: ["public_order_book", "public_trades"] }),
 
   factor("funding_zscore", "资金费率Z分数", "合约衍生品", "context", "OKX资金费率历史", "当前资金费率相对近期历史的偏离。"),
   factor("funding_price_divergence", "资金费率价格背离", "合约衍生品", "direction", "价格与资金费率", "价格方向与拥挤资金费率的背离。"),
@@ -81,6 +227,11 @@ export const FACTOR_DEFINITIONS = Object.freeze([
   factor("liquidation_imbalance", "强平方向不平衡", "合约衍生品", "direction", "OKX公开强平订单", "多头与空头强平名义量的方向差。"),
   factor("long_short_ratio", "多空账户比", "合约衍生品", "direction", "OKX合约统计", "全市场多空账户比的拥挤反向信号。"),
   factor("basis_volatility", "基差波动率", "合约衍生品", "risk", "OKX标记价与指数价", "基差变化的滚动波动率；历史不足时不可用。"),
+  factor("taker_oi_confirmation", "主动成交/OI确认", "合约衍生品", "direction", "公开主动成交与OI", "主动成交方向与未平仓量变化共同确认新仓推动。"),
+  factor("liquidation_price_confirmation", "强平/价格确认", "合约衍生品", "direction", "公开强平与价格", "强平方向与短期价格变化的交互，区分顺势踩踏与吸收。"),
+  factor("leverage_crowding_risk", "杠杆拥挤风险", "合约衍生品", "risk", "资金费率与OI", "资金费率极端程度与未平仓量变化绝对值的联合风险。"),
+  factor("basis_dislocation_risk", "基差脱锚风险", "合约衍生品", "risk", "标记价与指数价", "永续标记价相对指数价偏离的绝对程度。"),
+  factor("derivatives_consensus", "衍生品方向共识", "合约衍生品", "direction", "公开合约统计", "OI价格确认、主动成交与强平信号的稳健中位融合。"),
 
   factor("btc_beta_residual", "BTC Beta残差", "市场状态与跨资产", "direction", "跨资产K线", "剔除BTC共同波动后的相对收益。"),
   factor("eth_btc_relative_strength", "ETH/BTC相对强弱", "市场状态与跨资产", "direction", "跨资产K线", "相对BTC和ETH基准的强弱。"),
@@ -89,38 +240,58 @@ export const FACTOR_DEFINITIONS = Object.freeze([
   factor("hmm_regime_signal", "HMM市场状态", "市场状态与跨资产", "direction", "三状态HMM", "HMM牛熊状态概率差。", { defaultEnabled: true, defaultUseInDecision: true }),
   factor("market_session", "交易时段因子", "市场状态与跨资产", "context", "UTC交易时段", "亚洲、欧洲、美国及交会时段的策略上下文。"),
   factor("news_impact_decay", "消息影响衰减", "市场状态与跨资产", "direction", "消息聚合", "消息方向乘以时效影响。"),
-  factor("event_source_consensus", "多消息源一致性", "市场状态与跨资产", "direction", "消息聚合", "独立来源方向一致程度。")
+  factor("event_source_consensus", "多消息源一致性", "市场状态与跨资产", "direction", "消息聚合", "独立来源方向一致程度。"),
+  factor("btc_lead_lag", "BTC领先滞后", "市场状态与跨资产", "direction", "跨资产K线", "BTC前一期收益与标的当期相对收益的方向差。"),
+  factor("market_breadth", "市场涨跌宽度", "市场状态与跨资产", "context", "多标的公共K线", "同一时点上涨标的占比的居中值，只作为市场状态。"),
+  factor("cross_section_dispersion", "横截面收益偏离度", "市场状态与跨资产", "risk", "多标的公共K线", "单一标的相对横截面平均收益的绝对偏离，并用当期离散度归一化。"),
+  factor("beta_instability", "BTC Beta不稳定度", "市场状态与跨资产", "risk", "跨资产K线", "短窗与长窗BTC Beta差异的绝对值。"),
+  factor("cross_section_residual_momentum", "市场中性残差动量", "市场状态与跨资产", "direction", "多标的公共K线", "标的收益减去横截面平均收益，降低共同市场方向暴露。")
 ]);
 
-const DEFINITION_BY_ID = new Map(FACTOR_DEFINITIONS.map((item) => [item.id, item]));
+export const FACTOR_CATALOG_AUDIT = Object.freeze(validateResearchCatalog(
+  FACTOR_DEFINITIONS,
+  FACTOR_RESEARCH_REFERENCES
+));
+if (!FACTOR_CATALOG_AUDIT.passed) {
+  throw new Error(`factor catalog validation failed: ${FACTOR_CATALOG_AUDIT.errors.join(", ")}`);
+}
 
-const MINED_OPERATOR_META = Object.freeze({
-  difference: Object.freeze({
-    label: "差值",
-    category: "自动挖掘·差值",
-    symbol: "−",
-    explanation: "衡量左侧因子相对右侧因子的方向优势；正值表示左侧更强，负值表示右侧更强。"
-  }),
-  blend: Object.freeze({
-    label: "均值融合",
-    category: "自动挖掘·均值融合",
-    symbol: "+",
-    explanation: "对两个因子等权平均，用于提取共同方向并降低单因子噪声。"
-  }),
-  agreement: Object.freeze({
-    label: "一致性确认",
-    category: "自动挖掘·一致性确认",
-    symbol: "↔",
-    explanation: "先融合两个因子，再按二者分歧程度衰减；方向越一致，保留的信号越多。"
-  })
-});
+const DEFINITION_BY_ID = new Map(FACTOR_DEFINITIONS.map((item) => [item.id, item]));
 
 function minedPairKey(leftId, rightId) {
   return [String(leftId || ""), String(rightId || "")].sort().join("|");
 }
 
+function stableSemanticHash(value) {
+  return createHash("sha256").update(String(value || "")).digest("hex").slice(0, 16);
+}
+
+function minedExpression(definition) {
+  const raw = definition?.expression || {
+    type: "operator",
+    operator: String(definition?.operator || "blend"),
+    children: [
+      { type: "factor", id: String(definition?.leftId || "") },
+      { type: "factor", id: String(definition?.rightId || "") }
+    ]
+  };
+  const normalize = (expression) => {
+    if (!expression || expression.type === "factor") return { type: "factor", id: String(expression?.id || "") };
+    const children = (expression.children || []).map(normalize);
+    if (MINED_OPERATOR_META[expression.operator]?.commutative) {
+      children.sort((left, right) => canonicalExpression(left).localeCompare(canonicalExpression(right)));
+    }
+    return { type: "operator", operator: String(expression.operator || "blend"), children };
+  };
+  return normalize(raw);
+}
+
 function minedSemanticKey(definition) {
-  return `${String(definition?.operator || "blend")}|${minedPairKey(definition?.leftId, definition?.rightId)}`;
+  try {
+    return canonicalExpression(minedExpression(definition));
+  } catch {
+    return `${String(definition?.operator || "blend")}|${minedPairKey(definition?.leftId, definition?.rightId)}`;
+  }
 }
 
 function minedFactorPresentation(definition) {
@@ -130,16 +301,27 @@ function minedFactorPresentation(definition) {
   const right = DEFINITION_BY_ID.get(definition?.rightId);
   const leftName = left?.name || definition?.leftId || "左因子";
   const rightName = right?.name || definition?.rightId || "右因子";
+  const expression = minedExpression(definition);
   return {
     ...definition,
     name: `挖掘·${meta.label}：${leftName} ${meta.symbol} ${rightName}`,
     category: meta.category,
-    source: `受限DSL自动挖掘·${meta.label}`,
-    description: `${meta.explanation} 该候选保持隔离，必须通过样本量、IC、ICIR、覆盖率与多重检验后才可验证。`,
-    formula: `${operator}(${definition?.leftId}, ${definition?.rightId})`,
+    source: `确定性束搜索·受限DSL·${meta.label}`,
+    description: `${meta.explanation} 候选保持隔离，必须通过时间顺序训练/验证/测试、HAC统计、覆盖率、冗余与多重检验后才可验证。`,
+    formula: canonicalExpression(expression),
     operator,
     operatorLabel: meta.label,
-    semanticKey: minedSemanticKey(definition)
+    expression,
+    complexity: safeNumber(definition?.complexity, 1 + safeNumber(meta.complexity, 1)),
+    researchStage: definition?.researchStage || (definition?.validationStatus === "validated" ? "shadow_validated" : "quarantine"),
+    researchBasis: "在受限类型、复杂度和数据可用边界内检验父因子的增量交互",
+    referenceIds: ["openfe", "gplearn", "alphagen", "factor_pipeline", "factor_evaluation"],
+    dataRequirements: [...new Set([
+      ...(left?.dataRequirements || []),
+      ...(right?.dataRequirements || [])
+    ])],
+    catalogStatus: "research_candidate",
+    semanticKey: minedSemanticKey({ ...definition, expression })
   };
 }
 
@@ -181,6 +363,13 @@ function normalizeMinedFactors(rawFactors, metrics) {
 
 function compactMetricEvidence(metric) {
   if (!metric || typeof metric !== "object") return null;
+  const chronological = chronologicalFactorEvidence(metric);
+  const compactSegment = (segment) => ({
+    samples: safeNumber(segment?.samples),
+    meanIc: round(segment?.meanIc),
+    icir: round(segment?.icir),
+    hacTStatistic: round(segment?.hacTStatistic)
+  });
   return {
     samples: safeNumber(metric.samples),
     meanIc: metric.meanIc ?? null,
@@ -190,7 +379,17 @@ function compactMetricEvidence(metric) {
     coverage: metric.coverage ?? null,
     lastIc: metric.lastIc ?? null,
     historySamples: safeNumber(metric.historySamples),
-    realtimeSamples: safeNumber(metric.realtimeSamples)
+    realtimeSamples: safeNumber(metric.realtimeSamples),
+    holdout: {
+      passed: chronological.passed,
+      hasHoldout: chronological.hasHoldout,
+      sameDirection: chronological.sameDirection,
+      realtimeContradiction: chronological.realtimeContradiction,
+      source: chronological.source,
+      train: compactSegment(chronological.train),
+      validation: compactSegment(chronological.validation),
+      test: compactSegment(chronological.test)
+    }
   };
 }
 
@@ -388,6 +587,148 @@ function garmanKlassVolatility(candles) {
   return Math.sqrt(Math.max(0, variance));
 }
 
+function rogersSatchellVolatility(candles) {
+  const sample = candles.slice(-20).filter((item) => item.open > 0 && item.high > 0 && item.low > 0 && item.close > 0);
+  if (sample.length < 5) return null;
+  const variance = mean(sample.map((item) =>
+    Math.log(item.high / item.open) * Math.log(item.high / item.close) +
+    Math.log(item.low / item.open) * Math.log(item.low / item.close)
+  ));
+  return Math.sqrt(Math.max(0, variance));
+}
+
+function yangZhangVolatility(candles) {
+  const sample = candles.slice(-21).filter((item) => item.open > 0 && item.high > 0 && item.low > 0 && item.close > 0);
+  if (sample.length < 6) return null;
+  const overnight = [];
+  const openClose = [];
+  const rs = [];
+  for (let index = 1; index < sample.length; index += 1) {
+    const item = sample[index];
+    overnight.push(Math.log(item.open / sample[index - 1].close));
+    openClose.push(Math.log(item.close / item.open));
+    rs.push(
+      Math.log(item.high / item.open) * Math.log(item.high / item.close) +
+      Math.log(item.low / item.open) * Math.log(item.low / item.close)
+    );
+  }
+  const count = openClose.length;
+  const k = 0.34 / (1.34 + (count + 1) / Math.max(count - 1, 1));
+  return Math.sqrt(Math.max(0, std(overnight) ** 2 + k * std(openClose) ** 2 + (1 - k) * mean(rs)));
+}
+
+function standardizedMoment(values, order) {
+  const sample = values.filter(Number.isFinite);
+  const deviation = std(sample);
+  if (sample.length < 8 || deviation <= 0) return null;
+  const average = mean(sample);
+  const moment = mean(sample.map((value) => ((value - average) / deviation) ** order));
+  return order === 4 ? moment - 3 : moment;
+}
+
+function bipowerJumpRatio(values) {
+  const sample = values.slice(-30).filter(Number.isFinite);
+  if (sample.length < 8) return null;
+  const realizedVariance = sample.reduce((sum, value) => sum + value ** 2, 0);
+  let bipower = 0;
+  for (let index = 1; index < sample.length; index += 1) bipower += Math.abs(sample[index]) * Math.abs(sample[index - 1]);
+  bipower *= Math.PI / 2;
+  return realizedVariance > 0 ? clamp((realizedVariance - bipower) / realizedVariance, 0, 1) : 0;
+}
+
+function discreteEntropy(values) {
+  const sample = values.slice(-30).filter(Number.isFinite);
+  if (sample.length < 8) return null;
+  const scale = Math.max(std(sample) * 0.25, 1e-12);
+  const counts = [0, 0, 0];
+  for (const value of sample) counts[value < -scale ? 0 : value > scale ? 2 : 1] += 1;
+  const entropy = counts.reduce((sum, count) => {
+    if (!count) return sum;
+    const probability = count / sample.length;
+    return sum - probability * Math.log(probability);
+  }, 0);
+  return entropy / Math.log(3);
+}
+
+function linearTrend(values) {
+  const sample = values.slice(-20).filter((value) => value > 0).map(Math.log);
+  if (sample.length < 8) return { slope: null, r2: null };
+  const xMean = (sample.length - 1) / 2;
+  const yMean = mean(sample);
+  let covariance = 0;
+  let xVariance = 0;
+  let yVariance = 0;
+  for (let index = 0; index < sample.length; index += 1) {
+    covariance += (index - xMean) * (sample[index] - yMean);
+    xVariance += (index - xMean) ** 2;
+    yVariance += (sample[index] - yMean) ** 2;
+  }
+  const slope = xVariance > 0 ? covariance / xVariance : 0;
+  const r2 = xVariance > 0 && yVariance > 0 ? clamp(covariance ** 2 / (xVariance * yVariance), 0, 1) : 0;
+  return { slope, r2 };
+}
+
+function moneyFlowIndex(candles) {
+  const sample = candles.slice(-15);
+  if (sample.length < 6) return null;
+  let positive = 0;
+  let negative = 0;
+  for (let index = 1; index < sample.length; index += 1) {
+    const typical = (sample[index].high + sample[index].low + sample[index].close) / 3;
+    const previous = (sample[index - 1].high + sample[index - 1].low + sample[index - 1].close) / 3;
+    const flow = typical * safeNumber(sample[index].volume);
+    if (typical >= previous) positive += flow;
+    else negative += flow;
+  }
+  if (positive + negative <= 0) return null;
+  const mfi = negative > 0 ? 100 - 100 / (1 + positive / negative) : 100;
+  return clamp((mfi - 50) / 50, -1, 1);
+}
+
+function chaikinMoneyFlow(candles) {
+  const sample = candles.slice(-20);
+  let weighted = 0;
+  let volume = 0;
+  for (const item of sample) {
+    const range = safeNumber(item.high) - safeNumber(item.low);
+    const itemVolume = safeNumber(item.volume);
+    if (range <= 0 || itemVolume <= 0) continue;
+    weighted += ((2 * safeNumber(item.close) - item.high - item.low) / range) * itemVolume;
+    volume += itemVolume;
+  }
+  return volume > 0 ? clamp(weighted / volume, -1, 1) : null;
+}
+
+function accumulationDistributionSlope(candles) {
+  const sample = candles.slice(-20);
+  const flows = sample.map((item) => {
+    const range = safeNumber(item.high) - safeNumber(item.low);
+    return range > 0 ? ((2 * safeNumber(item.close) - item.high - item.low) / range) * safeNumber(item.volume) : 0;
+  });
+  const scale = flows.reduce((sum, value) => sum + Math.abs(value), 0);
+  return flows.length >= 6 && scale > 0 ? clamp(flows.reduce((sum, value) => sum + value, 0) / scale, -1, 1) : null;
+}
+
+function easeOfMovement(candles) {
+  const sample = candles.slice(-15);
+  const values = [];
+  for (let index = 1; index < sample.length; index += 1) {
+    const midpoint = (sample[index].high + sample[index].low) / 2;
+    const previousMidpoint = (sample[index - 1].high + sample[index - 1].low) / 2;
+    const range = Math.max(sample[index].high - sample[index].low, 1e-12);
+    values.push((midpoint - previousMidpoint) * range / Math.max(safeNumber(sample[index].volume), 1e-12));
+  }
+  const scale = mean(values.map(Math.abs));
+  return values.length >= 5 && scale > 0 ? clamp(mean(values) / (3 * scale), -1, 1) : null;
+}
+
+function median(values) {
+  const sample = values.filter(Number.isFinite).sort((left, right) => left - right);
+  if (!sample.length) return null;
+  const middle = Math.floor(sample.length / 2);
+  return sample.length % 2 ? sample[middle] : (sample[middle - 1] + sample[middle]) / 2;
+}
+
 function factorSetting(config, definition) {
   const override = config.factorSettings?.[definition.id] || {};
   return {
@@ -490,7 +831,9 @@ export function createFactorLibraryStatus() {
     lastAdjustmentAt: null,
     weightVersion: 1,
     effectiveWeights: {},
+    weightDiagnostics: null,
     pendingFrames: [],
+    lastRealtimeIcAt: {},
     metrics: {},
     latestBySymbol: {},
     latestFactorAvailability: {},
@@ -507,14 +850,21 @@ export function createFactorLibraryStatus() {
       lastRetiredAt: null,
       activeLimit: MAX_ACTIVE_MINED_FACTORS,
       archiveLimit: MAX_RETIRED_MINED_FACTORS,
+      algorithm: "deterministic_typed_beam_search_v1",
+      maxExpressionDepth: 2,
+      validationMethod: "chronological_60_20_20_hac_fdr",
       currentActivity: "idle"
     },
     dataSources: {},
     historicalBackfill: {
       version: HISTORICAL_BACKFILL_VERSION,
       samplingMode: null,
+      attemptedSamplingMode: null,
+      sourcePolicy: null,
+      attemptedSourcePolicy: null,
       status: "not_started",
-      source: "OKX public historical candles",
+      background: false,
+      source: "Binance Futures + OKX public historical candles",
       intervalMinutes: 15,
       lookbackMonths: 3,
       symbols: 0,
@@ -597,6 +947,7 @@ export function normalizeFactorLibraryStatus(value = {}) {
     weightVersion: Math.max(1, Math.round(safeNumber(raw.weightVersion, 1))),
     effectiveWeights,
     pendingFrames,
+    lastRealtimeIcAt: raw.lastRealtimeIcAt && typeof raw.lastRealtimeIcAt === "object" ? raw.lastRealtimeIcAt : {},
     metrics,
     latestBySymbol,
     latestFactorAvailability,
@@ -640,8 +991,11 @@ function factorValueMap(context) {
   const ema5 = ema(closes1m.slice(-60), 5);
   const ema20 = ema(closes1m.slice(-90), 20);
   const previousEma20 = ema(closes1m.slice(-91, -1), 20);
+  const ema10 = ema(closes1m.slice(-90), 10);
+  const ema50 = ema(closes1m.slice(-120), 50);
   const macd = macdHistogram(closes1m);
   const currentRsi = rsi(closes1m);
+  const trend20 = linearTrend(closes1m);
   const channel = candles1m.slice(-21, -1);
   const channelHigh = channel.length ? Math.max(...channel.map((item) => item.high)) : null;
   const channelLow = channel.length ? Math.min(...channel.map((item) => item.low)) : null;
@@ -653,6 +1007,9 @@ function factorValueMap(context) {
   const downside = returns1m.slice(-30).filter((value) => value < 0);
   const jumpThreshold = Math.max(3 * std(returns1m.slice(-60)), 1e-9);
   const jumpValues = returns1m.slice(-30).filter((value) => Math.abs(value) >= jumpThreshold);
+  const upside = returns1m.slice(-30).filter((value) => value > 0);
+  const rollingVolatility = [];
+  for (let end = 10; end <= returns1m.length; end += 5) rollingVolatility.push(std(returns1m.slice(Math.max(0, end - 10), end)));
   let obv = 0;
   const obvSeries = [];
   for (let index = 1; index < candles1m.length; index += 1) {
@@ -683,11 +1040,62 @@ function factorValueMap(context) {
   const sourceCount = new Set((context.eventAggregate?.events || []).map((item) => item.source).filter(Boolean)).size;
   const sessionKey = String(context.sessionContext?.policyKey || "off_hours");
   const sessionSignal = sessionKey.includes("overlap") ? 0.2 : sessionKey === "europe" ? 0.15 : sessionKey === "us" ? 0.1 : sessionKey === "asia" ? 0 : -0.2;
+  const oscillatorWindow = candles1m.slice(-14);
+  const oscillatorHigh = oscillatorWindow.length ? Math.max(...oscillatorWindow.map((item) => safeNumber(item.high))) : null;
+  const oscillatorLow = oscillatorWindow.length ? Math.min(...oscillatorWindow.map((item) => safeNumber(item.low))) : null;
+  const stochasticPosition = oscillatorHigh > oscillatorLow ? (latest - oscillatorLow) / (oscillatorHigh - oscillatorLow) : null;
+  const williamsPositions = [0, 1, 2].map((offset) => {
+    const end = candles1m.length - offset;
+    const sample = candles1m.slice(Math.max(0, end - 21), end);
+    const high = sample.length ? Math.max(...sample.map((item) => safeNumber(item.high))) : null;
+    const low = sample.length ? Math.min(...sample.map((item) => safeNumber(item.low))) : null;
+    const close = safeNumber(sample.at(-1)?.close);
+    return high > low && close > 0 ? (close - low) / (high - low) : null;
+  }).filter((value) => value != null);
+  const bollingerSample = closes1m.slice(-20);
+  const bollingerDeviation = std(bollingerSample);
+  const typicalPrices = candles1m.slice(-20).map((item) => (safeNumber(item.high) + safeNumber(item.low) + safeNumber(item.close)) / 3);
+  const typicalMean = mean(typicalPrices);
+  const typicalDeviation = mean(typicalPrices.map((value) => Math.abs(value - typicalMean)));
+  const aroonWindow = candles1m.slice(-25);
+  const aroonHighIndex = aroonWindow.length ? aroonWindow.reduce((best, item, index, array) => item.high >= array[best].high ? index : best, 0) : -1;
+  const aroonLowIndex = aroonWindow.length ? aroonWindow.reduce((best, item, index, array) => item.low <= array[best].low ? index : best, 0) : -1;
+  const forceValues = candles1m.slice(-11).slice(1).map((item, index, sample) => {
+    const previous = candles1m.slice(-11)[index];
+    return (safeNumber(item.close) - safeNumber(previous?.close)) * safeNumber(item.volume);
+  });
+  const forceScale = forceValues.reduce((sum, value) => sum + Math.abs(value), 0);
+  const weightedMomentumRows = candles1m.slice(-16);
+  let weightedMomentum = 0;
+  let weightedMomentumVolume = 0;
+  for (let index = 1; index < weightedMomentumRows.length; index += 1) {
+    const previous = safeNumber(weightedMomentumRows[index - 1].close);
+    const volume = safeNumber(weightedMomentumRows[index].volume);
+    if (previous <= 0 || volume <= 0) continue;
+    weightedMomentum += (weightedMomentumRows[index].close / previous - 1) * volume;
+    weightedMomentumVolume += volume;
+  }
+  const topDepthQuote = safeNumber(micro.topDepthQuote);
+  const visibleDepthQuote = safeNumber(micro.bidDepthQuote) + safeNumber(micro.askDepthQuote);
+  const flow5 = micro.flow5s || {};
+  const flowPersistence = micro.tradeAvailable
+    ? Math.sign(safeNumber(flow5.imbalance)) === Math.sign(safeNumber(flow30.imbalance))
+      ? mean([safeNumber(flow5.imbalance), safeNumber(flow30.imbalance)])
+      : mean([safeNumber(flow5.imbalance), safeNumber(flow30.imbalance)]) * 0.25
+    : null;
+  const directionalDerivatives = [
+    ret15 == null ? null : clamp(Math.sign(safeNumber(market.oiChange)) * ret15 / 0.015, -1, 1),
+    finiteOrNull(derivatives.takerImbalance),
+    finiteOrNull(derivatives.liquidationImbalance)
+  ];
 
   return {
     return_1m: barMinutes === 1 ? normalizeSignal(roc(closes1m, 1), 0.003) : null,
+    return_3m: barMinutes <= 3 ? normalizeSignal(roc(closes1m, barsForMinutes(3)), 0.005) : null,
     return_5m: barMinutes <= 5 ? normalizeSignal(roc(closes1m, barsForMinutes(5)), 0.008) : null,
+    return_10m: barMinutes <= 10 ? normalizeSignal(roc(closes1m, barsForMinutes(10)), 0.012) : null,
     return_15m: normalizeSignal(ret15, 0.015),
+    return_30m: normalizeSignal(roc(closes1m, barsForMinutes(30)), 0.022),
     return_1h: normalizeSignal(ret1h, 0.03),
     ema_spread_5_20: latest > 0 && ema20 > 0 ? clamp((ema5 - ema20) / priceScale, -1, 1) : null,
     ema_slope_20: latest > 0 && previousEma20 > 0 ? clamp((ema20 - previousEma20) / Math.max(priceScale * 0.25, 1e-9), -1, 1) : null,
@@ -697,6 +1105,18 @@ function factorValueMap(context) {
       ? clamp(((latest - channelLow) / (channelHigh - channelLow) - 0.5) * 2, -1, 1)
       : null,
     rsi_reversal: currentRsi == null ? null : clamp((50 - currentRsi) / 25, -1, 1),
+    ema_spread_10_50: latest > 0 && ema50 > 0 ? clamp((ema10 - ema50) / Math.max(priceScale * 1.5, 1e-9), -1, 1) : null,
+    price_acceleration_5_20: normalizeSignal(
+      safeNumber(roc(closes1m, barsForMinutes(5))) - safeNumber(roc(closes1m, barsForMinutes(20))),
+      0.015
+    ),
+    linear_trend_slope_20: trend20.slope == null ? null : clamp(trend20.slope / Math.max(realized, 1e-6), -1, 1),
+    trend_fit_r2_20: trend20.r2,
+    stochastic_reversal: stochasticPosition == null ? null : clamp(1 - 2 * stochasticPosition, -1, 1),
+    williams_r_reversal: williamsPositions.length === 3 ? clamp(1 - 2 * mean(williamsPositions), -1, 1) : null,
+    bollinger_reversal: bollingerDeviation > 0 ? clamp(-(latest - mean(bollingerSample)) / (2 * bollingerDeviation), -1, 1) : null,
+    cci_reversal: typicalDeviation > 0 ? clamp(-(typicalPrices.at(-1) - typicalMean) / (0.015 * typicalDeviation * 200), -1, 1) : null,
+    aroon_oscillator: aroonWindow.length >= 8 ? clamp((aroonHighIndex - aroonLowIndex) / Math.max(aroonWindow.length - 1, 1), -1, 1) : null,
     realized_volatility: realized > 0 ? clamp(realized / 0.02, 0, 1) : null,
     volatility_zscore: baselineVols.length ? clamp(safeNumber(zscore(realized, baselineVols)) / 3, -1, 1) : null,
     range_expansion: currentRange && ranges.length > 5 ? clamp(currentRange / Math.max(mean(ranges.slice(-21, -1)), 1e-9) - 1, -1, 1) : null,
@@ -705,6 +1125,14 @@ function factorValueMap(context) {
     garman_klass_volatility: garmanKlassVolatility(candles1m),
     downside_semivolatility: downside.length ? clamp(std(downside) / 0.02, 0, 1) : 0,
     jump_intensity: returns1m.length >= 30 ? clamp(jumpValues.length / 5, 0, 1) : null,
+    rogers_satchell_volatility: rogersSatchellVolatility(candles1m),
+    yang_zhang_volatility: yangZhangVolatility(candles1m),
+    upside_semivolatility: upside.length ? clamp(std(upside) / 0.02, 0, 1) : 0,
+    realized_skewness: normalizeSignal(standardizedMoment(returns1m.slice(-30), 3), 3),
+    realized_kurtosis: normalizeSignal(standardizedMoment(returns1m.slice(-30), 4), 10),
+    bipower_jump_ratio: bipowerJumpRatio(returns1m),
+    volatility_of_volatility: rollingVolatility.length >= 5 ? clamp(std(rollingVolatility) / Math.max(mean(rollingVolatility), 1e-9), 0, 1) : null,
+    return_entropy: discreteEntropy(returns1m),
     volume_zscore: currentVolume != null && recentVolume.length > 10 ? clamp(safeNumber(zscore(currentVolume, recentVolume.slice(0, -1))) / 3, -1, 1) : null,
     volume_roc: recentVolume.length > 6 ? normalizeSignal(roc(recentVolume, 5), 1) : null,
     obv_slope: obvDelta == null || obvScale <= 0 ? null : clamp(obvDelta / obvScale, -1, 1),
@@ -715,6 +1143,18 @@ function factorValueMap(context) {
     average_trade_size: safeNumber(flow30.tradeCount) > 0 ? clamp(quoteForImpact / flow30.tradeCount / 50_000, 0, 1) : null,
     buy_sell_volume_divergence: totalQuote > 0 ? clamp((2 * takerBuy - totalQuote) / totalQuote, -1, 1) : null,
     price_volume_correlation: priceVolumeCorrelation(candles1m),
+    money_flow_index: moneyFlowIndex(candles1m),
+    chaikin_money_flow: chaikinMoneyFlow(candles1m),
+    accumulation_distribution_slope: accumulationDistributionSlope(candles1m),
+    force_index: forceScale > 0 ? clamp(forceValues.reduce((sum, value) => sum + value, 0) / forceScale, -1, 1) : null,
+    ease_of_movement: easeOfMovement(candles1m),
+    volume_weighted_momentum: weightedMomentumVolume > 0 ? normalizeSignal(weightedMomentum / weightedMomentumVolume, 0.01) : null,
+    volume_trend_confirmation: ret15 == null || recentVolume.length <= 6 ? null : clamp(
+      normalizeSignal(ret15, 0.015) * Math.sign(safeNumber(roc(recentVolume, 5))) * Math.min(1, Math.abs(safeNumber(roc(recentVolume, 5)))),
+      -1,
+      1
+    ),
+    signed_trade_intensity: micro.tradeAvailable ? clamp(safeNumber(flow30.imbalance) * clamp(safeNumber(flow30.tradeCount) / 50, 0, 1), -1, 1) : null,
     spread_bps: micro.bookAvailable ? clamp(safeNumber(micro.spreadBps) / 10, 0, 1) : null,
     microprice_bias: micro.bookAvailable ? clamp(safeNumber(micro.microPriceBiasBps) / 3, -1, 1) : null,
     depth_imbalance_l1: micro.bookAvailable ? finiteOrNull(micro.topBookImbalance) : null,
@@ -727,6 +1167,17 @@ function factorValueMap(context) {
     liquidity_void: micro.bookAvailable ? finiteOrNull(micro.liquidityVoid) : null,
     kyle_lambda_proxy: quoteForImpact > 0 ? clamp(Math.abs(returnForImpact) / quoteForImpact * 1e9, 0, 1) : null,
     amihud_illiquidity: last15mQuote > 0 && ret15 != null ? clamp(Math.abs(ret15) / last15mQuote * 1e9, 0, 1) : null,
+    quoted_depth: micro.bookAvailable && visibleDepthQuote > 0 ? clamp(Math.log1p(visibleDepthQuote) / Math.log1p(10_000_000), 0, 1) : null,
+    depth_concentration: micro.bookAvailable && visibleDepthQuote > 0 && topDepthQuote > 0 ? clamp(topDepthQuote / visibleDepthQuote, 0, 1) : null,
+    weighted_book_pressure: micro.bookAvailable ? clamp(0.6 * safeNumber(micro.topBookImbalance) + 0.4 * safeNumber(micro.orderBookImbalance), -1, 1) : null,
+    order_flow_persistence: flowPersistence == null ? null : clamp(flowPersistence, -1, 1),
+    cancel_to_add_ratio: micro.bookAvailable && bookAdd > 0 ? clamp(bookCancel / bookAdd / 3, 0, 1) : null,
+    depth_adjusted_ofi: micro.available && visibleDepthQuote > 0 ? clamp(
+      safeNumber(micro.signal) * clamp(safeNumber(micro.tradeConfidence) + safeNumber(micro.bookFlowConfidence), 0, 1) *
+      clamp(Math.log1p(visibleDepthQuote) / Math.log1p(1_000_000), 0.2, 1),
+      -1,
+      1
+    ) : null,
     funding_zscore: fundingZ == null ? null : clamp(fundingZ / 3, -1, 1),
     funding_price_divergence: fundingZ == null || ret1h == null ? null : clamp(-Math.sign(fundingZ) * Math.abs(ret1h / 0.03) * Math.min(1, Math.abs(fundingZ) / 2), -1, 1),
     open_interest_change: finiteOrNull(market.oiChange),
@@ -735,6 +1186,19 @@ function factorValueMap(context) {
     liquidation_imbalance: finiteOrNull(derivatives.liquidationImbalance),
     long_short_ratio: finiteOrNull(derivatives.longShortContrarian),
     basis_volatility: finiteOrNull(derivatives.basisVolatility),
+    taker_oi_confirmation: finiteOrNull(derivatives.takerImbalance) == null ? null : clamp(
+      safeNumber(derivatives.takerImbalance) * Math.sign(safeNumber(market.oiChange)) * Math.sqrt(Math.min(1, Math.abs(safeNumber(market.oiChange)))),
+      -1,
+      1
+    ),
+    liquidation_price_confirmation: finiteOrNull(derivatives.liquidationImbalance) == null || ret15 == null ? null : clamp(
+      safeNumber(derivatives.liquidationImbalance) * Math.sign(ret15) * Math.min(1, Math.abs(ret15) / 0.015),
+      -1,
+      1
+    ),
+    leverage_crowding_risk: fundingZ == null ? null : clamp(Math.abs(fundingZ) / 3 * Math.min(1, Math.abs(safeNumber(market.oiChange))), 0, 1),
+    basis_dislocation_risk: basis == null ? null : clamp(Math.abs(basis) / 0.005, 0, 1),
+    derivatives_consensus: directionalDerivatives.filter((value) => value != null).length >= 2 ? clamp(median(directionalDerivatives), -1, 1) : null,
     btc_beta_residual: finiteOrNull(context.crossAsset?.btcBetaResidual),
     eth_btc_relative_strength: finiteOrNull(context.crossAsset?.ethBtcRelativeStrength),
     cross_section_momentum_rank: finiteOrNull(context.crossAsset?.momentumRank),
@@ -743,6 +1207,11 @@ function factorValueMap(context) {
     market_session: sessionSignal,
     news_impact_decay: eventScore > 0 ? clamp(eventDirection * eventScore, -1, 1) : 0,
     event_source_consensus: sourceCount > 0 ? clamp(eventDirection * Math.min(1, sourceCount / 3) * Math.min(1, eventCount / 3), -1, 1) : 0
+    ,btc_lead_lag: finiteOrNull(context.crossAsset?.btcLeadLag),
+    market_breadth: finiteOrNull(context.crossAsset?.marketBreadth),
+    cross_section_dispersion: finiteOrNull(context.crossAsset?.crossSectionDispersion),
+    beta_instability: finiteOrNull(context.crossAsset?.betaInstability),
+    cross_section_residual_momentum: finiteOrNull(context.crossAsset?.residualMomentum)
   };
 }
 
@@ -752,11 +1221,20 @@ function crossAssetContext(items) {
   const eth = bySymbol.get("ETHUSDT")?.market;
   const momentum = items.map((item) => ({ symbol: item.market.symbol, value: safeNumber(roc(item.factorContext?.candles15m?.map((candle) => candle.close) || [], 1)) }));
   const ranked = rank(momentum.map((item) => item.value));
+  const crossSectionMean = mean(momentum.map((item) => item.value));
+  const crossSectionDispersion = std(momentum.map((item) => item.value));
+  const marketBreadth = momentum.length
+    ? momentum.reduce((sum, item) => sum + (item.value > 0 ? 1 : item.value < 0 ? 0 : 0.5), 0) / momentum.length * 2 - 1
+    : null;
   return Object.fromEntries(items.map((item) => {
     const marketReturns = item.market.returns15m || [];
     const btcReturns = btc?.returns15m || [];
     const betaDenominator = correlation(btcReturns, btcReturns);
     const beta = betaDenominator ? safeNumber(correlation(marketReturns, btcReturns)) * std(marketReturns) / Math.max(std(btcReturns), 1e-9) : 0;
+    const shortMarketReturns = marketReturns.slice(-10);
+    const shortBtcReturns = btcReturns.slice(-10);
+    const shortBeta = safeNumber(correlation(shortMarketReturns, shortBtcReturns)) * std(shortMarketReturns) / Math.max(std(shortBtcReturns), 1e-9);
+    const longBeta = safeNumber(correlation(marketReturns.slice(-30), btcReturns.slice(-30))) * std(marketReturns.slice(-30)) / Math.max(std(btcReturns.slice(-30)), 1e-9);
     const ownReturn = safeNumber(momentum.find((entry) => entry.symbol === item.market.symbol)?.value);
     const btcReturn = safeNumber(momentum.find((entry) => entry.symbol === "BTCUSDT")?.value);
     const ethReturn = safeNumber(momentum.find((entry) => entry.symbol === "ETHUSDT")?.value);
@@ -765,18 +1243,18 @@ function crossAssetContext(items) {
       btcBetaResidual: clamp((ownReturn - beta * btcReturn) / 0.02, -1, 1),
       ethBtcRelativeStrength: clamp((ownReturn - mean([btcReturn, ethReturn])) / 0.02, -1, 1),
       momentumRank: ranked.length > 1 ? (ranked[rankIndex] - 1) / (ranked.length - 1) * 2 - 1 : 0,
-      btcCorrelation: finiteOrNull(correlation(marketReturns, btcReturns))
+      btcCorrelation: finiteOrNull(correlation(marketReturns, btcReturns)),
+      btcLeadLag: btcReturns.length >= 2 ? clamp((safeNumber(btcReturns.at(-2)) - ownReturn) / 0.02, -1, 1) : null,
+      marketBreadth,
+      crossSectionDispersion: crossSectionDispersion > 0 ? clamp(Math.abs(ownReturn - crossSectionMean) / (3 * crossSectionDispersion), 0, 1) : 0,
+      betaInstability: marketReturns.length >= 10 && btcReturns.length >= 10 ? clamp(Math.abs(shortBeta - longBeta) / 2, 0, 1) : null,
+      residualMomentum: clamp((ownReturn - crossSectionMean) / 0.02, -1, 1)
     }];
   }));
 }
 
 function minedValue(definition, values) {
-  const left = finiteOrNull(values[definition.leftId]);
-  const right = finiteOrNull(values[definition.rightId]);
-  if (left == null || right == null) return null;
-  if (definition.operator === "difference") return clamp((left - right) / 2, -1, 1);
-  if (definition.operator === "agreement") return clamp(((left + right) / 2) * (1 - Math.abs(left - right) / 2), -1, 1);
-  return clamp((left + right) / 2, -1, 1);
+  return evaluateExpression(minedExpression(definition), values);
 }
 
 export function buildFactorSnapshots({ marketResults = [], eventsBySymbol = {}, sessionContext = null, status = null }) {
@@ -815,12 +1293,29 @@ export function buildHistoricalFactorFrames({ seriesBySymbol = {}, intervalMinut
   ]));
   const frames = [];
   const warmup = 95;
+  const anchorStep = Math.max(1, Math.round(60 / Math.max(1, intervalMinutes)));
   for (let index = warmup; index < commonTimes.length; index += Math.max(1, Math.round(stride))) {
     const capturedAt = new Date(commonTimes[index]).toISOString();
-    const marketResults = symbols.map((symbol) => {
+    const aligned = symbols.map((symbol) => {
       const series = seriesBySymbol[symbol];
       const candleIndex = timeIndexes[symbol].get(commonTimes[index]) ?? -1;
       if (candleIndex < warmup) return null;
+      return { symbol, series, candleIndex, candle: series[candleIndex] };
+    }).filter(Boolean);
+    if (aligned.length < MIN_CROSS_SECTION_SYMBOLS) continue;
+    const prices = Object.fromEntries(aligned.map(({ symbol, candle }) => [symbol, candle.close]));
+    const isAnchor = (index - warmup) % anchorStep === 0;
+    if (!isAnchor) {
+      frames.push({
+        capturedAt,
+        intervalMinutes,
+        source: "historical_public_candles",
+        prices,
+        values: {}
+      });
+      continue;
+    }
+    const marketResults = aligned.map(({ symbol, series, candleIndex }) => {
       const candles = series.slice(Math.max(0, candleIndex - 119), candleIndex + 1);
       const latest = candles.at(-1)?.close;
       const returns15m = candles.slice(1).map((candle, offset) => {
@@ -846,14 +1341,13 @@ export function buildHistoricalFactorFrames({ seriesBySymbol = {}, intervalMinut
           derivatives: { sources: { historicalCandles: { available: true, updatedAt: capturedAt } } }
         }
       };
-    }).filter(Boolean);
-    if (marketResults.length < MIN_CROSS_SECTION_SYMBOLS) continue;
+    });
     const snapshots = buildFactorSnapshots({ marketResults, status: normalizedStatus });
     frames.push({
       capturedAt,
       intervalMinutes,
       source: "historical_public_candles",
-      prices: Object.fromEntries(snapshots.map((snapshot) => [snapshot.symbol, snapshot.price])),
+      prices,
       values: Object.fromEntries(snapshots.map((snapshot) => [snapshot.symbol, snapshot.values]))
     });
   }
@@ -912,8 +1406,17 @@ function constrainedWeights(definitions, rawScores, config) {
 }
 
 function metricSummary(values, coverageValues, sourceValues = []) {
-  const sample = values.filter(Number.isFinite).slice(-MAX_IC_OBSERVATIONS);
-  const retainedSources = sourceValues.slice(-sample.length);
+  const normalized = values.map((value, index) => ({
+    value,
+    coverage: coverageValues[index],
+    source: sourceValues.length === values.length ? sourceValues[index] : 1
+  })).filter((item) => Number.isFinite(item.value));
+  const historical = normalized.filter((item) => item.source === 0).slice(-MAX_HISTORICAL_IC_OBSERVATIONS);
+  const realtime = normalized.filter((item) => item.source !== 0).slice(-MAX_REALTIME_IC_OBSERVATIONS);
+  const retained = [...historical, ...realtime];
+  const sample = retained.map((item) => item.value);
+  const retainedCoverage = retained.map((item) => Number.isFinite(item.coverage) ? item.coverage : null);
+  const retainedSources = retained.map((item) => item.source === 0 ? 0 : 1);
   const average = mean(sample);
   const deviation = std(sample);
   return {
@@ -922,12 +1425,12 @@ function metricSummary(values, coverageValues, sourceValues = []) {
     icStd: round(deviation),
     icir: round(deviation > 0 ? average / deviation : 0),
     tStatistic: round(deviation > 0 ? average / (deviation / Math.sqrt(sample.length)) : 0),
-    coverage: round(mean(coverageValues.filter(Number.isFinite).slice(-MAX_IC_OBSERVATIONS))),
-    lastIc: round(sample.at(-1)),
-    historySamples: retainedSources.filter((source) => source === 0).length,
-    realtimeSamples: retainedSources.filter((source) => source === 1).length,
+    coverage: round(mean(retainedCoverage.filter(Number.isFinite))),
+    lastIc: round((realtime.at(-1) || historical.at(-1))?.value),
+    historySamples: historical.length,
+    realtimeSamples: realtime.length,
     values: sample,
-    coverageValues: coverageValues.filter(Number.isFinite).slice(-MAX_IC_OBSERVATIONS),
+    coverageValues: retainedCoverage,
     sourceValues: retainedSources
   };
 }
@@ -963,6 +1466,10 @@ function removeHistoricalMetricObservations(status) {
   }
 }
 
+function factorIcTarget(definition, forwardReturn) {
+  return definition?.role === "direction" ? forwardReturn : Math.abs(forwardReturn);
+}
+
 function resolvePendingFrames(status, snapshots, nowMs, definitions, horizons) {
   const currentPrices = Object.fromEntries(snapshots.map((item) => [item.symbol, item.price]));
   for (const frame of status.pendingFrames) {
@@ -971,8 +1478,14 @@ function resolvePendingFrames(status, snapshots, nowMs, definitions, horizons) {
     if (!Number.isFinite(capturedMs)) continue;
     for (const horizon of horizons) {
       if (frame.resolvedHorizons.includes(horizon) || nowMs - capturedMs < horizon * 60_000) continue;
+      const lastSampleMs = Date.parse(status.lastRealtimeIcAt?.[horizon] || "");
+      if (Number.isFinite(lastSampleMs) && capturedMs - lastSampleMs < horizon * 60_000) {
+        frame.resolvedHorizons.push(horizon);
+        continue;
+      }
       const symbols = Object.keys(frame.prices || {}).filter((symbol) => frame.prices[symbol] > 0 && currentPrices[symbol] > 0);
       const forwardReturns = Object.fromEntries(symbols.map((symbol) => [symbol, currentPrices[symbol] / frame.prices[symbol] - 1]));
+      let appended = false;
       for (const definition of definitions) {
         const factorValues = [];
         const targetReturns = [];
@@ -980,12 +1493,14 @@ function resolvePendingFrames(status, snapshots, nowMs, definitions, horizons) {
           const value = finiteOrNull(frame.values?.[symbol]?.[definition.id]);
           if (value == null) continue;
           factorValues.push(value * safeNumber(definition.orientation, 1));
-          targetReturns.push(forwardReturns[symbol]);
+          targetReturns.push(factorIcTarget(definition, forwardReturns[symbol]));
         }
         const ic = spearman(factorValues, targetReturns);
         if (ic == null) continue;
         appendIc(status, definition.id, horizon, ic, factorValues.length / Math.max(symbols.length, 1), "realtime");
+        appended = true;
       }
+      if (appended) status.lastRealtimeIcAt[horizon] = frame.capturedAt;
       frame.resolvedHorizons.push(horizon);
     }
   }
@@ -1021,7 +1536,7 @@ function resolveHistoricalFrames(status, frames, definitions, horizons) {
           const value = finiteOrNull(frame.values?.[symbol]?.[definition.id]);
           if (value == null) continue;
           factorValues.push(value * safeNumber(definition.orientation, 1));
-          targetReturns.push(forwardReturns[symbol]);
+          targetReturns.push(factorIcTarget(definition, forwardReturns[symbol]));
         }
         const ic = spearman(factorValues, targetReturns);
         if (ic == null) continue;
@@ -1050,14 +1565,8 @@ function evidenceOrientation(definition, status) {
     return definition.validationStatus === "validated" ? safeNumber(definition.orientation, 1) : null;
   }
   const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
-  if (
-    safeNumber(metric?.samples) < MIN_SMART_WEIGHT_SAMPLES ||
-    Math.abs(safeNumber(metric?.meanIc)) < 0.02 ||
-    Math.abs(safeNumber(metric?.icir)) < 0.1 ||
-    Math.abs(safeNumber(metric?.tStatistic)) < 2 ||
-    safeNumber(metric?.coverage) < 0.6
-  ) return null;
-  return safeNumber(metric.meanIc) < 0 ? -1 : 1;
+  const evidence = chronologicalFactorEvidence(metric);
+  return evidence.passed ? evidence.orientation : null;
 }
 
 function manualWeights(config, definitions, status) {
@@ -1092,6 +1601,24 @@ function adjustSmartWeights(config, status, definitions, nowMs) {
     const stability = clamp(1 - safeNumber(metric.icStd), 0.05, 1);
     raw[definition.id] = Math.max(0.0001, positiveIc * stability * clamp(safeNumber(metric.coverage), 0, 1));
   }
+  const selected = [];
+  const redundancyPenalty = {};
+  for (const definition of definitions
+    .filter((item) => safeNumber(raw[item.id]) > 0)
+    .sort((left, right) => safeNumber(raw[right.id]) - safeNumber(raw[left.id]))) {
+    const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
+    const maxCorrelation = selected.reduce((maximum, selectedDefinition) => Math.max(
+      maximum,
+      Math.abs(safeNumber(metricEvidenceCorrelation(
+        metric,
+        status.metrics?.[selectedDefinition.id]?.[PRIMARY_IC_HORIZON_MINUTES]
+      )))
+    ), 0);
+    const penalty = clamp(1 - maxCorrelation ** 2, 0.1, 1);
+    raw[definition.id] *= penalty;
+    redundancyPenalty[definition.id] = round(penalty);
+    selected.push(definition);
+  }
   const candidate = constrainedWeights(definitions, raw, config);
   if (!eligible || !Object.keys(candidate).length) return previous;
   const blendedRaw = {};
@@ -1102,6 +1629,11 @@ function adjustSmartWeights(config, status, definitions, nowMs) {
   }
   status.lastAdjustmentAt = new Date(nowMs).toISOString();
   status.weightVersion += 1;
+  status.weightDiagnostics = {
+    method: "IC强度 × 稳定性 × 覆盖率 × IC序列去冗余",
+    redundancyPenalty,
+    generatedAt: new Date(nowMs).toISOString()
+  };
   return constrainedWeights(definitions, blendedRaw, config);
 }
 
@@ -1115,36 +1647,55 @@ function updateMinedValidation(status, nowMs) {
   const candidates = status.minedFactors || [];
   const tests = candidates.map((definition) => {
     const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
-    return { definition, metric, pValue: approximatePValue(metric?.tStatistic) };
-  }).filter((item) => safeNumber(item.metric?.samples) >= MIN_MINED_FACTOR_SAMPLES).sort((a, b) => a.pValue - b.pValue);
+    const evidence = chronologicalFactorEvidence(metric, { minSamples: MIN_MINED_FACTOR_SAMPLES });
+    return { definition, metric, evidence, pValue: approximatePValue(evidence.test.hacTStatistic) };
+  }).filter((item) => item.evidence.hasHoldout).sort((a, b) => a.pValue - b.pValue);
   let bhCutoff = 0;
   tests.forEach((item, index) => {
     if (item.pValue <= ((index + 1) / tests.length) * 0.1) bhCutoff = item.pValue;
   });
   status.minedFactors = candidates.map((definition) => {
     const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
-    const pValue = approximatePValue(metric?.tStatistic);
+    const evidence = chronologicalFactorEvidence(metric, { minSamples: MIN_MINED_FACTOR_SAMPLES });
+    const pValue = approximatePValue(evidence.test.hacTStatistic);
     const validated =
-      safeNumber(metric?.samples) >= MIN_MINED_FACTOR_SAMPLES &&
-      Math.abs(safeNumber(metric?.meanIc)) >= 0.02 &&
-      Math.abs(safeNumber(metric?.icir)) >= 0.3 &&
-      safeNumber(metric?.coverage) >= 0.8 &&
+      evidence.passed &&
       bhCutoff > 0 && pValue <= bhCutoff;
     const validationStatus = validated
       ? "validated"
-      : safeNumber(metric?.samples) >= MIN_MINED_FACTOR_SAMPLES
+      : evidence.hasHoldout
         ? "rejected"
         : "quarantine";
+    const compactSegment = (segment) => ({
+      samples: safeNumber(segment?.samples),
+      meanIc: round(segment?.meanIc),
+      icir: round(segment?.icir),
+      hacTStatistic: round(segment?.hacTStatistic)
+    });
     return {
       ...definition,
       orientation: validated
-        ? (safeNumber(metric?.meanIc) < 0 ? -1 : 1)
+        ? evidence.orientation
         : safeNumber(definition.orientation, 1),
       validationStatus,
+      researchStage: validated ? "shadow_validated" : validationStatus === "rejected" ? "rejected_observation" : "quarantine",
       firstRejectedAt: validationStatus === "rejected"
         ? definition.firstRejectedAt || (definition.validationStatus === "rejected" ? definition.createdAt : null) || now
         : null,
-      validation: { samples: safeNumber(metric?.samples), meanIc: metric?.meanIc ?? null, icir: metric?.icir ?? null, tStatistic: metric?.tStatistic ?? null, pValue: round(pValue), bhCutoff: round(bhCutoff) }
+      validation: {
+        samples: safeNumber(metric?.samples),
+        meanIc: metric?.meanIc ?? null,
+        icir: metric?.icir ?? null,
+        tStatistic: metric?.tStatistic ?? null,
+        pValue: round(pValue),
+        bhCutoff: round(bhCutoff),
+        hasHoldout: evidence.hasHoldout,
+        sameDirection: evidence.sameDirection,
+        realtimeContradiction: evidence.realtimeContradiction,
+        train: compactSegment(evidence.train),
+        validation: compactSegment(evidence.validation),
+        test: compactSegment(evidence.test)
+      }
     };
   });
   status.mining.validatedCount = status.minedFactors.filter((item) => item.validationStatus === "validated").length;
@@ -1211,11 +1762,6 @@ function mineFactor(status, config, definitions, nowMs) {
   if (!config.miningEnabled || status.minedFactors.length >= MAX_ACTIVE_MINED_FACTORS) return;
   const lastRunMs = Date.parse(status.mining.lastRunAt || "");
   if (Number.isFinite(lastRunMs) && nowMs - lastRunMs < config.miningIntervalMinutes * 60_000) return;
-  const candidates = definitions.filter((definition) => definition.origin === "built_in" && definition.role === "direction");
-  const scored = candidates.map((definition) => ({
-    definition,
-    score: Math.abs(safeNumber(status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES]?.meanIc)) + (definition.defaultEnabled ? 0.01 : 0)
-  })).sort((a, b) => b.score - a.score);
   const existing = new Set([
     ...status.minedFactors.map(minedSemanticKey),
     ...(status.retiredMinedFactors || []).map(minedSemanticKey)
@@ -1227,45 +1773,22 @@ function mineFactor(status, config, definitions, nowMs) {
     pairUsage.set(pairKey, safeNumber(pairUsage.get(pairKey)) + 1);
     operatorUsage.set(definition.operator, safeNumber(operatorUsage.get(definition.operator)) + 1);
   }
-  const operators = ["agreement", "blend", "difference"];
-  const candidateSpace = [];
-  for (let leftIndex = 0; leftIndex < Math.min(scored.length, 12); leftIndex += 1) {
-    for (let rightIndex = leftIndex + 1; rightIndex < Math.min(scored.length, 12); rightIndex += 1) {
-      for (const operator of operators) {
-        const left = scored[leftIndex].definition;
-        const right = scored[rightIndex].definition;
-        const semanticKey = minedSemanticKey({ leftId: left.id, rightId: right.id, operator });
-        if (existing.has(semanticKey)) continue;
-        const pairKey = minedPairKey(left.id, right.id);
-        candidateSpace.push({
-          left,
-          right,
-          operator,
-          semanticKey,
-          pairUsage: safeNumber(pairUsage.get(pairKey)),
-          operatorUsage: safeNumber(operatorUsage.get(operator)),
-          parentScore: scored[leftIndex].score + scored[rightIndex].score
-        });
-      }
-    }
-  }
-  candidateSpace.sort((left, right) =>
-    left.pairUsage - right.pairUsage ||
-    left.operatorUsage - right.operatorUsage ||
-    right.parentScore - left.parentScore ||
-    left.semanticKey.localeCompare(right.semanticKey)
-  );
-  const selected = candidateSpace[0] || null;
+  const selected = chooseMiningCandidate({
+    definitions,
+    metrics: status.metrics,
+    blockedSemanticKeys: existing,
+    pairUsage,
+    operatorUsage
+  });
   status.mining.lastRunAt = new Date(nowMs).toISOString();
   status.mining.runCount += 1;
   if (!selected) {
     status.mining.currentActivity = "candidate_space_exhausted";
     return;
   }
-  const orderedParents = [selected.left, selected.right].sort((left, right) => left.id.localeCompare(right.id));
-  const left = orderedParents[0];
-  const right = orderedParents[1];
-  const id = `mined_${selected.operator}_${left.id}_${right.id}`;
+  const left = selected.left;
+  const right = selected.right;
+  const id = `mined_${selected.operator}_${stableSemanticHash(selected.semanticKey)}`;
   status.minedFactors.push(minedFactorPresentation({
     id,
     name: "",
@@ -1282,8 +1805,17 @@ function mineFactor(status, config, definitions, nowMs) {
     leftId: left.id,
     rightId: right.id,
     operator: selected.operator,
+    expression: selected.expression,
+    complexity: selected.complexity,
+    screening: {
+      method: "deterministic_typed_beam_search_v1",
+      parentEvidenceCorrelation: round(selected.redundancy),
+      fitness: round(selected.fitness),
+      passedStaticGate: true
+    },
     createdAt: new Date(nowMs).toISOString(),
-    validationStatus: "quarantine"
+    validationStatus: "quarantine",
+    researchStage: "quarantine"
   }));
   status.mining.currentActivity = `generated:${id}`;
 }
@@ -1339,7 +1871,7 @@ export function updateFactorLibraryRuntime({ config: configValue, status: status
     (
       status.historicalBackfill.status !== "complete" ||
       safeNumber(status.historicalBackfill.version) !== HISTORICAL_BACKFILL_VERSION ||
-      status.historicalBackfill.samplingMode !== "hourly_anchors_non_overlapping_v2"
+      status.historicalBackfill.samplingMode !== FACTOR_HISTORICAL_SAMPLING_MODE
     )
   ) {
     removeHistoricalMetricObservations(status);
@@ -1350,7 +1882,7 @@ export function updateFactorLibraryRuntime({ config: configValue, status: status
     const historicalResolved = resolveHistoricalFrames(status, historicalFrames, definitions, config.horizonsMinutes);
     status.historicalBackfill.status = "complete";
     status.historicalBackfill.version = HISTORICAL_BACKFILL_VERSION;
-    status.historicalBackfill.samplingMode = "hourly_anchors_non_overlapping_v2";
+    status.historicalBackfill.samplingMode = FACTOR_HISTORICAL_SAMPLING_MODE;
     status.historicalBackfill.completedAt = now;
     status.historicalBackfill.resolvedSamples = historicalResolved;
     status.historicalBackfill.startAt = historicalFrames[0]?.capturedAt || null;
@@ -1441,16 +1973,18 @@ export function publicFactorLibrary(configValue, statusValue) {
     const primary = metrics[PRIMARY_IC_HORIZON_MINUTES];
     const availability = status.latestFactorAvailability?.[definition.id] || definition.retiredAvailability || { availableSymbols: 0, totalSymbols: 0, coverage: 0, meanValue: null };
     const primaryMeanIc = safeNumber(primary?.meanIc);
-    const primaryIcIr = safeNumber(primary?.icir);
-    const primaryT = safeNumber(primary?.tStatistic);
-    const primaryCoverage = safeNumber(primary?.coverage);
     const evidenceStatus = availability.availableSymbols <= 0
       ? "data_unavailable"
-      : safeNumber(primary?.samples) < MIN_SMART_WEIGHT_SAMPLES
+      : safeNumber(primary?.samples) < MIN_MINED_FACTOR_SAMPLES || !primary?.holdout?.hasHoldout
         ? "insufficient_samples"
-        : Math.abs(primaryMeanIc) >= 0.02 && Math.abs(primaryIcIr) >= 0.1 && Math.abs(primaryT) >= 2 && primaryCoverage >= 0.6
+        : primary.holdout.passed
           ? primaryMeanIc >= 0 ? "effective" : "inverse_effective"
           : "unstable";
+    const empiricalStage = primary?.holdout?.passed
+      ? "out_of_sample_validated"
+      : safeNumber(primary?.samples) >= MIN_SMART_WEIGHT_SAMPLES
+        ? "observing_unstable"
+        : "collecting_evidence";
     return {
       ...definition,
       ...setting,
@@ -1462,6 +1996,7 @@ export function publicFactorLibrary(configValue, statusValue) {
         : 0,
       availability,
       evidenceStatus,
+      empiricalStage,
       metrics
     };
   });
@@ -1472,6 +2007,8 @@ export function publicFactorLibrary(configValue, statusValue) {
     config,
     counts: {
       total: factors.filter((item) => !item.archived).length,
+      builtIn: factors.filter((item) => item.origin === "built_in" && !item.archived).length,
+      empiricalValidatedBuiltIn: factors.filter((item) => item.origin === "built_in" && item.empiricalStage === "out_of_sample_validated" && !item.archived).length,
       enabled: factors.filter((item) => item.enabled && !item.archived).length,
       inDecision: factors.filter((item) => item.enabled && item.useInDecision && !item.archived).length,
       decisionEligible: eligibleDecisionIds.size,
@@ -1490,16 +2027,31 @@ export function publicFactorLibrary(configValue, statusValue) {
       reason: decisionReady ? null : "通过证据门槛的方向因子不足，因子组合暂不影响交易判断。"
     },
     historicalBackfill: status.historicalBackfill,
+    catalogAudit: FACTOR_CATALOG_AUDIT,
+    researchReferences: FACTOR_RESEARCH_REFERENCES,
+    weightDiagnostics: status.weightDiagnostics || null,
     samplingPolicy: {
       usesPaperPositions: false,
       runsWhenPaperEntriesPaused: true,
       realtimeSource: "public market candles, order book, trades and derivatives statistics",
       historicalSource: status.historicalBackfill.source,
-      icMethod: "cross-sectional Spearman correlation between factor ranks and forward returns"
+      icMethod: "role-aware cross-sectional Spearman rank correlation",
+      icTargets: {
+        direction: "forward return",
+        risk: "absolute forward return",
+        context: "absolute forward return"
+      },
+      validationMethod: "chronological 60/20/20 split, HAC t-statistic, realtime contradiction check and FDR for mined factors",
+      observationRetention: {
+        historicalPerFactorHorizon: MAX_HISTORICAL_IC_OBSERVATIONS,
+        realtimePerFactorHorizon: MAX_REALTIME_IC_OBSERVATIONS,
+        sourcePartitioned: true
+      }
     },
     limitations: [
       "IC is a rolling predictive association, not proof of causality or future profitability.",
-      "Mined factors remain quarantined until sample, ICIR, coverage, t-statistic and multiple-testing gates pass.",
+      "Built-in means the mechanism, data requirements and formula passed catalog checks; it does not mean the factor has passed this market's out-of-sample gate.",
+      "Mined factors remain quarantined until chronological holdout, HAC statistic, coverage, realtime consistency and multiple-testing gates pass.",
       "Rejected mined factors retire only after extended observation; compact evidence is archived and the same semantic formula is not mined again.",
       "Unavailable source data is represented as null and is never replaced with fabricated values."
     ]
