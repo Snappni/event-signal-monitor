@@ -95,7 +95,7 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.18.2";
+const MONITOR_VERSION = "0.18.3";
 const RUN_LAYER = "event-driven-hybrid";
 const LAYER_REPORT_PATH = REPORT_PATH;
 const MESSAGE_FEED_LIMIT = 200;
@@ -4975,7 +4975,7 @@ function marketStreamConfig() {
   const candidateSymbols = [...new Set(rankedCandidates)]
     .filter((symbol) => !positionSymbols.includes(symbol))
     .slice(0, remainingCapacity);
-  const orderFlowSymbols = [...positionSymbols, ...candidateSymbols];
+  const orderFlowSymbols = [...positionSymbols, ...candidateSymbols].sort();
   return {
     ...positions,
     protectionSymbols: positionSymbols,
