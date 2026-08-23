@@ -16,6 +16,7 @@ const trade = (id, closedAt, realizedPnl) => ({
   id,
   sessionId: "session-test",
   status: "closed",
+  calibrationCohort: "layered-multi-factor-v1",
   symbol: "BTCUSDT",
   side: "long",
   openedAt: new Date(Date.parse(closedAt) - 3_600_000).toISOString(),
@@ -72,6 +73,7 @@ try {
   assert.equal(Object.hasOwn(firstPage.records[0], "calculation"), false);
   assert.equal(firstPage.records[0].holdingObservationCount, 10_000);
   assert.equal(firstPage.records[0].decisionCalculation.direction.combinedDirection, 0.7);
+  assert.equal(firstPage.records[0].calibrationCohort, "layered-multi-factor-v1");
   assert.equal(Object.hasOwn(firstPage.records[0].decisionCalculation, "oversized"), false);
 
   const compact = compactArchivedTrade(rows[0]);

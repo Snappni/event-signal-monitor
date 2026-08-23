@@ -122,9 +122,10 @@ try {
   }
   const pageHtml = [indexHtml, summaryHtml, reviewHtml, signalsHtml, messagesHtml, modelsHtml, logsHtml];
   for (const html of pageHtml) {
-    for (const href of ["/", "/summary.html", "/signals.html", "/messages.html", "/models.html", "/logs.html", "/review.html"]) {
+    for (const href of ["/", "/summary.html", "/signals.html", "/messages.html", "/logs.html", "/review.html"]) {
       assert.ok(html.includes(`href="${href}"`), `missing sidebar link ${href}`);
     }
+    assert.ok(!html.includes('href="/models.html"'), "models page must not remain in the sidebar");
   }
   assert.ok(summaryHtml.includes('src="/vendor/echarts.min.js"'));
   assert.ok(modelsHtml.includes('id="signalCalibration"'), "models page must expose the bounded signal outcome dataset");

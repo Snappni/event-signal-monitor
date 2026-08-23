@@ -1,5 +1,7 @@
 const DEFAULT_MIN_SAMPLES = 90;
 const DEFAULT_MIN_SEGMENT_SAMPLES = 18;
+const MAX_MINED_EXPRESSION_DEPTH = 3;
+const MAX_MINED_LEAF_FACTORS = 4;
 
 export const MINING_OPERATOR_META = Object.freeze({
   difference: Object.freeze({
@@ -215,6 +217,11 @@ function expressionDepth(expression) {
   return 1 + Math.max(...(expression.children || []).map(expressionDepth), 0);
 }
 
+export function expressionLeafIds(expression) {
+  if (!expression || expression.type === "factor") return [String(expression?.id || "")].filter(Boolean);
+  return [...new Set((expression.children || []).flatMap(expressionLeafIds))];
+}
+
 export function metricEvidenceCorrelation(leftMetric, rightMetric) {
   const leftHistory = metricSeries(leftMetric, "historical");
   const rightHistory = metricSeries(rightMetric, "historical");
@@ -234,16 +241,20 @@ function parentScore(definition, metric) {
 
 export function chooseMiningCandidate({ definitions = [], metrics = {}, blockedSemanticKeys = new Set(), pairUsage = new Map(), operatorUsage = new Map() }) {
   const parents = definitions
-    .filter((definition) => definition?.role === "direction" && (definition.origin === "built_in" || definition.validationStatus === "validated"))
-    .filter((definition) => expressionDepth(expressionForDefinition(definition)) < 2)
+    .filter((definition) => definition?.role === "direction" && !definition.governanceOnly && (definition.origin === "built_in" || definition.validationStatus === "validated"))
+    .filter((definition) => expressionDepth(expressionForDefinition(definition)) < MAX_MINED_EXPRESSION_DEPTH)
+    .filter((definition) => expressionLeafIds(expressionForDefinition(definition)).length <= MAX_MINED_LEAF_FACTORS)
     .map((definition) => ({ definition, score: parentScore(definition, metrics?.[definition.id]?.[15]) }))
     .sort((left, right) => right.score - left.score || left.definition.id.localeCompare(right.definition.id))
-    .slice(0, 24);
+    .slice(0, 32);
   const candidates = [];
   for (let leftIndex = 0; leftIndex < parents.length; leftIndex += 1) {
     for (let rightIndex = leftIndex + 1; rightIndex < parents.length; rightIndex += 1) {
       const left = parents[leftIndex];
       const right = parents[rightIndex];
+      const leftLeaves = expressionLeafIds(expressionForDefinition(left.definition));
+      const rightLeaves = expressionLeafIds(expressionForDefinition(right.definition));
+      if (leftLeaves.some((id) => rightLeaves.includes(id))) continue;
       const redundancy = Math.abs(finite(metricEvidenceCorrelation(
         metrics?.[left.definition.id]?.[15],
         metrics?.[right.definition.id]?.[15]
@@ -255,7 +266,8 @@ export function chooseMiningCandidate({ definitions = [], metrics = {}, blockedS
           operator,
           children: [expressionForDefinition(left.definition), expressionForDefinition(right.definition)]
         };
-        if (expressionDepth(expression) > 2) continue;
+        const leafIds = expressionLeafIds(expression);
+        if (expressionDepth(expression) > MAX_MINED_EXPRESSION_DEPTH || leafIds.length > MAX_MINED_LEAF_FACTORS) continue;
         const semanticKey = canonicalExpression(expression);
         if (blockedSemanticKeys.has(semanticKey)) continue;
         const pairKey = [left.definition.id, right.definition.id].sort().join("|");
@@ -265,7 +277,9 @@ export function chooseMiningCandidate({ definitions = [], metrics = {}, blockedS
           operator,
           expression,
           semanticKey,
-          complexity: 1 + meta.complexity + expressionDepth(expression),
+          leafIds,
+          leafCount: leafIds.length,
+          complexity: leafIds.length + meta.complexity + expressionDepth(expression),
           pairUsage: finite(pairUsage.get(pairKey)),
           operatorUsage: finite(operatorUsage.get(operator)),
           redundancy,

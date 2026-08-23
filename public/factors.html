@@ -15,7 +15,6 @@
         <a class="toolbar-link" href="/summary.html"><span aria-hidden="true">⌁</span>账户总结</a>
         <a class="toolbar-link" href="/signals.html"><span aria-hidden="true">⌁</span>信号复盘</a>
         <a class="toolbar-link" href="/messages.html"><span aria-hidden="true">◫</span>消息情报</a>
-        <a class="toolbar-link" href="/models.html"><span aria-hidden="true">∿</span>模型计算</a>
         <a class="toolbar-link active" href="/factors.html" aria-current="page"><span aria-hidden="true">ƒ</span>因子库</a>
         <a class="toolbar-link" href="/logs.html"><span aria-hidden="true">≡</span>运行日志</a>
         <a class="toolbar-link" href="/review.html"><span aria-hidden="true">↻</span>迭代复盘</a>
@@ -24,27 +23,29 @@
     </header>
     <main class="detail-page factor-page">
       <section class="page-heading">
-        <div><span class="eyebrow">FACTOR RESEARCH</span><h2>因子库</h2><p>管理方向因子、风险因子和自动挖掘候选；IC 只表示预测相关性，不等于盈利保证</p></div>
+        <div><span class="eyebrow">FACTOR RESEARCH</span><h2>因子库</h2><p>方向、情景、风险因子分别进入独立决策层；IC 只表示预测相关性，不等于盈利保证</p></div>
         <span id="factorRuntimeState" class="live-state"><i></i>因子引擎独立运行</span>
       </section>
       <section class="summary-grid detail-summary factor-summary" aria-label="因子摘要">
         <div class="metric"><span>内置 / 总活跃</span><strong id="factorCount">0 / 0</strong></div>
         <div class="metric"><span>已启用</span><strong id="factorEnabledCount">0</strong></div>
-        <div class="metric"><span>样本外通过 / 当前可交易</span><strong id="factorDecisionCount">0 / 0</strong></div>
+        <div class="metric"><span>样本外通过 / 分层可交易</span><strong id="factorDecisionCount">0 / 0</strong></div>
         <div class="metric"><span>挖掘 / 已验证</span><strong id="factorMinedCount">0 / 0</strong></div>
         <div class="metric"><span>权重版本</span><strong id="factorWeightVersion">v1</strong></div>
         <div class="metric"><span>数据时间</span><strong id="factorGeneratedAt" class="metric-time">-</strong></div>
       </section>
 
       <section class="panel detail-panel factor-settings-panel">
-        <div class="section-title"><h2>运行设置</h2><span id="factorSaveNotice">修改后点击保存</span></div>
+        <div class="section-title"><h2>运行设置</h2><span id="factorSaveNotice">修改后会出现保存栏</span></div>
         <div class="factor-settings-grid">
           <label class="factor-switch"><input id="factorLibraryEnabled" type="checkbox" /><span>启用因子引擎</span></label>
           <label class="factor-switch"><input id="factorIntelligentAdjustment" type="checkbox" /><span>智能自适应权重</span></label>
+          <label class="factor-switch"><input id="factorAutoGovernanceEnabled" type="checkbox" /><span>自动治理方向因子</span></label>
           <label class="factor-switch"><input id="factorMiningEnabled" type="checkbox" /><span>实时自动挖掘</span></label>
-          <label>参与原决策的最大占比<input id="factorDecisionInfluence" type="number" min="0" max="40" step="1" /><span class="input-suffix">%</span></label>
-          <button id="saveFactorConfig" type="button">保存全部设置</button>
+          <label>普通方向因子组合最大融合权重<input id="factorDecisionInfluence" type="number" min="0" max="40" step="1" /><span class="input-suffix">%</span></label>
         </div>
+        <p id="factorAutoGovernanceStatus" class="muted">自动治理未启用；当前只对有平仓反事实证据的方向因子执行自动切换。</p>
+        <p class="factor-policy-note">方向因子只融合方向；情景因子只收缩概率置信度；风险因子只调整止损尺度。普通因子层 4 个有效因子开始参与，默认到 10 个才达到完整强度；模型治理因子沿各自路径启停。</p>
       </section>
 
       <section class="panel detail-panel">
@@ -65,6 +66,9 @@
             <option value="insufficient_samples">样本不足</option>
             <option value="data_unavailable">数据不可用</option>
           </select>
+          <button id="factorIcSort" class="factor-sort-button" type="button" aria-pressed="false" aria-label="按有效IC排序：默认">
+            <span>有效 IC</span><strong id="factorIcSortDirection">默认</strong>
+          </button>
           <label class="factor-switch compact"><input id="factorShowArchived" type="checkbox" /><span>显示已删除</span></label>
         </div>
         <div class="factor-bulk-tools">
@@ -83,6 +87,16 @@
         </div>
       </section>
     </main>
+    <aside id="factorSaveBar" class="factor-save-bar" aria-live="polite" hidden>
+      <div class="factor-save-context">
+        <span class="factor-save-indicator" aria-hidden="true"></span>
+        <div><strong>有未保存的更改</strong><span id="factorSaveMessage">保存后将在下一轮监控中应用</span></div>
+      </div>
+      <div class="factor-save-actions">
+        <button id="discardFactorConfig" type="button" class="factor-save-discard">放弃更改</button>
+        <button id="saveFactorConfig" type="button" class="factor-save-primary">保存更改</button>
+      </div>
+    </aside>
     <script src="/factors.js" type="module"></script>
   </body>
 </html>

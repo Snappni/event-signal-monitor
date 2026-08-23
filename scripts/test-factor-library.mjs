@@ -8,7 +8,10 @@ import {
   buildHistoricalFactorFrames,
   buildFactorSnapshots,
   createFactorLibraryStatus,
+  discreteFourierFeatures,
   factorDecisionForSnapshot,
+  factorLayerHeadsForSnapshot,
+  modelFactorGovernance,
   normalizeFactorLibraryConfig,
   normalizeFactorLibraryStatus,
   mergeHistoricalFactorEvidence,
@@ -18,8 +21,10 @@ import {
 } from "./factor-library.mjs";
 import {
   canonicalExpression,
+  chooseMiningCandidate,
   chronologicalFactorEvidence,
-  evaluateExpression
+  evaluateExpression,
+  expressionLeafIds
 } from "./factor-research.mjs";
 
 const symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT"];
@@ -97,9 +102,9 @@ function marketResults(priceMultiplier = 1) {
   });
 }
 
-assert.equal(FACTOR_DEFINITIONS.length, 100, "reviewed built-in catalog should remain near the requested size without silent inflation");
+assert.equal(FACTOR_DEFINITIONS.length, 108, "reviewed built-in catalog should only grow by the declared Fourier/model factors");
 assert.equal(FACTOR_CATALOG_AUDIT.passed, true, FACTOR_CATALOG_AUDIT.errors.join(", "));
-assert.equal(FACTOR_CATALOG_AUDIT.factorCount, 100);
+assert.equal(FACTOR_CATALOG_AUDIT.factorCount, 108);
 assert.ok(Object.keys(FACTOR_RESEARCH_REFERENCES).length >= 8);
 assert.ok(FACTOR_DEFINITIONS.every((item) => item.catalogStatus === "mechanism_validated"));
 assert.ok(FACTOR_DEFINITIONS.every((item) => item.referenceIds.length > 0 && item.dataRequirements.length > 0));
@@ -109,6 +114,45 @@ const expressionRight = { type: "operator", operator: "blend", children: [...exp
 assert.equal(canonicalExpression(expressionLeft), canonicalExpression(expressionRight), "commutative DSL expressions must deduplicate canonically");
 assert.ok(Math.abs(evaluateExpression(expressionLeft, { return_5m: 0.8, return_15m: -0.2 }) - 0.3) < 1e-12);
 
+const nestedExpression = {
+  type: "operator",
+  operator: "agreement",
+  children: [expressionLeft, { type: "factor", id: "return_1h" }]
+};
+const multiFactorCandidate = chooseMiningCandidate({
+  definitions: [
+    {
+      id: "validated_pair",
+      role: "direction",
+      origin: "mined",
+      validationStatus: "validated",
+      expression: expressionLeft
+    },
+    { id: "return_1h", role: "direction", origin: "built_in" }
+  ],
+  metrics: {
+    validated_pair: { 15: { samples: 120, meanIc: 0.04, icir: 0.4, coverage: 1 } },
+    return_1h: { 15: { samples: 120, meanIc: 0.03, icir: 0.3, coverage: 1 } }
+  }
+});
+assert.equal(multiFactorCandidate.leafCount, 3, "validated expressions must be extendable beyond pair-only mining");
+assert.equal(expressionLeafIds(multiFactorCandidate.expression).length, 3);
+assert.ok(Number.isFinite(evaluateExpression(nestedExpression, { return_5m: 0.8, return_15m: -0.2, return_1h: 0.4 })));
+
+const periodicCloses = Array.from({ length: 64 }, (_, index) => 100 * Math.exp(0.002 * Math.sin(2 * Math.PI * index / 16)));
+const spectral = discreteFourierFeatures(periodicCloses);
+assert.ok(spectral.concentration > 0.8, "single periodic component should concentrate spectral energy");
+assert.ok(Number.isFinite(spectral.phaseSignal));
+
+const defaultModelGovernance = modelFactorGovernance(normalizeFactorLibraryConfig());
+assert.equal(defaultModelGovernance.gbm.useInDecision, true);
+assert.equal(defaultModelGovernance.hiddenMarkov.useInDecision, true);
+const shadowModelGovernance = modelFactorGovernance(normalizeFactorLibraryConfig({
+  factorSettings: { model_gbm_direction: { enabled: true, useInDecision: false } }
+}));
+assert.equal(shadowModelGovernance.gbm.shadow, true);
+assert.equal(shadowModelGovernance.gbm.useInDecision, false);
+
 const stableHoldoutValues = Array.from({ length: 120 }, (_, index) => 0.025 + (index % 3 - 1) * 0.004);
 const stableHoldout = chronologicalFactorEvidence({
   values: stableHoldoutValues,
@@ -116,6 +160,71 @@ const stableHoldout = chronologicalFactorEvidence({
   sourceValues: Array(120).fill(0)
 });
 assert.equal(stableHoldout.passed, true, "stable chronological evidence should pass the holdout gate");
+
+let governanceConfig = normalizeFactorLibraryConfig({
+  autoGovernanceEnabled: true,
+  factorSettings: { fourier_dominant_phase: { enabled: true, useInDecision: false } }
+});
+let governanceStatus = normalizeFactorLibraryStatus({
+  metrics: {
+    fourier_dominant_phase: {
+      15: {
+        values: stableHoldoutValues,
+        coverageValues: Array(stableHoldoutValues.length).fill(1),
+        sourceValues: Array(stableHoldoutValues.length).fill(0)
+      }
+    }
+  }
+});
+const governanceTrades = (beneficial) => Array.from({ length: 80 }, (_, index) => {
+  const side = index % 2 ? "long" : "short";
+  const sideDirection = side === "long" ? 1 : -1;
+  return {
+    id: `governance-${beneficial ? "good" : "bad"}-${index}`,
+    side,
+    initialMaxLossAmount: 100,
+    realizedPnl: beneficial ? 40 : -40,
+    closedAt: new Date(Date.parse("2026-07-01T00:00:00.000Z") + index * 3_600_000).toISOString(),
+    factorSnapshot: { factorLibrary: { values: { fourier_dominant_phase: sideDirection * 0.6 } } }
+  };
+});
+({ config: governanceConfig, status: governanceStatus } = updateFactorLibraryRuntime({
+  config: governanceConfig,
+  status: governanceStatus,
+  snapshots: [],
+  closedTrades: governanceTrades(true),
+  now: "2026-07-30T00:00:00.000Z"
+}));
+({ config: governanceConfig, status: governanceStatus } = updateFactorLibraryRuntime({
+  config: governanceConfig,
+  status: governanceStatus,
+  snapshots: [],
+  closedTrades: governanceTrades(true),
+  now: "2026-07-30T01:01:00.000Z"
+}));
+assert.equal(governanceConfig.factorSettings.fourier_dominant_phase.useInDecision, true, "two validated runs should promote a shadow factor");
+governanceStatus.metrics.fourier_dominant_phase[15] = {
+  values: [...Array(72).fill(0.03), ...Array(48).fill(-0.03)],
+  coverageValues: Array(120).fill(1),
+  sourceValues: Array(120).fill(0)
+};
+({ config: governanceConfig, status: governanceStatus } = updateFactorLibraryRuntime({
+  config: governanceConfig,
+  status: governanceStatus,
+  snapshots: [],
+  closedTrades: governanceTrades(false),
+  now: "2026-07-30T08:01:00.000Z"
+}));
+({ config: governanceConfig, status: governanceStatus } = updateFactorLibraryRuntime({
+  config: governanceConfig,
+  status: governanceStatus,
+  snapshots: [],
+  closedTrades: governanceTrades(false),
+  now: "2026-07-30T09:02:00.000Z"
+}));
+assert.equal(governanceConfig.factorSettings.fourier_dominant_phase.useInDecision, false, "two invalid runs after cooldown should demote a factor to shadow");
+assert.ok(governanceStatus.autoGovernance.actions.some((item) => item.action === "promoted_to_decision"));
+assert.ok(governanceStatus.autoGovernance.actions.some((item) => item.action === "demoted_to_shadow"));
 const signFlipHoldout = chronologicalFactorEvidence({
   values: [...Array(72).fill(0.03), ...Array(24).fill(-0.03), ...Array(24).fill(0.03)],
   coverageValues: Array(120).fill(1),
@@ -390,6 +499,12 @@ let status = createFactorLibraryStatus();
 const firstSnapshots = buildFactorSnapshots({ marketResults: marketResults(), status });
 assert.ok(firstSnapshots.every((snapshot) => FACTOR_DEFINITIONS.every((definition) => Object.hasOwn(snapshot.values, definition.id))), "every catalog factor must have an explicit value or null");
 assert.ok(firstSnapshots.every((snapshot) => Object.values(snapshot.values).every((value) => value == null || value >= -1 && value <= 1)), "all factor outputs must stay in the normalized range");
+const openCandleMutation = marketResults();
+openCandleMutation[0].factorContext.candles15m.at(-1).close *= 10;
+const mutatedFourierSnapshot = buildFactorSnapshots({ marketResults: openCandleMutation, status })[0];
+for (const id of ["fourier_dominant_phase", "fourier_spectral_concentration", "fourier_high_frequency_ratio"]) {
+  assert.equal(mutatedFourierSnapshot.values[id], firstSnapshots[0].values[id], `${id} must ignore the still-open final candle`);
+}
 const historicalSeries = Object.fromEntries(
   marketResults().map((item) => [item.market.symbol, item.factorContext.candles15m])
 );
@@ -552,6 +667,69 @@ const strictDecision = factorDecisionForSnapshot(
 assert.equal(strictDecision.requestedFactors, 10);
 assert.equal(strictDecision.sufficient, true, "ten direction factors with stable holdout evidence may influence the original decision");
 assert.ok(strictDecision.influence > 0);
+
+const layerFactorIds = Object.fromEntries(["context", "risk"].map((role) => [role,
+  FACTOR_DEFINITIONS
+    .filter((item) => item.role === role && !item.governanceOnly && Number.isFinite(laterSnapshots[0].values[item.id]))
+    .slice(0, 4)
+    .map((item) => item.id)
+]));
+const layeredEvidenceStatus = normalizeFactorLibraryStatus({
+  metrics: Object.fromEntries([...validatedDirectionIds, ...layerFactorIds.context, ...layerFactorIds.risk].map((id) => [id, {
+    15: {
+      samples: stableHoldoutValues.length,
+      meanIc: 0.025,
+      icStd: 0.004,
+      icir: 6.25,
+      tStatistic: 60,
+      coverage: 1,
+      values: stableHoldoutValues,
+      coverageValues: Array(stableHoldoutValues.length).fill(1),
+      sourceValues: Array(stableHoldoutValues.length).fill(0)
+    }
+  }]))
+});
+const layeredConfig = normalizeFactorLibraryConfig({
+  enabled: true,
+  factorSettings: Object.fromEntries([...layerFactorIds.context, ...layerFactorIds.risk].map((id) => [id, {
+    enabled: true,
+    useInDecision: true,
+    weight: 1
+  }]))
+});
+layeredEvidenceStatus.effectiveWeights = Object.fromEntries(layerFactorIds.context.map((id) => [id, 0.1]));
+const layerHeads = factorLayerHeadsForSnapshot(laterSnapshots[0], layeredConfig, layeredEvidenceStatus);
+assert.equal(layerHeads.direction.sufficient, true);
+assert.equal(layerHeads.context.sufficient, true);
+assert.equal(layerHeads.risk.sufficient, true);
+assert.equal(layerHeads.direction.strength, 1);
+assert.equal(layerHeads.context.minimumActiveFactors, 4);
+assert.equal(layerHeads.risk.minimumActiveFactors, 4);
+assert.equal(layerHeads.context.fullStrengthFactors, 10);
+assert.equal(layerHeads.risk.fullStrengthFactors, 10);
+assert.equal(layerHeads.context.strength, 0.4);
+assert.equal(layerHeads.risk.strength, 0.4);
+assert.ok(Math.abs(layerHeads.context.activeFactors.reduce((sum, item) => sum + item.weight, 0) - 0.4) < 1e-12);
+assert.ok(Object.values(layerHeads).every((head) => head.activeFactors.every((item) => item.weight <= 0.1 + 1e-12)));
+assert.ok(layerHeads.direction.activeFactors.every((item) => validatedDirectionIds.includes(item.id)));
+assert.ok(layerHeads.context.activeFactors.every((item) => layerFactorIds.context.includes(item.id)));
+assert.ok(layerHeads.risk.activeFactors.every((item) => layerFactorIds.risk.includes(item.id)));
+const contextMutatedSnapshot = {
+  ...laterSnapshots[0],
+  values: {
+    ...laterSnapshots[0].values,
+    ...Object.fromEntries(layerFactorIds.context.map((id) => [id, -laterSnapshots[0].values[id]]))
+  }
+};
+const contextMutatedHeads = factorLayerHeadsForSnapshot(contextMutatedSnapshot, layeredConfig, layeredEvidenceStatus);
+assert.equal(contextMutatedHeads.direction.composite, layerHeads.direction.composite, "context factors must not leak into the direction head");
+assert.notEqual(contextMutatedHeads.context.composite, layerHeads.context.composite, "context factors must remain isolated in the context head");
+const layeredView = publicFactorLibrary(layeredConfig, layeredEvidenceStatus);
+assert.equal(layeredView.decisionReadiness.layers.context.ready, true);
+assert.equal(layeredView.decisionReadiness.layers.context.strength, 0.4);
+assert.ok(layeredView.factors
+  .filter((factor) => layerFactorIds.context.includes(factor.id))
+  .every((factor) => factor.effectiveWeight <= 0.1 + 1e-12));
 
 config = updateFactorLibraryConfig(config, {
   factorUpdates: [{ id: "return_1m", enabled: false, useInDecision: false, weight: 3 }],

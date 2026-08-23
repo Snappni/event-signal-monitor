@@ -68,6 +68,7 @@ export function compactArchivedTrade(trade) {
     sessionId: trade?.sessionId || null,
     signalId: trade?.signalId || null,
     status: "closed",
+    calibrationCohort: trade?.calibrationCohort || trade?.factorSnapshot?.calibrationCohort || null,
     costModelVersion: safeNumber(trade?.costModelVersion, 1),
     symbol: trade?.symbol || null,
     side: trade?.side || null,

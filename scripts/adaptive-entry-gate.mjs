@@ -43,10 +43,18 @@ function calibrationBucket(trades) {
   };
 }
 
-export function buildTradeCalibration(trades = []) {
-  const usable = Array.isArray(trades)
+function calibrationCohort(trade) {
+  return String(trade?.calibrationCohort || trade?.factorSnapshot?.calibrationCohort || "").trim() || null;
+}
+
+export function buildTradeCalibration(trades = [], options = {}) {
+  const closed = Array.isArray(trades)
     ? trades.filter((trade) => trade?.status === "closed" || trade?.closedAt)
     : [];
+  const requiredCohort = String(options?.cohort || "").trim() || null;
+  const usable = requiredCohort
+    ? closed.filter((trade) => calibrationCohort(trade) === requiredCohort)
+    : closed;
   const byMode = {};
   const byRegime = {};
   for (const trade of usable) {
@@ -59,7 +67,10 @@ export function buildTradeCalibration(trades = []) {
     ...calibrationBucket(usable),
     byMode: Object.fromEntries(Object.entries(byMode).map(([key, value]) => [key, calibrationBucket(value)])),
     byRegime: Object.fromEntries(Object.entries(byRegime).map(([key, value]) => [key, calibrationBucket(value)])),
-    source: "paper_trade_history"
+    source: "paper_trade_history",
+    cohort: requiredCohort,
+    closedSamples: closed.length,
+    excludedIncompatibleSamples: closed.length - usable.length
   };
 }
 

@@ -5,12 +5,20 @@ import {
   chronologicalFactorEvidence,
   chooseMiningCandidate,
   evaluateExpression,
+  expressionLeafIds,
   metricEvidenceCorrelation,
   validateResearchCatalog
 } from "./factor-research.mjs";
+import {
+  analyzeGeometricBrownianMotion,
+  analyzeHiddenMarkovRegime,
+  estimateGarch11
+} from "./model-factors.mjs";
 
-const FACTOR_LIBRARY_VERSION = 4;
+const FACTOR_LIBRARY_VERSION = 7;
 const PRIMARY_IC_HORIZON_MINUTES = 15;
+const FACTOR_DECISION_ROLES = Object.freeze(["direction", "context", "risk"]);
+const MIN_ACTIVE_LAYER_FACTORS = 4;
 const MAX_PENDING_FRAMES = 90;
 const MAX_HISTORICAL_IC_OBSERVATIONS = 1536;
 const MAX_REALTIME_IC_OBSERVATIONS = 768;
@@ -18,11 +26,16 @@ const MAX_ACTIVE_MINED_FACTORS = 20;
 const MAX_RETIRED_MINED_FACTORS = 2048;
 const MIN_RETIRED_FACTOR_SAMPLES = 90;
 const MIN_REJECTED_FACTOR_AGE_MS = 6 * 60 * 60 * 1_000;
-const HISTORICAL_BACKFILL_VERSION = 3;
-export const FACTOR_HISTORICAL_SAMPLING_MODE = "hourly_anchors_non_overlapping_partitioned_v3";
+const HISTORICAL_BACKFILL_VERSION = 4;
+export const FACTOR_HISTORICAL_SAMPLING_MODE = "hourly_anchors_non_overlapping_partitioned_v4";
 const MIN_CROSS_SECTION_SYMBOLS = 8;
 const MIN_SMART_WEIGHT_SAMPLES = 30;
 const MIN_MINED_FACTOR_SAMPLES = 90;
+const AUTO_GOVERNANCE_PROMOTION_RUNS = 2;
+const AUTO_GOVERNANCE_DEMOTION_RUNS = 2;
+const AUTO_GOVERNANCE_COOLDOWN_MS = 6 * 60 * 60 * 1_000;
+const AUTO_GOVERNANCE_MIN_CLOSED_TRADES = 60;
+const AUTO_GOVERNANCE_MAX_CLOSED_TRADES = 240;
 
 export const FACTOR_RESEARCH_REFERENCES = Object.freeze({
   formulaic_alpha: Object.freeze({
@@ -104,6 +117,11 @@ export const FACTOR_RESEARCH_REFERENCES = Object.freeze({
     title: "AlphaGen",
     url: "https://github.com/ICT-FinD-Lab/alphagen",
     scope: "协同公式因子集合与增量组合评价；仅借鉴研究思想，未复制无明确许可代码"
+  }),
+  discrete_fourier_transform: Object.freeze({
+    title: "An Algorithm for the Machine Calculation of Complex Fourier Series",
+    url: "https://doi.org/10.1090/S0025-5718-1965-0178586-1",
+    scope: "离散频域分解的计算基础；交易有效性仍需本项目样本外证据"
   })
 });
 
@@ -113,7 +131,8 @@ const FACTOR_CATEGORY_RESEARCH = Object.freeze({
   "成交量与成交流": Object.freeze({ basis: "价格与成交量、主动成交方向的可检验联合关系", references: ["formulaic_alpha", "ta_lib", "order_flow_imbalance", "factor_evaluation"], data: ["public_ohlcv", "public_trades"] }),
   "订单簿与微观结构": Object.freeze({ basis: "盘口供需、订单事件和流动性对短期价格的影响", references: ["order_flow_imbalance", "illiquidity", "factor_evaluation"], data: ["public_order_book", "public_trades"] }),
   "合约衍生品": Object.freeze({ basis: "永续合约拥挤、基差、未平仓量与强平的状态代理", references: ["perpetual_markets", "factor_evaluation"], data: ["public_derivatives"] }),
-  "市场状态与跨资产": Object.freeze({ basis: "横截面相对价值、共同风险暴露与市场状态", references: ["crypto_factors", "factor_pipeline", "factor_evaluation"], data: ["multi_symbol_public_ohlcv"] })
+  "市场状态与跨资产": Object.freeze({ basis: "横截面相对价值、共同风险暴露与市场状态", references: ["crypto_factors", "factor_pipeline", "factor_evaluation"], data: ["multi_symbol_public_ohlcv"] }),
+  "模型与频域": Object.freeze({ basis: "将模型输出和离散频域特征作为可隔离、可检验的因子，而非底层无条件规则", references: ["discrete_fourier_transform", "factor_pipeline", "factor_evaluation"], data: ["public_ohlcv"] })
 });
 
 function factor(id, name, category, role, source, description, options = {}) {
@@ -123,6 +142,7 @@ function factor(id, name, category, role, source, description, options = {}) {
     name,
     category,
     role,
+    decisionLayer: options.decisionLayer || (role === "context" ? "probability" : role),
     source,
     description,
     origin: "built_in",
@@ -130,6 +150,9 @@ function factor(id, name, category, role, source, description, options = {}) {
     defaultEnabled: options.defaultEnabled === true,
     defaultUseInDecision: options.defaultUseInDecision === true,
     defaultWeight: Number.isFinite(options.defaultWeight) ? options.defaultWeight : 1,
+    governanceTarget: options.governanceTarget || null,
+    governanceOnly: options.governanceTarget != null,
+    autoGovernanceEligible: options.autoGovernanceEligible === true,
     formula: options.formula || null,
     implementationKey: id,
     researchBasis: options.researchBasis || research.basis,
@@ -237,7 +260,6 @@ export const FACTOR_DEFINITIONS = Object.freeze([
   factor("eth_btc_relative_strength", "ETH/BTC相对强弱", "市场状态与跨资产", "direction", "跨资产K线", "相对BTC和ETH基准的强弱。"),
   factor("cross_section_momentum_rank", "横截面动量排名", "市场状态与跨资产", "direction", "多标的K线", "同一时点全部监控标的的动量分位。"),
   factor("correlation_regime", "滚动相关性状态", "市场状态与跨资产", "risk", "跨资产K线", "标的与BTC滚动相关性。"),
-  factor("hmm_regime_signal", "HMM市场状态", "市场状态与跨资产", "direction", "三状态HMM", "HMM牛熊状态概率差。", { defaultEnabled: true, defaultUseInDecision: true }),
   factor("market_session", "交易时段因子", "市场状态与跨资产", "context", "UTC交易时段", "亚洲、欧洲、美国及交会时段的策略上下文。"),
   factor("news_impact_decay", "消息影响衰减", "市场状态与跨资产", "direction", "消息聚合", "消息方向乘以时效影响。"),
   factor("event_source_consensus", "多消息源一致性", "市场状态与跨资产", "direction", "消息聚合", "独立来源方向一致程度。"),
@@ -245,7 +267,61 @@ export const FACTOR_DEFINITIONS = Object.freeze([
   factor("market_breadth", "市场涨跌宽度", "市场状态与跨资产", "context", "多标的公共K线", "同一时点上涨标的占比的居中值，只作为市场状态。"),
   factor("cross_section_dispersion", "横截面收益偏离度", "市场状态与跨资产", "risk", "多标的公共K线", "单一标的相对横截面平均收益的绝对偏离，并用当期离散度归一化。"),
   factor("beta_instability", "BTC Beta不稳定度", "市场状态与跨资产", "risk", "跨资产K线", "短窗与长窗BTC Beta差异的绝对值。"),
-  factor("cross_section_residual_momentum", "市场中性残差动量", "市场状态与跨资产", "direction", "多标的公共K线", "标的收益减去横截面平均收益，降低共同市场方向暴露。")
+  factor("cross_section_residual_momentum", "市场中性残差动量", "市场状态与跨资产", "direction", "多标的公共K线", "标的收益减去横截面平均收益，降低共同市场方向暴露。"),
+
+  factor("fourier_dominant_phase", "傅里叶主周期相位", "模型与频域", "direction", "闭合15分钟K线DFT", "对去趋势对数价格执行离散傅里叶变换，以主频下一步相位变化形成方向信号；默认只影子观察。", {
+    defaultEnabled: true,
+    defaultUseInDecision: false,
+    autoGovernanceEligible: true,
+    referenceIds: ["discrete_fourier_transform", "factor_evaluation"]
+  }),
+  factor("fourier_spectral_concentration", "傅里叶频谱集中度", "模型与频域", "context", "闭合15分钟K线DFT", "主频能量占非零频率总能量的比例，衡量周期结构是否集中。", {
+    defaultEnabled: true,
+    referenceIds: ["discrete_fourier_transform", "factor_evaluation"]
+  }),
+  factor("fourier_high_frequency_ratio", "傅里叶高频能量比", "模型与频域", "risk", "闭合15分钟K线DFT", "频谱上三分之一频段的能量占比，作为短周期噪声代理。", {
+    defaultEnabled: true,
+    referenceIds: ["discrete_fourier_transform", "factor_evaluation"]
+  }),
+  factor("model_gbm_direction", "GBM方向模型因子", "模型与频域", "direction", "GBM模型输出", "GBM上涨概率与期望收益合成的方向信号；因子库只治理其原有单一路径，不重复叠加。", {
+    defaultEnabled: true,
+    defaultUseInDecision: true,
+    governanceTarget: "gbm",
+    autoGovernanceEligible: true,
+    referenceIds: ["factor_pipeline", "factor_evaluation"]
+  }),
+  factor("hmm_regime_signal", "HMM方向模型因子", "模型与频域", "direction", "三状态HMM", "HMM牛熊状态概率差；因子库只治理其原有单一路径，不重复叠加。", {
+    defaultEnabled: true,
+    defaultUseInDecision: true,
+    governanceTarget: "hiddenMarkov",
+    autoGovernanceEligible: true,
+    referenceIds: ["factor_pipeline", "factor_evaluation"]
+  }),
+  factor("model_garch_risk", "GARCH风险模型因子", "模型与频域", "risk", "GARCH(1,1)模型输出", "GARCH波动稳定度、信号置信缩放和止损波动下限的统一参与门控。", {
+    defaultEnabled: true,
+    defaultUseInDecision: true,
+    governanceTarget: "garch",
+    referenceIds: ["factor_pipeline", "factor_evaluation"]
+  }),
+  factor("model_poisson_context", "Poisson事件聚集因子", "模型与频域", "context", "事件到达模型", "事件聚集异常度的上下文门控；不把事件强度误当成多空方向。", {
+    defaultEnabled: true,
+    defaultUseInDecision: true,
+    governanceTarget: "poisson",
+    referenceIds: ["factor_pipeline", "factor_evaluation"]
+  }),
+  factor("model_bayesian_calibration", "Bayesian概率校准因子", "模型与频域", "context", "Bayesian更新", "胜率后验校准的参与门控；应以校准误差评价，暂不由方向IC自动启停。", {
+    defaultEnabled: true,
+    defaultUseInDecision: true,
+    governanceTarget: "bayesian",
+    referenceIds: ["factor_pipeline", "factor_evaluation"]
+  }),
+  factor("model_markowitz_allocator", "Markowitz配置因子", "模型与频域", "context", "正则化切点组合", "候选仓位横截面配置的参与门控；应以组合增益评价，暂不由方向IC自动启停。", {
+    defaultEnabled: true,
+    defaultUseInDecision: true,
+    governanceTarget: "markowitz",
+    decisionLayer: "sizing",
+    referenceIds: ["factor_pipeline", "factor_evaluation"]
+  })
 ]);
 
 export const FACTOR_CATALOG_AUDIT = Object.freeze(validateResearchCatalog(
@@ -302,24 +378,27 @@ function minedFactorPresentation(definition) {
   const leftName = left?.name || definition?.leftId || "左因子";
   const rightName = right?.name || definition?.rightId || "右因子";
   const expression = minedExpression(definition);
+  const leafIds = expressionLeafIds(expression);
+  const leafNames = leafIds.map((id) => DEFINITION_BY_ID.get(id)?.name || id);
   return {
     ...definition,
-    name: `挖掘·${meta.label}：${leftName} ${meta.symbol} ${rightName}`,
+    name: leafIds.length > 2
+      ? `挖掘·${leafIds.length}因子·${meta.label}：${leafNames.join(" / ")}`
+      : `挖掘·${meta.label}：${leftName} ${meta.symbol} ${rightName}`,
     category: meta.category,
-    source: `确定性束搜索·受限DSL·${meta.label}`,
-    description: `${meta.explanation} 候选保持隔离，必须通过时间顺序训练/验证/测试、HAC统计、覆盖率、冗余与多重检验后才可验证。`,
+    source: `确定性束搜索·最多4因子受限DSL·${meta.label}`,
+    description: `${meta.explanation} 当前表达式含${leafIds.length}个叶子因子；候选保持隔离，必须通过时间顺序训练/验证/测试、HAC统计、覆盖率、冗余与多重检验后才可验证。`,
     formula: canonicalExpression(expression),
     operator,
     operatorLabel: meta.label,
     expression,
+    leafIds,
+    leafCount: leafIds.length,
     complexity: safeNumber(definition?.complexity, 1 + safeNumber(meta.complexity, 1)),
     researchStage: definition?.researchStage || (definition?.validationStatus === "validated" ? "shadow_validated" : "quarantine"),
     researchBasis: "在受限类型、复杂度和数据可用边界内检验父因子的增量交互",
     referenceIds: ["openfe", "gplearn", "alphagen", "factor_pipeline", "factor_evaluation"],
-    dataRequirements: [...new Set([
-      ...(left?.dataRequirements || []),
-      ...(right?.dataRequirements || [])
-    ])],
+    dataRequirements: [...new Set(leafIds.flatMap((id) => DEFINITION_BY_ID.get(id)?.dataRequirements || []))],
     catalogStatus: "research_candidate",
     semanticKey: minedSemanticKey({ ...definition, expression })
   };
@@ -423,6 +502,8 @@ export const DEFAULT_FACTOR_LIBRARY_CONFIG = Object.freeze({
   version: FACTOR_LIBRARY_VERSION,
   enabled: true,
   intelligentAdjustment: false,
+  autoGovernanceEnabled: false,
+  autoGovernanceIntervalMinutes: 60,
   miningEnabled: false,
   autoPromoteMined: false,
   decisionInfluence: 0.25,
@@ -650,6 +731,55 @@ function discreteEntropy(values) {
   return entropy / Math.log(3);
 }
 
+export function discreteFourierFeatures(closes) {
+  const sample = closes.filter((value) => value > 0).slice(-64).map(Math.log);
+  if (sample.length < 32) return { phaseSignal: null, concentration: null, highFrequencyRatio: null, dominantPeriodBars: null };
+  const count = sample.length;
+  const xMean = (count - 1) / 2;
+  const yMean = mean(sample);
+  let covariance = 0;
+  let xVariance = 0;
+  for (let index = 0; index < count; index += 1) {
+    covariance += (index - xMean) * (sample[index] - yMean);
+    xVariance += (index - xMean) ** 2;
+  }
+  const slope = xVariance > 0 ? covariance / xVariance : 0;
+  const detrended = sample.map((value, index) => value - (yMean + slope * (index - xMean)));
+  const bins = [];
+  for (let frequency = 1; frequency <= Math.floor(count / 2); frequency += 1) {
+    let real = 0;
+    let imaginary = 0;
+    for (let index = 0; index < count; index += 1) {
+      const angle = 2 * Math.PI * frequency * index / count;
+      real += detrended[index] * Math.cos(angle);
+      imaginary -= detrended[index] * Math.sin(angle);
+    }
+    bins.push({ frequency, real, imaginary, energy: real ** 2 + imaginary ** 2 });
+  }
+  const totalEnergy = bins.reduce((sum, item) => sum + item.energy, 0);
+  if (!(totalEnergy > 0)) return { phaseSignal: 0, concentration: 0, highFrequencyRatio: 0, dominantPeriodBars: null };
+  const cycleBins = bins.filter((item) => item.frequency <= Math.max(2, Math.floor(count / 4)));
+  const dominant = cycleBins.reduce((best, item) => !best || item.energy > best.energy ? item : best, null);
+  const amplitude = dominant ? 2 * Math.sqrt(dominant.energy) / count : 0;
+  const componentAt = (index) => {
+    if (!dominant) return 0;
+    const angle = 2 * Math.PI * dominant.frequency * index / count;
+    return 2 / count * (dominant.real * Math.cos(angle) - dominant.imaginary * Math.sin(angle));
+  };
+  const concentration = dominant ? dominant.energy / totalEnergy : 0;
+  const phaseDelta = amplitude > 0 ? (componentAt(count) - componentAt(count - 1)) / (2 * amplitude) : 0;
+  const highFrequencyStart = Math.ceil(bins.length * 2 / 3);
+  const highFrequencyEnergy = bins
+    .filter((item) => item.frequency >= highFrequencyStart)
+    .reduce((sum, item) => sum + item.energy, 0);
+  return {
+    phaseSignal: clamp(phaseDelta * Math.sqrt(concentration), -1, 1),
+    concentration: clamp(concentration, 0, 1),
+    highFrequencyRatio: clamp(highFrequencyEnergy / totalEnergy, 0, 1),
+    dominantPeriodBars: dominant ? count / dominant.frequency : null
+  };
+}
+
 function linearTrend(values) {
   const sample = values.slice(-20).filter((value) => value > 0).map(Math.log);
   if (sample.length < 8) return { slope: null, r2: null };
@@ -743,6 +873,22 @@ function allDefinitions(status) {
   return [...FACTOR_DEFINITIONS, ...(Array.isArray(status?.minedFactors) ? status.minedFactors : [])];
 }
 
+export function modelFactorGovernance(configValue = {}) {
+  const config = normalizeFactorLibraryConfig(configValue);
+  return Object.fromEntries(FACTOR_DEFINITIONS
+    .filter((definition) => definition.governanceTarget)
+    .map((definition) => {
+      const setting = factorSetting(config, definition);
+      const calculated = config.enabled && setting.enabled && !setting.archived;
+      return [definition.governanceTarget, {
+        factorId: definition.id,
+        calculated,
+        useInDecision: calculated && setting.useInDecision,
+        shadow: calculated && !setting.useInDecision
+      }];
+    }));
+}
+
 export function normalizeFactorLibraryConfig(value = {}, extraDefinitions = []) {
   const raw = value && typeof value === "object" ? value : {};
   const definitions = [...FACTOR_DEFINITIONS, ...extraDefinitions];
@@ -783,6 +929,8 @@ export function normalizeFactorLibraryConfig(value = {}, extraDefinitions = []) 
     version: FACTOR_LIBRARY_VERSION,
     enabled: raw.enabled !== false,
     intelligentAdjustment: raw.intelligentAdjustment === true,
+    autoGovernanceEnabled: raw.autoGovernanceEnabled === true,
+    autoGovernanceIntervalMinutes: Math.round(clamp(safeNumber(raw.autoGovernanceIntervalMinutes, 60), 15, 1440)),
     miningEnabled: raw.miningEnabled === true,
     autoPromoteMined: raw.autoPromoteMined === true,
     decisionInfluence: clamp(safeNumber(raw.decisionInfluence, DEFAULT_FACTOR_LIBRARY_CONFIG.decisionInfluence), 0, 0.4),
@@ -850,10 +998,19 @@ export function createFactorLibraryStatus() {
       lastRetiredAt: null,
       activeLimit: MAX_ACTIVE_MINED_FACTORS,
       archiveLimit: MAX_RETIRED_MINED_FACTORS,
-      algorithm: "deterministic_typed_beam_search_v1",
-      maxExpressionDepth: 2,
+      algorithm: "deterministic_typed_beam_search_v2",
+      maxExpressionDepth: 3,
+      maxLeafFactors: 4,
       validationMethod: "chronological_60_20_20_hac_fdr",
       currentActivity: "idle"
+    },
+    autoGovernance: {
+      enabled: false,
+      lastRunAt: null,
+      runCount: 0,
+      lastActionAt: null,
+      actions: [],
+      factors: {}
     },
     dataSources: {},
     historicalBackfill: {
@@ -954,6 +1111,14 @@ export function normalizeFactorLibraryStatus(value = {}) {
     minedFactors,
     retiredMinedFactors,
     mining,
+    autoGovernance: {
+      ...base.autoGovernance,
+      ...(raw.autoGovernance || {}),
+      actions: (Array.isArray(raw.autoGovernance?.actions) ? raw.autoGovernance.actions : []).slice(-100),
+      factors: raw.autoGovernance?.factors && typeof raw.autoGovernance.factors === "object"
+        ? raw.autoGovernance.factors
+        : {}
+    },
     dataSources: raw.dataSources && typeof raw.dataSources === "object" ? raw.dataSources : {},
     historicalBackfill: { ...base.historicalBackfill, ...(raw.historicalBackfill || {}) }
   };
@@ -985,6 +1150,19 @@ function factorValueMap(context) {
   const latest = safeNumber(market.latest, closes1m.at(-1) || closes15m.at(-1));
   const returns1m = returns(closes1m);
   const returns15m = returns(closes15m);
+  const closedCandles15m = context.candlesAreClosed === true ? candles15m : candles15m.slice(0, -1);
+  const closedCloses15m = closedCandles15m.map((item) => safeNumber(item.close)).filter((value) => value > 0);
+  const modelReturns15m = returns(closedCloses15m);
+  const fourier = discreteFourierFeatures(closedCloses15m);
+  const gbmModel = Number.isFinite(Number(market.gbm?.signal))
+    ? market.gbm
+    : analyzeGeometricBrownianMotion(modelReturns15m);
+  const garchModel = Number.isFinite(Number(market.garch?.stabilityScore))
+    ? market.garch
+    : estimateGarch11(modelReturns15m);
+  const hmmModel = Number.isFinite(Number(market.hiddenMarkov?.signal))
+    ? market.hiddenMarkov
+    : analyzeHiddenMarkovRegime(modelReturns15m);
   const recentVolume = candles1m.slice(-30).map((item) => safeNumber(item.quoteVolume || item.volume)).filter((value) => value > 0);
   const currentVolume = recentVolume.at(-1);
   const priceScale = Math.max(latest * Math.max(safeNumber(market.atrPct, 0.004), 0.002), 1e-9);
@@ -1037,6 +1215,10 @@ function factorValueMap(context) {
   const eventDirection = safeNumber(context.eventAggregate?.direction);
   const eventScore = clamp(safeNumber(context.eventAggregate?.score) / 100, 0, 1);
   const eventCount = safeNumber(context.eventAggregate?.eventCount, context.eventAggregate?.events?.length || 0);
+  const eventLambda = clamp(0.25 + eventScore * 1.65, 0.05, 4);
+  const poissonCluster = eventCount > eventLambda
+    ? clamp((eventCount - eventLambda) / Math.sqrt(eventLambda) / 3, 0, 1) * Math.abs(eventDirection)
+    : 0;
   const sourceCount = new Set((context.eventAggregate?.events || []).map((item) => item.source).filter(Boolean)).size;
   const sessionKey = String(context.sessionContext?.policyKey || "off_hours");
   const sessionSignal = sessionKey.includes("overlap") ? 0.2 : sessionKey === "europe" ? 0.15 : sessionKey === "us" ? 0.1 : sessionKey === "asia" ? 0 : -0.2;
@@ -1203,7 +1385,6 @@ function factorValueMap(context) {
     eth_btc_relative_strength: finiteOrNull(context.crossAsset?.ethBtcRelativeStrength),
     cross_section_momentum_rank: finiteOrNull(context.crossAsset?.momentumRank),
     correlation_regime: finiteOrNull(context.crossAsset?.btcCorrelation),
-    hmm_regime_signal: finiteOrNull(market.hiddenMarkov?.signal),
     market_session: sessionSignal,
     news_impact_decay: eventScore > 0 ? clamp(eventDirection * eventScore, -1, 1) : 0,
     event_source_consensus: sourceCount > 0 ? clamp(eventDirection * Math.min(1, sourceCount / 3) * Math.min(1, eventCount / 3), -1, 1) : 0
@@ -1211,7 +1392,16 @@ function factorValueMap(context) {
     market_breadth: finiteOrNull(context.crossAsset?.marketBreadth),
     cross_section_dispersion: finiteOrNull(context.crossAsset?.crossSectionDispersion),
     beta_instability: finiteOrNull(context.crossAsset?.betaInstability),
-    cross_section_residual_momentum: finiteOrNull(context.crossAsset?.residualMomentum)
+    cross_section_residual_momentum: finiteOrNull(context.crossAsset?.residualMomentum),
+    fourier_dominant_phase: fourier.phaseSignal,
+    fourier_spectral_concentration: fourier.concentration,
+    fourier_high_frequency_ratio: fourier.highFrequencyRatio,
+    model_gbm_direction: finiteOrNull(gbmModel?.signal),
+    hmm_regime_signal: finiteOrNull(hmmModel?.signal),
+    model_garch_risk: finiteOrNull(garchModel?.stabilityScore),
+    model_poisson_context: poissonCluster,
+    model_bayesian_calibration: null,
+    model_markowitz_allocator: null
   };
 }
 
@@ -1335,6 +1525,7 @@ export function buildHistoricalFactorFrames({ seriesBySymbol = {}, intervalMinut
         factorContext: {
           capturedAt,
           barMinutes: intervalMinutes,
+          candlesAreClosed: true,
           candles1m: candles,
           candles15m: candles,
           candles1h: candles,
@@ -1380,6 +1571,34 @@ function cappedAllocation(items, cap) {
   return result;
 }
 
+function cappedAllocationWithIndividualCaps(items, caps) {
+  if (!items.length) return {};
+  const scores = Object.fromEntries(items.map((item) => [item.id, Math.max(0, safeNumber(item.score))]));
+  if (Object.values(scores).every((value) => value <= 0)) for (const item of items) scores[item.id] = 1;
+  const result = Object.fromEntries(items.map((item) => [item.id, 0]));
+  let remaining = 1;
+  let active = items.map((item) => item.id);
+  while (active.length && remaining > 1e-12) {
+    const total = active.reduce((sum, id) => sum + scores[id], 0);
+    const proposed = active.map((id) => ({
+      id,
+      weight: remaining * (total > 0 ? scores[id] / total : 1 / active.length)
+    }));
+    const capped = proposed.filter((item) => item.weight > safeNumber(caps[item.id], 1) + 1e-12);
+    if (!capped.length) {
+      for (const item of proposed) result[item.id] += item.weight;
+      break;
+    }
+    for (const item of capped) {
+      result[item.id] = safeNumber(caps[item.id], 1);
+      remaining -= result[item.id];
+    }
+    const cappedIds = new Set(capped.map((item) => item.id));
+    active = active.filter((id) => !cappedIds.has(id));
+  }
+  return result;
+}
+
 function constrainedWeights(definitions, rawScores, config) {
   const active = definitions.filter((definition) => safeNumber(rawScores[definition.id]) > 0);
   if (!active.length) return {};
@@ -1392,12 +1611,30 @@ function constrainedWeights(definitions, rawScores, config) {
     id,
     score: factors.reduce((sum, definition) => sum + safeNumber(rawScores[definition.id]), 0)
   }));
-  const categoryWeights = cappedAllocation(categoryItems, config.maxCategoryWeight);
+  const effectiveFactorCap = Math.max(config.maxFactorWeight, 1 / active.length);
+  let effectiveCategoryCap = Math.max(config.maxCategoryWeight, 1 / categoryItems.length);
+  const categoryCapacity = (cap) => [...grouped.values()]
+    .reduce((sum, factors) => sum + Math.min(cap, factors.length * effectiveFactorCap), 0);
+  if (categoryCapacity(effectiveCategoryCap) < 1 - 1e-12) {
+    let low = effectiveCategoryCap;
+    let high = 1;
+    for (let iteration = 0; iteration < 50; iteration += 1) {
+      const middle = (low + high) / 2;
+      if (categoryCapacity(middle) >= 1) high = middle;
+      else low = middle;
+    }
+    effectiveCategoryCap = high;
+  }
+  const categoryCaps = Object.fromEntries([...grouped.entries()].map(([category, factors]) => [
+    category,
+    Math.min(effectiveCategoryCap, factors.length * effectiveFactorCap)
+  ]));
+  const categoryWeights = cappedAllocationWithIndividualCaps(categoryItems, categoryCaps);
   const result = {};
   for (const [category, factors] of grouped.entries()) {
     const within = cappedAllocation(
       factors.map((definition) => ({ id: definition.id, score: rawScores[definition.id] })),
-      Math.min(1, config.maxFactorWeight / Math.max(categoryWeights[category], 1e-9))
+      Math.min(1, effectiveFactorCap / Math.max(categoryWeights[category], 1e-9))
     );
     for (const definition of factors) result[definition.id] = categoryWeights[category] * safeNumber(within[definition.id]);
   }
@@ -1661,72 +1898,104 @@ function evidenceOrientation(definition, status) {
   return evidence.passed ? evidence.orientation : null;
 }
 
-function manualWeights(config, definitions, status) {
-  const raw = {};
-  for (const definition of definitions) {
+function decisionDefinitions(config, definitions, status, role) {
+  return definitions.filter((definition) => {
     const setting = factorSetting(config, definition);
-    const orientation = evidenceOrientation(definition, status);
-    if (setting.enabled && setting.useInDecision && !setting.archived && definition.role === "direction" && orientation != null) {
-      raw[definition.id] = setting.weight;
-    }
-  }
-  return constrainedWeights(definitions, raw, config);
+    return definition.role === role &&
+      !definition.governanceOnly &&
+      setting.enabled &&
+      setting.useInDecision &&
+      !setting.archived &&
+      evidenceOrientation(definition, status) != null;
+  });
+}
+
+function manualRoleWeights(config, definitions, status, role) {
+  const roleDefinitions = decisionDefinitions(config, definitions, status, role);
+  return constrainedWeights(
+    roleDefinitions,
+    Object.fromEntries(roleDefinitions.map((definition) => [definition.id, factorSetting(config, definition).weight])),
+    config
+  );
+}
+
+function manualWeights(config, definitions, status) {
+  return Object.assign({}, ...FACTOR_DECISION_ROLES.map((role) =>
+    manualRoleWeights(config, definitions, status, role)
+  ));
 }
 
 function adjustSmartWeights(config, status, definitions, nowMs) {
+  const manual = manualWeights(config, definitions, status);
   const previous = Object.keys(status.effectiveWeights || {}).length
     ? status.effectiveWeights
-    : manualWeights(config, definitions, status);
-  const raw = {};
-  let eligible = 0;
-  for (const definition of definitions) {
-    const setting = factorSetting(config, definition);
-    const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
-    const orientation = evidenceOrientation(definition, status);
-    if (!setting.enabled || !setting.useInDecision || setting.archived || definition.role !== "direction" || orientation == null) continue;
-    if (safeNumber(metric?.samples) < MIN_SMART_WEIGHT_SAMPLES) {
-      raw[definition.id] = Math.max(0.001, safeNumber(previous[definition.id], setting.weight));
+    : manual;
+  const result = {};
+  const redundancyPenalty = {};
+  let adjustedRoles = 0;
+
+  for (const role of FACTOR_DECISION_ROLES) {
+    const roleDefinitions = decisionDefinitions(config, definitions, status, role);
+    const raw = {};
+    let eligible = 0;
+    for (const definition of roleDefinitions) {
+      const setting = factorSetting(config, definition);
+      const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
+      if (safeNumber(metric?.samples) < MIN_SMART_WEIGHT_SAMPLES) {
+        raw[definition.id] = Math.max(0.001, safeNumber(previous[definition.id], setting.weight));
+        continue;
+      }
+      eligible += 1;
+      const positiveIc = Math.abs(safeNumber(metric.meanIc));
+      const stability = clamp(1 - safeNumber(metric.icStd), 0.05, 1);
+      raw[definition.id] = Math.max(0.0001, positiveIc * stability * clamp(safeNumber(metric.coverage), 0, 1));
+    }
+
+    const selected = [];
+    for (const definition of roleDefinitions
+      .filter((item) => safeNumber(raw[item.id]) > 0)
+      .sort((left, right) => safeNumber(raw[right.id]) - safeNumber(raw[left.id]))) {
+      const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
+      const maxCorrelation = selected.reduce((maximum, selectedDefinition) => Math.max(
+        maximum,
+        Math.abs(safeNumber(metricEvidenceCorrelation(
+          metric,
+          status.metrics?.[selectedDefinition.id]?.[PRIMARY_IC_HORIZON_MINUTES]
+        )))
+      ), 0);
+      const penalty = clamp(1 - maxCorrelation ** 2, 0.1, 1);
+      raw[definition.id] *= penalty;
+      redundancyPenalty[definition.id] = round(penalty);
+      selected.push(definition);
+    }
+
+    const candidate = constrainedWeights(roleDefinitions, raw, config);
+    if (!eligible || !Object.keys(candidate).length) {
+      Object.assign(result, manualRoleWeights(config, definitions, status, role));
       continue;
     }
-    eligible += 1;
-    const positiveIc = Math.abs(safeNumber(metric.meanIc));
-    const stability = clamp(1 - safeNumber(metric.icStd), 0.05, 1);
-    raw[definition.id] = Math.max(0.0001, positiveIc * stability * clamp(safeNumber(metric.coverage), 0, 1));
+    const blendedRaw = {};
+    for (const definition of roleDefinitions) {
+      const id = definition.id;
+      const before = safeNumber(previous[id], safeNumber(manual[id]));
+      const after = safeNumber(candidate[id]);
+      blendedRaw[id] = clamp(after, Math.max(0, before - config.maxWeightStep), before + config.maxWeightStep);
+    }
+    Object.assign(result, constrainedWeights(roleDefinitions, blendedRaw, config));
+    adjustedRoles += 1;
   }
-  const selected = [];
-  const redundancyPenalty = {};
-  for (const definition of definitions
-    .filter((item) => safeNumber(raw[item.id]) > 0)
-    .sort((left, right) => safeNumber(raw[right.id]) - safeNumber(raw[left.id]))) {
-    const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
-    const maxCorrelation = selected.reduce((maximum, selectedDefinition) => Math.max(
-      maximum,
-      Math.abs(safeNumber(metricEvidenceCorrelation(
-        metric,
-        status.metrics?.[selectedDefinition.id]?.[PRIMARY_IC_HORIZON_MINUTES]
-      )))
-    ), 0);
-    const penalty = clamp(1 - maxCorrelation ** 2, 0.1, 1);
-    raw[definition.id] *= penalty;
-    redundancyPenalty[definition.id] = round(penalty);
-    selected.push(definition);
+
+  if (adjustedRoles) {
+    status.lastAdjustmentAt = new Date(nowMs).toISOString();
+    status.weightVersion += 1;
   }
-  const candidate = constrainedWeights(definitions, raw, config);
-  if (!eligible || !Object.keys(candidate).length) return previous;
-  const blendedRaw = {};
-  for (const id of new Set([...Object.keys(previous), ...Object.keys(candidate)])) {
-    const before = safeNumber(previous[id]);
-    const after = safeNumber(candidate[id]);
-    blendedRaw[id] = clamp(after, Math.max(0, before - config.maxWeightStep), before + config.maxWeightStep);
-  }
-  status.lastAdjustmentAt = new Date(nowMs).toISOString();
-  status.weightVersion += 1;
   status.weightDiagnostics = {
-    method: "IC强度 × 稳定性 × 覆盖率 × IC序列去冗余",
+    method: "分层 IC强度 × 稳定性 × 覆盖率 × 层内IC序列去冗余",
+    adjustedRoles,
     redundancyPenalty,
     generatedAt: new Date(nowMs).toISOString()
   };
-  return constrainedWeights(definitions, blendedRaw, config);
+  return result;
 }
 
 function approximatePValue(tStatistic) {
@@ -1898,11 +2167,14 @@ function mineFactor(status, config, definitions, nowMs) {
     rightId: right.id,
     operator: selected.operator,
     expression: selected.expression,
+    leafIds: selected.leafIds,
+    leafCount: selected.leafCount,
     complexity: selected.complexity,
     screening: {
-      method: "deterministic_typed_beam_search_v1",
+      method: "deterministic_typed_beam_search_v2",
       parentEvidenceCorrelation: round(selected.redundancy),
       fitness: round(selected.fitness),
+      leafCount: selected.leafCount,
       passedStaticGate: true
     },
     createdAt: new Date(nowMs).toISOString(),
@@ -1912,48 +2184,224 @@ function mineFactor(status, config, definitions, nowMs) {
   status.mining.currentActivity = `generated:${id}`;
 }
 
-export function factorDecisionForSnapshot(snapshot, configValue, statusValue) {
-  const status = normalizeFactorLibraryStatus(statusValue);
-  const definitions = allDefinitions(status);
-  const config = normalizeFactorLibraryConfig(configValue, status.minedFactors);
-  if (!config.enabled) return { composite: 0, influence: 0, coverage: 0, activeFactors: [], weightVersion: status.weightVersion };
-  const weights = Object.keys(status.effectiveWeights || {}).length ? status.effectiveWeights : manualWeights(config, definitions, status);
+function minimumActiveFactorsForRole(role, config) {
+  return MIN_ACTIVE_LAYER_FACTORS;
+}
+
+function fullStrengthFactors(config) {
+  return Math.max(MIN_ACTIVE_LAYER_FACTORS, Math.ceil(1 / Math.max(config.maxFactorWeight, 1e-9)));
+}
+
+function factorRoleHead(snapshot, config, status, definitions, role) {
+  const eligible = decisionDefinitions(config, definitions, status, role);
+  const storedWeights = Object.fromEntries(eligible.map((definition) => [
+    definition.id,
+    safeNumber(status.effectiveWeights?.[definition.id])
+  ]));
+  const storedWeightTotal = Object.values(storedWeights).reduce((sum, value) => sum + value, 0);
+  const storedWeightCount = Object.values(storedWeights).filter((value) => value > 0).length;
+  const weights = storedWeightTotal > 0 && storedWeightCount === eligible.length
+    ? constrainedWeights(eligible, storedWeights, config)
+    : manualRoleWeights(config, definitions, status, role);
+  const fullStrengthFactorCount = fullStrengthFactors(config);
+  const configuredStrength = clamp(eligible.length / fullStrengthFactorCount, 0, 1);
   const activeFactors = [];
   let weighted = 0;
   let activeWeight = 0;
-  let requested = 0;
-  for (const definition of definitions) {
-    const setting = factorSetting(config, definition);
-    const orientation = evidenceOrientation(definition, status);
-    if (!setting.enabled || !setting.useInDecision || setting.archived || definition.role !== "direction" || orientation == null) continue;
-    requested += 1;
+  for (const definition of eligible) {
     const value = finiteOrNull(snapshot?.values?.[definition.id]);
     const weight = safeNumber(weights[definition.id]);
-    if (value == null || weight <= 0) continue;
-    weighted += value * orientation * weight;
-    activeWeight += weight;
-    activeFactors.push({ id: definition.id, value, weight, orientation, contribution: value * orientation * weight });
+    const orientation = evidenceOrientation(definition, status);
+    if (value == null || weight <= 0 || orientation == null) continue;
+    const effectiveWeight = weight * configuredStrength;
+    const contribution = value * orientation * effectiveWeight;
+    weighted += contribution;
+    activeWeight += effectiveWeight;
+    activeFactors.push({ id: definition.id, value, weight: effectiveWeight, relativeWeight: weight, orientation, contribution });
   }
-  const coverage = requested > 0 ? activeFactors.length / requested : 0;
-  const minimumActiveFactors = Math.max(4, Math.ceil(1 / Math.max(config.maxFactorWeight, 1e-9)));
+  const requestedFactors = eligible.length;
+  const coverage = requestedFactors > 0 ? activeFactors.length / requestedFactors : 0;
+  const minimumActiveFactors = minimumActiveFactorsForRole(role, config);
   const sufficient = activeFactors.length >= minimumActiveFactors && coverage >= 0.5;
+  const strength = sufficient ? clamp(activeFactors.length / fullStrengthFactorCount, 0, 1) : 0;
   return {
+    role,
     composite: activeWeight > 0 ? clamp(weighted / activeWeight, -1, 1) : 0,
-    influence: sufficient ? config.decisionInfluence * clamp(coverage, 0.5, 1) : 0,
+    influence: role === "direction" ? config.decisionInfluence * strength : strength,
+    confidence: strength,
+    strength,
+    configuredStrength,
     coverage,
     activeFactors,
-    requestedFactors: requested,
+    requestedFactors,
     minimumActiveFactors,
+    fullStrengthFactors: fullStrengthFactorCount,
     weightVersion: status.weightVersion,
     sufficient
   };
 }
 
-export function updateFactorLibraryRuntime({ config: configValue, status: statusValue, snapshots = [], historicalFrames = [], now = new Date().toISOString() }) {
+export function factorLayerHeadsForSnapshot(snapshot, configValue, statusValue) {
+  const status = normalizeFactorLibraryStatus(statusValue);
+  const definitions = allDefinitions(status);
+  const config = normalizeFactorLibraryConfig(configValue, status.minedFactors);
+  if (!config.enabled) {
+    return Object.fromEntries(FACTOR_DECISION_ROLES.map((role) => [role, {
+      role,
+      composite: 0,
+      influence: 0,
+      confidence: 0,
+      strength: 0,
+      configuredStrength: 0,
+      coverage: 0,
+      activeFactors: [],
+      requestedFactors: 0,
+      minimumActiveFactors: minimumActiveFactorsForRole(role, config),
+      fullStrengthFactors: fullStrengthFactors(config),
+      weightVersion: status.weightVersion,
+      sufficient: false
+    }]));
+  }
+  return Object.fromEntries(FACTOR_DECISION_ROLES.map((role) => [
+    role,
+    factorRoleHead(snapshot, config, status, definitions, role)
+  ]));
+}
+
+export function factorDecisionForSnapshot(snapshot, configValue, statusValue) {
+  return factorLayerHeadsForSnapshot(snapshot, configValue, statusValue).direction;
+}
+
+function closedTradeFactorValue(trade, definition) {
+  const values = trade?.factorSnapshot?.factorLibrary?.values || {};
+  const direct = finiteOrNull(values[definition.id]);
+  if (direct != null) return direct;
+  if (definition.id === "model_gbm_direction") {
+    return finiteOrNull(trade?.factorSnapshot?.directionSignals?.geometricBrownianMotion);
+  }
+  if (definition.id === "hmm_regime_signal") {
+    return finiteOrNull(trade?.factorSnapshot?.directionSignals?.hiddenMarkovModel);
+  }
+  return null;
+}
+
+function closedTradeFactorEvidence(trades, definition, orientation) {
+  const unique = new Map();
+  for (const trade of Array.isArray(trades) ? trades : []) {
+    const id = String(trade?.id || "");
+    const storedRealizedR = finiteOrNull(trade?.realizedR);
+    const initialMaxLossAmount = safeNumber(trade?.initialMaxLossAmount, safeNumber(trade?.maxLossAmount));
+    const realizedR = storedRealizedR ?? (initialMaxLossAmount > 0
+      ? safeNumber(trade?.realizedPnl) / initialMaxLossAmount
+      : finiteOrNull(trade?.realizedReturnPct));
+    const sideDirection = trade?.side === "long" ? 1 : trade?.side === "short" ? -1 : 0;
+    const value = closedTradeFactorValue(trade, definition);
+    const closedAtMs = Date.parse(trade?.closedAt || "");
+    if (!id || realizedR == null || !sideDirection || value == null || Math.abs(value) < 0.05 || !Number.isFinite(closedAtMs)) continue;
+    unique.set(id, {
+      closedAtMs,
+      benefitR: Math.sign(value * orientation) * sideDirection * realizedR
+    });
+  }
+  const observations = [...unique.values()]
+    .sort((left, right) => left.closedAtMs - right.closedAtMs)
+    .slice(-AUTO_GOVERNANCE_MAX_CLOSED_TRADES)
+    .map((item) => item.benefitR);
+  const summarize = (values) => {
+    const average = mean(values);
+    const deviation = std(values);
+    return {
+      samples: values.length,
+      meanBenefitR: round(average),
+      positiveRate: round(values.length ? values.filter((value) => value > 0).length / values.length : 0),
+      tStatistic: round(deviation > 0 ? average / (deviation / Math.sqrt(values.length)) : average > 0 ? 99 : 0)
+    };
+  };
+  const trainEnd = Math.floor(observations.length * 0.6);
+  const validationEnd = Math.floor(observations.length * 0.8);
+  const train = summarize(observations.slice(0, trainEnd));
+  const validation = summarize(observations.slice(trainEnd, validationEnd));
+  const test = summarize(observations.slice(validationEnd));
+  const overall = summarize(observations);
+  const sufficient = observations.length >= AUTO_GOVERNANCE_MIN_CLOSED_TRADES &&
+    [train, validation, test].every((item) => item.samples >= 12);
+  const passed = sufficient &&
+    [train, validation, test].every((item) => item.meanBenefitR > 0) &&
+    overall.meanBenefitR >= 0.02 &&
+    test.meanBenefitR >= 0.01 &&
+    test.positiveRate >= 0.52 &&
+    test.tStatistic >= 1;
+  return { sufficient, passed, train, validation, test, overall };
+}
+
+function applyAutomaticGovernance(config, status, definitions, nowMs, closedTrades) {
+  status.autoGovernance.enabled = config.autoGovernanceEnabled;
+  if (!config.autoGovernanceEnabled) return config;
+  const lastRunMs = Date.parse(status.autoGovernance.lastRunAt || "");
+  if (Number.isFinite(lastRunMs) && nowMs - lastRunMs < config.autoGovernanceIntervalMinutes * 60_000) {
+    return config;
+  }
+
+  const now = new Date(nowMs).toISOString();
+  const nextSettings = { ...config.factorSettings };
+  const actions = [];
+  for (const definition of definitions) {
+    if (definition.role !== "direction") continue;
+    if (definition.governanceOnly && definition.autoGovernanceEligible !== true) continue;
+    const setting = factorSetting(config, definition);
+    if (setting.archived || definition.retired) continue;
+    const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
+    const evidence = chronologicalFactorEvidence(metric);
+    const orientationAllowed = !definition.governanceOnly || evidence.orientation === 1;
+    const tradeEvidence = closedTradeFactorEvidence(closedTrades, definition, evidence.orientation);
+    const validated = evidence.passed && tradeEvidence.passed && orientationAllowed &&
+      (definition.origin !== "mined" || definition.validationStatus === "validated");
+    const invalid = evidence.hasHoldout && tradeEvidence.sufficient && !validated;
+    const previousState = status.autoGovernance.factors[definition.id] || {};
+    const state = {
+      promotionStreak: validated ? safeNumber(previousState.promotionStreak) + 1 : 0,
+      demotionStreak: invalid ? safeNumber(previousState.demotionStreak) + 1 : 0,
+      lastEvaluatedAt: now,
+      lastChangedAt: previousState.lastChangedAt || null,
+      evidence: validated ? "validated" : invalid ? "invalid" : "collecting",
+      marketEvidencePassed: evidence.passed,
+      tradeEvidence
+    };
+    const lastChangedMs = Date.parse(state.lastChangedAt || "");
+    const cooldownComplete = !Number.isFinite(lastChangedMs) || nowMs - lastChangedMs >= AUTO_GOVERNANCE_COOLDOWN_MS;
+    let useInDecision = setting.useInDecision;
+    let action = null;
+    if (useInDecision && invalid && state.demotionStreak >= AUTO_GOVERNANCE_DEMOTION_RUNS && cooldownComplete) {
+      useInDecision = false;
+      action = "demoted_to_shadow";
+    } else if (!useInDecision && validated && state.promotionStreak >= AUTO_GOVERNANCE_PROMOTION_RUNS && cooldownComplete) {
+      useInDecision = true;
+      action = "promoted_to_decision";
+    }
+    nextSettings[definition.id] = { ...setting, enabled: true, useInDecision };
+    if (action) {
+      state.lastChangedAt = now;
+      actions.push({ factorId: definition.id, action, at: now, reason: state.evidence });
+    }
+    status.autoGovernance.factors[definition.id] = state;
+  }
+  status.autoGovernance.lastRunAt = now;
+  status.autoGovernance.runCount += 1;
+  if (actions.length) {
+    status.autoGovernance.lastActionAt = now;
+    status.autoGovernance.actions = [...status.autoGovernance.actions, ...actions].slice(-100);
+  }
+  const settingsChanged = JSON.stringify(nextSettings) !== JSON.stringify(config.factorSettings);
+  return settingsChanged
+    ? normalizeFactorLibraryConfig({ ...config, factorSettings: nextSettings, updatedAt: now }, status.minedFactors)
+    : config;
+}
+
+export function updateFactorLibraryRuntime({ config: configValue, status: statusValue, snapshots = [], historicalFrames = [], closedTrades = [], now = new Date().toISOString() }) {
   const nowMs = Date.parse(now);
   const status = normalizeFactorLibraryStatus(statusValue);
   let definitions = allDefinitions(status);
-  const config = normalizeFactorLibraryConfig(configValue, status.minedFactors);
+  let config = normalizeFactorLibraryConfig(configValue, status.minedFactors);
   status.generatedAt = now;
   status.mining.enabled = config.miningEnabled;
   if (!Number.isFinite(nowMs)) return { config, status };
@@ -1989,6 +2437,7 @@ export function updateFactorLibraryRuntime({ config: configValue, status: status
   definitions = allDefinitions(status);
   mineFactor(status, config, definitions, nowMs);
   definitions = allDefinitions(status);
+  config = applyAutomaticGovernance(config, status, definitions, nowMs, closedTrades);
   for (const snapshot of snapshots) {
     for (const definition of status.minedFactors) {
       if (!Object.hasOwn(snapshot.values, definition.id)) snapshot.values[definition.id] = round(minedValue(definition, snapshot.values));
@@ -2050,12 +2499,38 @@ export function publicFactorLibrary(configValue, statusValue) {
     ...status.minedFactors,
     ...(status.retiredMinedFactors || [])
   ]);
-  const minimumActiveFactors = Math.max(4, Math.ceil(1 / Math.max(config.maxFactorWeight, 1e-9)));
-  const eligibleDecisionIds = new Set(definitions.filter((definition) => {
-    const setting = factorSetting(config, definition);
-    return setting.enabled && setting.useInDecision && !setting.archived && definition.role === "direction" && evidenceOrientation(definition, status) != null;
-  }).map((definition) => definition.id));
-  const decisionReady = eligibleDecisionIds.size >= minimumActiveFactors;
+  const eligibleDecisionIdsByRole = Object.fromEntries(FACTOR_DECISION_ROLES.map((role) => [
+    role,
+    new Set(decisionDefinitions(config, definitions, status, role).map((definition) => definition.id))
+  ]));
+  const layerWeights = Object.fromEntries(FACTOR_DECISION_ROLES.map((role) => {
+    const ids = eligibleDecisionIdsByRole[role];
+    const stored = Object.fromEntries([...ids].map((id) => [id, safeNumber(status.effectiveWeights?.[id])]));
+    const storedTotal = Object.values(stored).reduce((sum, value) => sum + value, 0);
+    const storedCount = Object.values(stored).filter((value) => value > 0).length;
+    const roleDefinitions = definitions.filter((definition) => ids.has(definition.id));
+    return [role, storedTotal > 0 && storedCount === ids.size
+      ? constrainedWeights(roleDefinitions, stored, config)
+      : manualRoleWeights(config, definitions, status, role)];
+  }));
+  const layerReadiness = Object.fromEntries(FACTOR_DECISION_ROLES.map((role) => {
+    const eligibleFactors = eligibleDecisionIdsByRole[role].size;
+    const minimumActiveFactors = minimumActiveFactorsForRole(role, config);
+    const fullStrengthFactorCount = fullStrengthFactors(config);
+    return [role, {
+      ready: eligibleFactors >= minimumActiveFactors,
+      eligibleFactors,
+      minimumActiveFactors,
+      fullStrengthFactors: fullStrengthFactorCount,
+      strength: eligibleFactors >= minimumActiveFactors
+        ? clamp(eligibleFactors / fullStrengthFactorCount, 0, 1)
+        : 0,
+      target: role === "direction" ? "forward_return" : "absolute_forward_return"
+    }];
+  }));
+  const decisionReady = Object.values(layerReadiness).some((item) => item.ready);
+  const eligibleDecisionCount = Object.values(eligibleDecisionIdsByRole)
+    .reduce((sum, ids) => sum + ids.size, 0);
   const factors = publicDefinitions.map((definition) => {
     const setting = factorSetting(config, definition);
     const metrics = Object.fromEntries(config.horizonsMinutes.map((horizon) => [
@@ -2083,12 +2558,15 @@ export function publicFactorLibrary(configValue, statusValue) {
       enabled: definition.retired ? false : setting.enabled,
       useInDecision: definition.retired ? false : setting.useInDecision,
       archived: definition.retired === true || setting.archived,
-      effectiveWeight: decisionReady && eligibleDecisionIds.has(definition.id)
-        ? safeNumber(status.effectiveWeights?.[definition.id])
-        : 0,
       availability,
       evidenceStatus,
       empiricalStage,
+      effectiveWeight: layerReadiness[definition.role]?.ready && eligibleDecisionIdsByRole[definition.role]?.has(definition.id)
+        ? safeNumber(layerWeights[definition.role]?.[definition.id]) * layerReadiness[definition.role].strength
+        : 0,
+      decisionChannel: definition.governanceOnly ? `model_${definition.decisionLayer}_path` : `${definition.role}_head`,
+      autoGovernanceEligible: definition.role === "direction" && (!definition.governanceOnly || definition.autoGovernanceEligible === true),
+      autoGovernanceState: status.autoGovernance.factors?.[definition.id] || null,
       metrics
     };
   });
@@ -2103,20 +2581,33 @@ export function publicFactorLibrary(configValue, statusValue) {
       empiricalValidatedBuiltIn: factors.filter((item) => item.origin === "built_in" && item.empiricalStage === "out_of_sample_validated" && !item.archived).length,
       enabled: factors.filter((item) => item.enabled && !item.archived).length,
       inDecision: factors.filter((item) => item.enabled && item.useInDecision && !item.archived).length,
-      decisionEligible: eligibleDecisionIds.size,
+      decisionEligible: eligibleDecisionCount,
+      decisionEligibleByRole: Object.fromEntries(FACTOR_DECISION_ROLES.map((role) => [role, eligibleDecisionIdsByRole[role].size])),
+      modelFactors: factors.filter((item) => item.governanceOnly && !item.archived).length,
+      modelInDecision: factors.filter((item) => item.governanceOnly && item.enabled && item.useInDecision && !item.archived).length,
       mined: factors.filter((item) => item.origin === "mined" && !item.archived).length,
       validatedMined: factors.filter((item) => item.origin === "mined" && item.validationStatus === "validated" && !item.archived).length,
       retiredMined: factors.filter((item) => item.origin === "mined" && item.retired === true).length
     },
     factors,
     mining: status.mining,
+    autoGovernance: status.autoGovernance,
     dataSources: status.dataSources,
     pendingFrameCount: status.pendingFrames.length,
     decisionReadiness: {
       ready: decisionReady,
-      eligibleFactors: eligibleDecisionIds.size,
-      minimumActiveFactors,
-      reason: decisionReady ? null : "通过证据门槛的方向因子不足，因子组合暂不影响交易判断。"
+      eligibleFactors: eligibleDecisionCount,
+      operationalLayers: FACTOR_DECISION_ROLES.filter((role) => layerReadiness[role].ready),
+      layers: layerReadiness,
+      reason: decisionReady ? null : "没有任一普通因子层达到样本外证据与最小因子数门槛；模型治理路径和原始基线继续独立运行。"
+    },
+    architecture: {
+      mode: "layered_multi_factor",
+      progressiveActivation: "a layer starts with 4 validated active factors and scales linearly to full strength at 1/maxFactorWeight factors",
+      direction: "ordinary direction head + GBM/HMM model paths; may change direction only",
+      probability: "context head may attenuate confidence; Poisson/Bayesian/historical calibration estimate win probability",
+      risk: "ordinary risk head + GARCH volatility floor determine stop distance",
+      sizing: "calibrated probability + reward/risk + costs feed fractional Kelly; Markowitz and hard risk caps are applied afterward"
     },
     historicalBackfill: status.historicalBackfill,
     catalogAudit: FACTOR_CATALOG_AUDIT,
@@ -2124,6 +2615,8 @@ export function publicFactorLibrary(configValue, statusValue) {
     weightDiagnostics: status.weightDiagnostics || null,
     samplingPolicy: {
       usesPaperPositions: false,
+      automaticGovernanceUsesClosedPaperTrades: true,
+      automaticGovernanceUsesOpenPositions: false,
       runsWhenPaperEntriesPaused: true,
       realtimeSource: "public market candles, order book, trades and derivatives statistics",
       historicalSource: status.historicalBackfill.source,
@@ -2142,6 +2635,9 @@ export function publicFactorLibrary(configValue, statusValue) {
     },
     limitations: [
       "IC is a rolling predictive association, not proof of causality or future profitability.",
+      "Automatic governance currently applies only to direction factors and requires both out-of-sample market evidence and at least 60 eligible closed paper trades; realized R is a strategy-specific counterfactual proxy, not proof of future profit.",
+      "Context-factor IC targets absolute forward return, not directional hit rate, so the context head may attenuate a positive probability edge but cannot raise it.",
+      "A sparse layer starts at four validated active factors; its total influence is reduced in proportion to active-factor count until the full-strength factor count is reached.",
       "Built-in means the mechanism, data requirements and formula passed catalog checks; it does not mean the factor has passed this market's out-of-sample gate.",
       "Mined factors remain quarantined until chronological holdout, HAC statistic, coverage, realtime consistency and multiple-testing gates pass.",
       "Rejected mined factors retire only after extended observation; compact evidence is archived and the same semantic formula is not mined again.",
