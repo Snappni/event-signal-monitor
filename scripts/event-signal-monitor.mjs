@@ -86,6 +86,20 @@ import {
   GARCH_CONFIDENCE_WEIGHT
 } from "./model-factors.mjs";
 import { riskBudgetForNewPosition } from "./paper-risk-policy.mjs";
+import { buildDecisionGovernanceAudit } from "./decision-governance.mjs";
+import {
+  buildFeatureMissingMask,
+  buildRealizedEvModel,
+  compareShallowBoosting,
+  createDecisionLearningState,
+  evaluateRealizedEv,
+  normalizeDecisionEvent,
+  predictQualifiedProbability,
+  recordCandidateCycle,
+  recordServiceInterruption,
+  replayPortfolio,
+  trainElasticNetProbability
+} from "./decision-learning.mjs";
 
 const RUNTIME_DIR = path.resolve(
   process.env.SIGNAL_RUNTIME_DIR || path.resolve(".runtime", "event-signal-monitor")
@@ -105,9 +119,9 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.21.0";
+const MONITOR_VERSION = "0.22.0";
 const RUN_LAYER = "layered-multi-factor";
-const ENTRY_CALIBRATION_COHORT = "layered-multi-factor-v1";
+const ENTRY_CALIBRATION_COHORT = "single-writer-layered-v2";
 const MIN_ENTRY_CALIBRATION_COHORT_TRADES = 30;
 const LAYER_REPORT_PATH = REPORT_PATH;
 const MESSAGE_FEED_LIMIT = 200;
@@ -117,6 +131,9 @@ const SERVICE_STATUS_PATH = path.resolve(RUNTIME_DIR, "service-status.json");
 const SERVICE_LOCK_PATH = path.resolve(RUNTIME_DIR, "service.lock");
 const FACTOR_LIBRARY_CONFIG_PATH = path.resolve(RUNTIME_DIR, "factor-library-config.json");
 const FACTOR_LIBRARY_STATUS_PATH = path.resolve(RUNTIME_DIR, "factor-library-status.json");
+const CANDIDATE_AUDIT_PATH = path.resolve(RUNTIME_DIR, "candidate-audit.jsonl");
+const CANDIDATE_LABELS_PATH = path.resolve(RUNTIME_DIR, "candidate-labels.jsonl");
+const DECISION_EVENTS_PATH = path.resolve(RUNTIME_DIR, "decision-events.jsonl");
 const SERVICE_ACTIVE_DECISION_DELAY_MS = toPositiveInt(
   process.env.SIGNAL_ACTIVE_DECISION_DELAY_MS,
   5_000
@@ -137,6 +154,7 @@ const SERVICE_SHUTDOWN_GRACE_MS = toPositiveInt(
 const SERVICE_DECISION_TIMEOUT_EXIT_CODE = 70;
 const PRICE_EVENT_COALESCE_MS = toPositiveInt(process.env.SIGNAL_PRICE_EVENT_COALESCE_MS, 100);
 const ORDER_FLOW_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_ORDER_FLOW_SYMBOL_LIMIT, 12);
+const VOLUME_DIRECTION_ENABLED = process.env.SIGNAL_VOLUME_DIRECTION_ENABLED === "1";
 const FACTOR_EXTERNAL_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_FACTOR_EXTERNAL_SYMBOL_LIMIT, 4);
 const FACTOR_HISTORY_SYMBOL_LIMIT = toPositiveInt(process.env.SIGNAL_FACTOR_HISTORY_SYMBOL_LIMIT, 12);
 const FACTOR_HISTORY_LOOKBACK_MONTHS = toPositiveInt(process.env.SIGNAL_FACTOR_HISTORY_MONTHS, 3);
@@ -2304,6 +2322,12 @@ function analyzeMarket(
     ? clamp(safeNumber(microstructureSnapshot.signal), -1, 1)
     : 0;
   const effectiveDirectionWeights = { ...directionWeights };
+  effectiveDirectionWeights.volume = VOLUME_DIRECTION_ENABLED ? safeNumber(effectiveDirectionWeights.volume) : 0;
+  const volumeDisabledWeight = VOLUME_DIRECTION_ENABLED ? 0 : safeNumber(directionWeights.volume);
+  if (volumeDisabledWeight > 0) {
+    const activeWeight = Object.values(effectiveDirectionWeights).reduce((sum, value) => sum + safeNumber(value), 0);
+    if (activeWeight > 0) for (const key of Object.keys(effectiveDirectionWeights)) effectiveDirectionWeights[key] /= activeWeight;
+  }
   if (!orderFlowAvailable && effectiveDirectionWeights.orderFlow > 0) {
     const activeWeight = 1 - effectiveDirectionWeights.orderFlow;
     for (const key of Object.keys(effectiveDirectionWeights)) {
@@ -2492,7 +2516,8 @@ function buildCandidate(
   weightVersion = 1,
   calibration = {},
   tradingRulesBySymbol = {},
-  sessionContext = null
+  sessionContext = null,
+  learningContext = null
 ) {
   if (!market.latest || !Number.isFinite(market.latest)) return null;
 
@@ -2506,8 +2531,9 @@ function buildCandidate(
   const candidateMode = hasEventContext ? (highImpactEvent ? "event_impact" : "event_math") : "math_only";
   const eventWeight = hasEventContext ? (highImpactEvent ? 0.62 : eventScoreNorm > 0.25 ? 0.42 : 0.18) : 0;
   const mathWeight = 1 - eventWeight;
-  const combinedDirection = clamp(eventDirection * eventWeight + mathDirection * mathWeight, -1, 1);
-  if (Math.abs(combinedDirection) < MIN_COMBINED_DIRECTION) return null;
+  const rawCombinedDirection = eventDirection * eventWeight + mathDirection * mathWeight;
+  const combinedDirection = clamp(rawCombinedDirection, -1, 1);
+  const directionEligible = Math.abs(combinedDirection) >= MIN_COMBINED_DIRECTION;
 
   const side = combinedDirection > 0 ? "long" : "short";
   const alignment =
@@ -2629,11 +2655,34 @@ function buildCandidate(
     candidateMode,
     regime: market.regime
   });
-  const winRate = winRateCalibration.calibratedWinRate;
+  const learningFeatures = {
+    ...Object.fromEntries(Object.entries(market.factorValues || {}).map(([id, value]) => [`factor:${id}`, value])),
+    raw_entry_score: rawCombinedDirection,
+    event_score: eventScoreNorm,
+    math_score: mathDirection,
+    volatility: market.atrPct,
+    order_flow: market.orderFlowSignal,
+    funding: market.fundingSignal,
+    open_interest: market.oiSignal
+  };
+  const learnedWinRate = predictQualifiedProbability(learningContext?.probabilityModel, {
+    mode: candidateMode,
+    regime: market.regime,
+    raw_entry_score: rawCombinedDirection,
+    features: learningFeatures
+  });
+  const probabilityModelQualified = learnedWinRate != null;
+  const winRate = probabilityModelQualified ? learnedWinRate : winRateCalibration.calibratedWinRate;
   factors.poisson = poisson.directionalIntensity;
   factors.bayesian = Math.abs(bayesian.adjustment) / 0.08;
   const expectancyPct = winRate * rewardPct - (1 - winRate) * riskPct - roundTripExecutionCostPct;
   const expectancyR = riskPct > 0 ? expectancyPct / riskPct : 0;
+  const lockedTest = learningContext?.probabilityModel?.locked_test;
+  const gateCalibration = learningContext?.strict === true
+    ? probabilityModelQualified
+      ? { samples: lockedTest.samples, wins: lockedTest.wins, avgPredictedWinRate: lockedTest.average_probability, source: "locked_time_test" }
+      : {}
+    : calibration;
   const gateResult = evaluateAdaptiveEntryGate({
     riskProfile: normalizedAccountConfig.riskProfile,
     expectancyPct,
@@ -2648,7 +2697,7 @@ function buildCandidate(
     alignment,
     candidateMode,
     combinedDirection,
-    calibration
+    calibration: gateCalibration
   });
   const expectancyClass = expectancyR >= MIN_HIGH_EXPECTANCY_R ? "high" : "normal";
   const adaptiveWinRateThreshold = clamp(
@@ -2656,7 +2705,14 @@ function buildCandidate(
     0.35,
     0.95
   );
-  const passesGate = gateResult.passesGate && winRate >= adaptiveWinRateThreshold;
+  const realizedEv = evaluateRealizedEv(learningContext?.realizedEvModel, {
+    mode: candidateMode,
+    regime: market.regime,
+    side
+  });
+  const strictLearningGate = learningContext?.strict === true;
+  const passesGate = gateResult.passesGate && winRate >= adaptiveWinRateThreshold && directionEligible &&
+    (!strictLearningGate || (probabilityModelQualified && realizedEv.passed));
   const tradingRule = tradingRulesBySymbol[market.symbol] || null;
   const entry = tradingRule
     ? alignToStep(market.latest, tradingRule.tickSize, "nearest")
@@ -2695,10 +2751,24 @@ function buildCandidate(
       : market.volatilityExpansion
   });
   const accountAllowsSignal = accountControl.allowed;
+  const reasonCode = !directionEligible
+    ? "weak_direction"
+    : strictLearningGate && !probabilityModelQualified
+      ? "probability_model_unqualified"
+      : strictLearningGate && !realizedEv.passed
+        ? realizedEv.reason_code
+        : !gateResult.passesGate || winRate < adaptiveWinRateThreshold
+          ? "entry_gate_failed"
+          : !accountAllowsSignal
+            ? "account_control_blocked"
+            : "accepted";
   const finalStatus = passesGate && accountAllowsSignal ? "passed" : accountAllowsSignal ? "watch" : "blocked";
+  const candidateId = `cand_${randomUUID()}`;
 
   return {
-    id: `${market.symbol}-${Date.now()}-${side}`,
+    id: candidateId,
+    candidate_id: candidateId,
+    reason_code: reasonCode,
     calibrationCohort: ENTRY_CALIBRATION_COHORT,
     symbol: market.symbol,
     side,
@@ -2712,6 +2782,7 @@ function buildCandidate(
     winRateCalibration,
     expectancyPct,
     expectancyR,
+    roundTripExecutionCostPct,
     expectancyClass,
     adaptiveWinRateThreshold,
     breakEvenWinRate: gateResult.breakEvenWinRate,
@@ -2724,6 +2795,11 @@ function buildCandidate(
     eventImpactScore: Math.round(eventAggregate.score),
     marketSession: sessionContext,
     combinedDirection,
+    rawCombinedDirection,
+    raw_entry_score: rawCombinedDirection,
+    raw_exit_score: null,
+    features: learningFeatures,
+    feature_missing_mask: buildFeatureMissingMask(learningFeatures),
     mathSignal: market.mathSignal,
     eventDirection,
     regime: market.regime,
@@ -2736,6 +2812,11 @@ function buildCandidate(
       factorLibraryVersion: 3,
       factorLibraryWeightVersion: safeNumber(market.factorLibrary?.weightVersion, 1),
       regime: market.regime,
+      rawScores: {
+        entry: rawCombinedDirection,
+        exit: null
+      },
+      featureMissingMask: buildFeatureMissingMask(learningFeatures),
       factorLayers: Object.fromEntries(Object.entries(market.factorLayers || {}).map(([role, head]) => [role, {
         role,
         composite: safeNumber(head?.composite),
@@ -2810,6 +2891,7 @@ function buildCandidate(
         factorLibrary: market.factorLibrary || null,
         eventWeight,
         mathWeight,
+        rawCombinedDirection,
         combinedDirection
       },
       winRate: {
@@ -2828,6 +2910,9 @@ function buildCandidate(
         bayesianPosteriorWeight,
         rawWinRate,
         historicalCalibration: winRateCalibration,
+        elasticNetProbability: learnedWinRate,
+        probabilityModelQualified,
+        probabilityModelVersion: learningContext?.probabilityModel?.version || null,
         result: winRate
       },
       poisson,
@@ -2856,7 +2941,8 @@ function buildCandidate(
         slippageRate: normalizedAccountConfig.slippageRate,
         roundTripExecutionCostPct,
         expectancyPct,
-        expectancyR
+        expectancyR,
+        realizedConditional: realizedEv
       },
       gate: {
         formula:
@@ -2892,7 +2978,7 @@ function buildCandidate(
       },
       advancedModels: {
         formula:
-          "GBM/HMM are direction-layer model paths; Poisson/Bayesian are probability-layer model paths; GARCH is a risk-layer model path; Kelly/Markowitz are sizing-layer paths. Ordinary factor heads cannot cross these role boundaries.",
+          "GBM/HMM are direction-layer model paths, but HMM is migrated to shadow/off by default; Poisson/Bayesian are probability-layer paths; GARCH is risk-layer; Kelly/Markowitz are sizing-layer. Ordinary factor heads cannot cross role boundaries.",
         gbm: market.gbm,
         garch: market.garch,
         hiddenMarkov: market.hiddenMarkov,
@@ -2932,7 +3018,7 @@ function buildCandidate(
       `adaptiveGate=${(gateResult.adaptiveWinRateThreshold * 100).toFixed(1)}%`,
       `EV=${(expectancyPct * 100).toFixed(2)}%`
     ],
-    relatedEvents: eventAggregate.events
+    relatedEvents: (eventAggregate.events || []).map((event) => normalizeDecisionEvent(event))
   };
 }
 
@@ -3863,6 +3949,8 @@ function openPaperPosition(account, signal, now) {
   const position = {
     id: `paper-${signal.id}`,
     signalId: signal.id,
+    candidateId: signal.candidate_id || signal.id,
+    candidateReasonCode: signal.reason_code || "accepted",
     costModelVersion: 1,
     openedAt: now,
     status: "open",
@@ -3885,6 +3973,9 @@ function openPaperPosition(account, signal, now) {
     expectancyPct: signal.expectancyPct,
     expectancyR: signal.expectancyR,
     eventImpactScore: signal.eventImpactScore,
+    rawEntryScore: signal.raw_entry_score ?? signal.rawCombinedDirection ?? signal.combinedDirection,
+    rawExitScore: signal.raw_exit_score ?? null,
+    featureMissingMask: signal.feature_missing_mask || null,
     leverage: control.appliedLeverage,
     leverageRuleExact: control.leverageRuleExact,
     leverageRuleSource: control.leverageRuleSource,
@@ -4655,14 +4746,16 @@ async function main({ onStage = () => {} } = {}) {
   onStage("runtime-state");
   ensureRuntimeDir();
   const state = readJsonIfExists(STATE_PATH, createInitialState());
+  state.decisionLearning = createDecisionLearningState(state.decisionLearning);
   let factorStatus = normalizeFactorLibraryStatus(
     readJsonIfExists(FACTOR_LIBRARY_STATUS_PATH, createFactorLibraryStatus())
   );
+  const storedFactorConfig = readJsonIfExists(FACTOR_LIBRARY_CONFIG_PATH, {});
   let factorConfig = normalizeFactorLibraryConfig(
-    readJsonIfExists(FACTOR_LIBRARY_CONFIG_PATH, {}),
+    storedFactorConfig,
     factorStatus.minedFactors
   );
-  if (!fs.existsSync(FACTOR_LIBRARY_CONFIG_PATH)) writeJson(FACTOR_LIBRARY_CONFIG_PATH, factorConfig);
+  if (JSON.stringify(storedFactorConfig) !== JSON.stringify(factorConfig)) writeJson(FACTOR_LIBRARY_CONFIG_PATH, factorConfig);
   state.version = MONITOR_VERSION;
   state.modelWeights = { ...BASE_MODEL_WEIGHTS, ...(state.modelWeights || {}) };
   state.polymarket = state.polymarket || {};
@@ -4678,6 +4771,7 @@ async function main({ onStage = () => {} } = {}) {
   let accountSessionId;
   let reviewWeightVersion = 1;
   let entryCalibration = buildCurrentArchitectureCalibration([]);
+  let calibrationTrades = [];
   try {
     accountConfig = readAccountConfig();
     const initialPaperAccount = readPaperAccount(accountConfig);
@@ -4685,7 +4779,7 @@ async function main({ onStage = () => {} } = {}) {
       appendTradeHistoryRecords(RUNTIME_DIR, initialPaperAccount.tradeHistory);
       tradeHistoryMigrated = true;
     }
-    const calibrationTrades = [...new Map([
+    calibrationTrades = [...new Map([
       ...loadTradeHistoryRecords(RUNTIME_DIR, { limit: FACTOR_GOVERNANCE_TRADE_LIMIT }),
       ...initialPaperAccount.tradeHistory
     ].filter((trade) => trade?.id).map((trade) => [trade.id, trade])).values()];
@@ -4696,6 +4790,20 @@ async function main({ onStage = () => {} } = {}) {
   } finally {
     releaseInitialAccountLock();
   }
+  const realizedEvModel = buildRealizedEvModel([...calibrationTrades, ...state.decisionLearning.labels]);
+  const priorProbabilityModel = state.decisionLearning.probabilityModel;
+  if (!priorProbabilityModel || state.decisionLearning.labels.length - safeNumber(priorProbabilityModel.samples) >= 100) {
+    state.decisionLearning.probabilityModel = trainElasticNetProbability(state.decisionLearning.labels);
+    state.decisionLearning.boostingComparison = compareShallowBoosting(
+      state.decisionLearning.probabilityModel,
+      state.decisionLearning.labels
+    );
+  }
+  const learningContext = {
+    strict: true,
+    realizedEvModel,
+    probabilityModel: state.decisionLearning.probabilityModel
+  };
   const lastFactorGovernanceRunMs = Date.parse(factorStatus.autoGovernance?.lastRunAt || "");
   const factorGovernanceDue = factorConfig.autoGovernanceEnabled && (
     !Number.isFinite(lastFactorGovernanceRunMs) ||
@@ -4895,6 +5003,13 @@ async function main({ onStage = () => {} } = {}) {
       market.mathBreakdown.result = market.mathSignal;
     }
   }
+  const entryGovernanceAudit = buildDecisionGovernanceAudit({
+    markets: marketAnalyses,
+    factorSnapshots
+  });
+  if (!entryGovernanceAudit.conflictFree) {
+    warnings.push(`决策治理冲突：${entryGovernanceAudit.conflicts.map((item) => item.check).join("、")}；本轮停止新开仓。`);
+  }
   writeJson(FACTOR_LIBRARY_STATUS_PATH, factorStatus);
   const factorPublicState = publicFactorLibrary(factorConfig, factorStatus);
   const factorOneMinuteCoverage = factorPublicState.factors.find((item) => item.id === "return_1m")?.availability?.coverage || 0;
@@ -4941,10 +5056,19 @@ async function main({ onStage = () => {} } = {}) {
         reviewWeightVersion,
         entryCalibration,
         tradingRulesBySymbol,
-        currentMarketSession
+        currentMarketSession,
+        learningContext
       )
     )
     .filter(Boolean);
+  for (const candidate of rawCandidates) {
+    candidate.factorSnapshot.decisionGovernance = {
+      mode: entryGovernanceAudit.mode,
+      conflictFree: entryGovernanceAudit.conflictFree,
+      directionReviewMode: entryGovernanceAudit.directionReviewMode,
+      exitReviewMode: entryGovernanceAudit.exitReviewMode
+    };
+  }
   const markowitzResult = applyMarkowitzSizing(
     rawCandidates,
     marketBySymbol,
@@ -4954,8 +5078,27 @@ async function main({ onStage = () => {} } = {}) {
     marketAnalyses[0]?.modelGovernance || null
   );
   const candidates = markowitzResult.candidates.sort((a, b) => b.expectancyR - a.expectancyR);
-  const actionableSignals = candidates.filter((candidate) => candidate.status === "passed").slice(0, 5);
+  if (!entryGovernanceAudit.conflictFree) {
+    for (const candidate of candidates) if (candidate.status === "passed") {
+      candidate.status = "watch";
+      candidate.reason_code = "decision_governance_conflict";
+    }
+  }
+  const actionableSignals = entryGovernanceAudit.conflictFree
+    ? candidates.filter((candidate) => candidate.status === "passed").slice(0, 5)
+    : [];
   const watchlist = candidates.filter((candidate) => candidate.status !== "passed").slice(0, 8);
+  const learningCycle = recordCandidateCycle(state.decisionLearning, {
+    candidates,
+    acceptedIds: actionableSignals.map((candidate) => candidate.candidate_id),
+    prices: marketBySymbol,
+    events: allEvents,
+    observedAt: new Date().toISOString()
+  });
+  state.decisionLearning = learningCycle.state;
+  if (learningCycle.audits.length) fs.appendFileSync(CANDIDATE_AUDIT_PATH, `${learningCycle.audits.map((item) => JSON.stringify(item)).join("\n")}\n`);
+  if (learningCycle.matured.length) fs.appendFileSync(CANDIDATE_LABELS_PATH, `${learningCycle.matured.map((item) => JSON.stringify(item)).join("\n")}\n`);
+  if (learningCycle.newEvents.length) fs.appendFileSync(DECISION_EVENTS_PATH, `${learningCycle.newEvents.map((item) => JSON.stringify(item)).join("\n")}\n`);
   const closedSignals = updateOpenSignalsAndReviews(state, actionableSignals, marketBySymbol);
   onStage("account-update");
   const releaseAccountLock = await acquireAccountLock();
@@ -4982,6 +5125,12 @@ async function main({ onStage = () => {} } = {}) {
   }
   const messageFeed = buildMessageFeed(scoredEvents);
   const modelCalculations = buildModelCalculations(marketAnalyses, eventsBySymbol, candidates);
+  const decisionGovernance = buildDecisionGovernanceAudit({
+    markets: marketAnalyses,
+    factorSnapshots,
+    reviewConfig: updatedPaperAccount.postTradeReviewConfig,
+    reviewState: updatedPaperAccount.postTradeReview
+  });
 
   state.updatedAt = new Date().toISOString();
   const cycleModelGovernance = marketAnalyses[0]?.modelGovernance || modelFactorGovernance(factorConfig);
@@ -5025,13 +5174,13 @@ async function main({ onStage = () => {} } = {}) {
         "ATR",
         "RSI",
         "15m/1h ROC",
-        "15m 成交量确认",
+        "15m 成交量方向（仅影子记录，不参与方向）",
         "实时主动成交、CVD 与五档盘口",
         "资金费率",
         "OI 变化",
         "GBM",
         "GARCH(1,1)",
-        "三状态 HMM",
+        "三状态 HMM（默认关闭，仅影子记录）",
         "泊松事件到达分布",
         "贝叶斯后验胜率校准",
         "Markowitz 均值-方差配置"
@@ -5045,15 +5194,37 @@ async function main({ onStage = () => {} } = {}) {
         governance: cycleModelGovernance
       },
       mathOnlyGate:
-        "纯数学模式仍必须满足方向强度、正 EV 和自适应胜率门槛；门槛由成本保本胜率、校准误差、样本量、行情状态、波动和因子分歧共同决定，未过线只进入观察或模型展示。",
+        "纯数学模式必须同时满足方向强度、合格的时间外 elastic-net 概率模型和真实条件净 EV 单侧95%下界大于0；任一未过线只进入观察与标签采集。",
       liveTrading: "paper-alert-only，不会发送实盘订单。"
     },
     factorLibrary: factorPublicState,
+    decisionGovernance,
+    decisionLearning: {
+      policy: {
+        evGate: "realized conditional net EV one-sided 95% lower bound > 0",
+        labels: ["5m", "15m", "60m", "240m", "triple_barrier"],
+        serviceInterruptionsTrainable: false,
+        probabilityGate: { auc: ">0.52", brier: "better_than_constant", ece: "<0.05" }
+      },
+      candidatesAudited: learningCycle.audits.length,
+      labelsMatured: learningCycle.matured.length,
+      pendingIndependentLabels: state.decisionLearning.pending.length,
+      storedIndependentLabels: state.decisionLearning.labels.length,
+      probabilityModel: state.decisionLearning.probabilityModel,
+      boostingComparison: state.decisionLearning.boostingComparison,
+      realizedEvBuckets: realizedEvModel.buckets,
+      interruptions: state.decisionLearning.interruptions.slice(-20),
+      portfolioReplay: replayPortfolio(calibrationTrades, {
+        maxConcurrent: currentMarketSession.policy.maxConcurrentPositions,
+        maxClusterExposure: 1,
+        interruptions: state.decisionLearning.interruptions
+      })
+    },
     reportPath: LAYER_REPORT_PATH,
     disclaimer:
       "Trading signals are not profit guarantees. No live order is sent unless the user separately authorizes real trading API access.",
     gateRules: {
-      mode: "adaptive-break-even-plus-uncertainty",
+      mode: "qualified-probability-plus-realized-net-ev-lower-bound",
       formula:
         "threshold = clamp(cost-adjusted break-even win rate + profile/sample/calibration/regime/volatility/alignment/mode margins - strong-direction discount, profile safety bounds)",
       safetyBounds: ADAPTIVE_GATE_BOUNDS,
@@ -5272,11 +5443,24 @@ async function runService({ decisionRunner = run } = {}) {
     }
     throw error;
   }
+  const previousServiceState = readJsonIfExists(SERVICE_STATUS_PATH, null);
+  const serviceStartedAt = new Date().toISOString();
+  const previousHeartbeatMs = Date.parse(previousServiceState?.heartbeatAt || previousServiceState?.lastDecisionCompletedAt || "");
+  if (!previousServiceState?.stoppedAt && Number.isFinite(previousHeartbeatMs) && Date.parse(serviceStartedAt) - previousHeartbeatMs > SERVICE_IDLE_DECISION_DELAY_MS * 2) {
+    const persistedState = readJsonIfExists(STATE_PATH, createInitialState());
+    persistedState.decisionLearning = recordServiceInterruption(
+      createDecisionLearningState(persistedState.decisionLearning),
+      new Date(previousHeartbeatMs).toISOString(),
+      serviceStartedAt,
+      "unclean_service_interruption"
+    );
+    writeJson(STATE_PATH, persistedState);
+  }
   const serviceState = {
     version: 1,
     mode: "event-driven-hybrid",
     pid: process.pid,
-    startedAt: new Date().toISOString(),
+    startedAt: serviceStartedAt,
     heartbeatAt: null,
     decisionBackend: "adaptive-sequential-rest",
     priceBackend: "binance-bookTicker-websocket",
@@ -6482,7 +6666,7 @@ function runRiskProfileSelfTest() {
   );
 }
 
-function runAdaptiveExitIntegrationSelfTest() {
+function runAdaptiveExitIntegrationSelfTest({ emit = true } = {}) {
   const config = normalizeAccountConfig({
     initialCapital: 1000,
     marketType: "futures",
@@ -6691,17 +6875,91 @@ function runAdaptiveExitIntegrationSelfTest() {
   ) {
     throw new Error("failed dynamic partial take-profit changed the target state");
   }
-  console.log(
-    JSON.stringify({
-      passed: true,
-      availableEquityRatio: availableRatio,
-      confirmationRuns: 3,
-      deRiskFraction: partialEvents[0].fraction,
-      dynamicTakeProfitFraction: takeProfitResult.partialTakeProfits[0].fraction,
-      closeReason: closed[0].closeReason,
-      lifetimeClosedTrades: account.lifetimeClosedTrades
-    })
-  );
+  const result = {
+    passed: true,
+    entryGatePassed: signal.status === "passed" && signal.accountControl.allowed === true,
+    positionOpened: Boolean(opened),
+    positionClosed: closed.length === 1 && !account.positions[opened.id],
+    availableEquityRatio: availableRatio,
+    confirmationRuns: 3,
+    deRiskFraction: partialEvents[0].fraction,
+    dynamicTakeProfitFraction: takeProfitResult.partialTakeProfits[0].fraction,
+    closeReason: closed[0].closeReason,
+    lifetimeClosedTrades: account.lifetimeClosedTrades
+  };
+  if (emit) console.log(JSON.stringify(result));
+  return result;
+}
+
+function runGovernedDecisionFullChainSelfTest() {
+  const exitLifecycle = runAdaptiveExitIntegrationSelfTest({ emit: false });
+  const market = {
+    symbol: "BTCUSDT",
+    factorLayers: {
+      direction: { activeFactors: [{ id: "return_15m" }] },
+      context: { activeFactors: [{ id: "volume_zscore" }] },
+      risk: { activeFactors: [{ id: "realized_volatility" }] }
+    },
+    modelGovernance: {
+      gbm: { factorId: "model_gbm_direction" },
+      garch: { factorId: "model_garch_volatility" },
+      hiddenMarkov: { factorId: "hmm_regime_signal" }
+    }
+  };
+  const factorSnapshot = {
+    symbol: "BTCUSDT",
+    modelReuse: { gbm: true, garch: true, hiddenMarkov: true }
+  };
+  const audit = buildDecisionGovernanceAudit({
+    markets: [market],
+    factorSnapshots: [factorSnapshot],
+    reviewConfig: normalizePostTradeReviewConfig({ autoApplyValidatedWeights: true }),
+    reviewState: createPostTradeReviewState(DIRECTION_MODEL_WEIGHTS, "self-test")
+  });
+  const detectorProbe = buildDecisionGovernanceAudit({
+    markets: [{
+      ...market,
+      factorLayers: {
+        ...market.factorLayers,
+        context: { activeFactors: [{ id: "return_15m" }] }
+      }
+    }],
+    factorSnapshots: [{
+      ...factorSnapshot,
+      modelReuse: { gbm: false, garch: true, hiddenMarkov: true }
+    }]
+  });
+  if (
+    !audit.conflictFree ||
+    detectorProbe.conflictFree ||
+    !exitLifecycle.entryGatePassed ||
+    !exitLifecycle.positionOpened ||
+    !exitLifecycle.positionClosed
+  ) {
+    throw new Error(`governed decision full-chain self-test failed: ${JSON.stringify({ audit, detectorProbe, exitLifecycle })}`);
+  }
+  console.log(JSON.stringify({
+    passed: true,
+    chain: [
+      "signal_observed",
+      "factor_layers_evaluated",
+      "model_outputs_reused",
+      "single_writer_audited",
+      "entry_gate_passed",
+      "position_opened",
+      "dynamic_exit_confirmed",
+      "position_closed",
+      "exit_review_only"
+    ],
+    conflictFree: audit.conflictFree,
+    conflictDetectorVerified: !detectorProbe.conflictFree,
+    directionReviewMode: audit.directionReviewMode,
+    modelReuse: factorSnapshot.modelReuse,
+    entryGatePassed: exitLifecycle.entryGatePassed,
+    positionOpened: exitLifecycle.positionOpened,
+    positionClosed: exitLifecycle.positionClosed,
+    closeReason: exitLifecycle.closeReason
+  }));
 }
 
 function runCapitalRotationIntegrationSelfTest() {
@@ -7039,6 +7297,8 @@ const execution = process.argv.includes("--service")
     ? Promise.resolve().then(runFactorHistoryWorkerIsolationSelfTest)
   : process.argv.includes("--self-test-stream-isolation")
     ? Promise.resolve().then(runMarketStreamIsolationSelfTest)
+  : process.argv.includes("--self-test-decision-governance")
+    ? Promise.resolve().then(runGovernedDecisionFullChainSelfTest)
   : process.argv.includes("--self-test-costs")
     ? Promise.resolve().then(runCostModelSelfTest)
   : process.argv.includes("--self-test-models")

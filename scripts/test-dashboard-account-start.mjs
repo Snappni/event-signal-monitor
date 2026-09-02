@@ -177,7 +177,7 @@ try {
   assert.ok(appScript.includes('timeZone: "Asia/Shanghai"'), "dashboard timestamps must use Beijing time explicitly");
   assert.ok(appScript.includes("北京时间 UTC+8"), "dashboard timestamps must label their timezone");
   assert.ok(appScript.includes('setInterval(() => refreshLog().catch(showError), 1_000)'), "log page must poll incremental updates every second");
-  assert.ok(appScript.includes('? 1_000\n      : 3_000'), "overview must refresh once per second");
+  assert.match(appScript, /\? 1_000\r?\n      : 3_000/, "overview must refresh once per second");
   assert.ok(appScript.includes("决策循环已停滞"), "overview must distinguish a stalled decision loop from a stopped process");
   assert.ok(appScript.includes("信号结果观察中（最长 72 小时，非仓位）"), "tracked signals must expose their bounded observation window");
   assert.ok(appScript.includes("清晰视图时间：北京时间 UTC+8"), "clean log view must label converted timestamps");
@@ -421,7 +421,7 @@ try {
   const reviewConfigResponse = await fetch(`${baseUrl}/api/post-trade-review/config`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled: true, reviewEveryTrades: 12, autoApplyValidatedWeights: true })
+    body: JSON.stringify({ enabled: true, reviewEveryTrades: 12, autoApplyValidatedExitWeights: true })
   });
   assert.equal(reviewConfigResponse.status, 200);
   const reviewConfigText = await reviewConfigResponse.text();
@@ -429,7 +429,9 @@ try {
   assert.ok(!reviewConfigText.includes('"tradeHistory"'));
   const reviewConfig = JSON.parse(reviewConfigText);
   assert.equal(reviewConfig.config.reviewEveryTrades, 12);
-  assert.equal(reviewConfig.config.autoApplyValidatedWeights, true);
+  assert.equal(reviewConfig.config.autoApplyValidatedWeights, false);
+  assert.equal(reviewConfig.config.autoApplyValidatedExitWeights, true);
+  assert.equal(reviewConfig.config.directionMode, "fixed_champion_read_only");
 
   const reviewAccountResponse = await fetch(`${baseUrl}/api/account`);
   const reviewAccount = await reviewAccountResponse.json();
@@ -455,7 +457,8 @@ try {
   assert.ok(reviewStateText.length < 100_000, "review page payload must stay compact");
   const reviewState = JSON.parse(reviewStateText);
   assert.equal(reviewState.config.reviewEveryTrades, 12);
-  assert.equal(reviewState.config.autoApplyValidatedWeights, true);
+  assert.equal(reviewState.config.autoApplyValidatedWeights, false);
+  assert.equal(reviewState.config.autoApplyValidatedExitWeights, true);
   assert.equal(reviewState.closedTrades, 640);
   assert.equal(reviewState.review.latestReview.trades.length, 20);
   assert.equal("reviewHistory" in reviewState.review, false);

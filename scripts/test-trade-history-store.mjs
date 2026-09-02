@@ -14,6 +14,9 @@ import {
 const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "trade-history-store-"));
 const trade = (id, closedAt, realizedPnl) => ({
   id,
+  signalId: `signal-${id}`,
+  candidateId: `candidate-${id}`,
+  candidateReasonCode: "accepted",
   sessionId: "session-test",
   status: "closed",
   calibrationCohort: "layered-multi-factor-v1",
@@ -31,6 +34,8 @@ const trade = (id, closedAt, realizedPnl) => ({
   realizedPnl,
   realizedReturnPct: realizedPnl / 100,
   winRate: 0.6,
+  rawEntryScore: 1.2,
+  featureMissingMask: { missing_feature: true },
   maxFavorableExcursionPct: 0.04,
   maxAdverseExcursionPct: -0.01,
   decisionCalculation: {
@@ -44,6 +49,8 @@ const trade = (id, closedAt, realizedPnl) => ({
     oversized: "x".repeat(100_000)
   },
   factorSnapshot: { direction: { contributions: { trend: 0.2 } } },
+  exitFactorSnapshot: { rawExitScore: 1.35 },
+  relatedEvents: [{ event_id: "evt-1", occurred_at: "2026-06-30T20:00:00Z", fetched_at: "2026-06-30T20:01:00Z", normalized_hash: "abc", source: "fixture", language: "en", cluster_id: "cluster-1" }],
   holdingObservations: Array.from({ length: 10_000 }, (_, index) => ({ index })),
   calculation: { oversized: "x".repeat(100_000) }
 });
@@ -74,6 +81,11 @@ try {
   assert.equal(firstPage.records[0].holdingObservationCount, 10_000);
   assert.equal(firstPage.records[0].decisionCalculation.direction.combinedDirection, 0.7);
   assert.equal(firstPage.records[0].calibrationCohort, "layered-multi-factor-v1");
+  assert.equal(firstPage.records[0].candidateId, "candidate-trade-c");
+  assert.equal(firstPage.records[0].rawEntryScore, 1.2);
+  assert.equal(firstPage.records[0].rawExitScore, 1.35);
+  assert.equal(firstPage.records[0].featureMissingMask.missing_feature, true);
+  assert.equal(firstPage.records[0].relatedEvents[0].cluster_id, "cluster-1");
   assert.equal(Object.hasOwn(firstPage.records[0].decisionCalculation, "oversized"), false);
 
   const compact = compactArchivedTrade(rows[0]);

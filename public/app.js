@@ -607,7 +607,7 @@ function renderPostTradeReview(account, currency) {
   const everyInput = $("#reviewEveryTrades");
   const autoInput = $("#reviewAutoApply");
   if (everyInput) setInputValueIfUnfocused(everyInput, interval);
-  if (autoInput && document.activeElement !== autoInput) autoInput.checked = config.autoApplyValidatedWeights === true;
+  if (autoInput && document.activeElement !== autoInput) autoInput.checked = config.autoApplyValidatedExitWeights === true;
 
   const status = $("#postTradeReviewStatus");
   if (status) {
@@ -615,10 +615,10 @@ function renderPostTradeReview(account, currency) {
     if (config.enabled === false) {
       status.textContent = "复盘已停用";
     } else if (latest?.status === "promoted") {
-      status.textContent = `权重版本 v${reviewState.weightVersion || 1} 已晋升`;
+      status.textContent = `退出权重 v${reviewState.exitWeightVersion || 1} 已晋升`;
       status.classList.add("ready");
-    } else if (latest?.promotionEligible) {
-      status.textContent = "候选权重已通过验证";
+    } else if (latest?.exitPromotionEligible) {
+      status.textContent = "退出候选已通过验证";
       status.classList.add("ready");
     } else if (latest) {
       status.textContent = latest.status === "insufficient_data" ? "样本不足，仅生成诊断" : "候选权重影子观察中";
@@ -630,11 +630,11 @@ function renderPostTradeReview(account, currency) {
 
   const applyButton = $("#applyReviewCandidateButton");
   const rollbackButton = $("#rollbackReviewWeightsButton");
-  if (applyButton) applyButton.disabled = state.postTradeReviewSubmitting || !latest?.promotionEligible || latest?.applied;
+  if (applyButton) applyButton.disabled = state.postTradeReviewSubmitting || !latest?.exitPromotionEligible || latest?.applied;
   if (rollbackButton) {
     rollbackButton.disabled =
       state.postTradeReviewSubmitting ||
-      (!reviewState.previousDirectionWeights && !reviewState.previousExitWeights);
+      !reviewState.previousExitWeights;
   }
 
   const target = $("#postTradeReview");
@@ -671,9 +671,9 @@ function renderPostTradeReview(account, currency) {
       return `
         <div class="review-factor-row">
           <div class="review-factor-name"><strong>${escapeHtml(reviewFactorLabels[item.factor] || item.factor)}</strong><span>${fmtNumber(item.activeSamples || 0, 0)}/${fmtNumber(item.samples || 0, 0)} 笔有效</span></div>
-          <div><span class="row-meta">当前权重</span>${fmtPct(item.currentWeight || 0, 2)}</div>
-          <div><span class="row-meta">候选权重</span>${item.candidateWeight == null ? "-" : fmtPct(item.candidateWeight, 2)}</div>
-          <div class="review-factor-delta ${deltaClass}"><span class="row-meta">建议变化</span>${item.candidateWeight == null ? "-" : fmtPct(delta, 2)}</div>
+          <div><span class="row-meta">固定冠军</span>${fmtPct(item.currentWeight || 0, 2)}</div>
+          <div><span class="row-meta">证据候选</span>${item.candidateWeight == null ? "-" : fmtPct(item.candidateWeight, 2)}</div>
+          <div class="review-factor-delta ${deltaClass}"><span class="row-meta">只读差异</span>${item.candidateWeight == null ? "-" : fmtPct(delta, 2)}</div>
           <div><span class="row-meta">反事实关联</span>${fmtNumber(item.directionAssociation || 0, 3)}</div>
         </div>
       `;
@@ -750,7 +750,7 @@ function renderPostTradeReview(account, currency) {
         <div class="review-card"><span>候选权重准确率</span><strong>${fmtPct(validation.challenger?.accuracy || 0, 1)}</strong></div>
       </div>
     ` : `<p class="review-note">目前只有 ${fmtNumber(latest.eligibleTrades || 0, 0)} 笔可归因交易；至少需要 ${fmtNumber(config.minimumProposalTrades || 20, 0)} 笔才生成候选权重。</p>`}
-    <div class="review-subtitle">因子归因与候选权重</div>
+    <div class="review-subtitle">固定方向冠军与只读证据候选</div>
     <div>${factorRows || `<div class="empty">暂无因子统计</div>`}</div>
     <div class="review-subtitle">退出因子迭代（含动态盈利保护）</div>
     ${exitValidation ? `
@@ -766,7 +766,7 @@ function renderPostTradeReview(account, currency) {
     <div>${qualityRows || `<div class="empty">暂无质量因子统计</div>`}</div>
     <div class="review-subtitle">最近交易完整链路摘要</div>
     <div>${tradeRows || `<div class="empty">暂无具备开仓快照的交易</div>`}</div>
-    <p class="review-note">这里衡量的是因子与结果的预测关联，不是因果证明。候选权重每轮变化受限，并且必须先在后段时间样本上胜过当前权重；无证据表明权重变化一定提高未来盈利。</p>
+    <p class="review-note">这里衡量的是因子与结果的预测关联，不是因果证明。方向候选不写入决策，因子库独占方向治理；退出候选必须先在后段时间样本上胜过当前权重。无证据表明权重变化一定提高未来盈利。</p>
   `;
 }
 
@@ -2044,7 +2044,7 @@ function bindEvents() {
       state.account = await postJson("/api/post-trade-review/config", {
         enabled: true,
         reviewEveryTrades: Number($("#reviewEveryTrades").value),
-        autoApplyValidatedWeights: $("#reviewAutoApply").checked
+        autoApplyValidatedExitWeights: $("#reviewAutoApply").checked
       });
       render();
     } catch (error) {

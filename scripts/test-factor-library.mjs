@@ -146,7 +146,7 @@ assert.ok(Number.isFinite(spectral.phaseSignal));
 
 const defaultModelGovernance = modelFactorGovernance(normalizeFactorLibraryConfig());
 assert.equal(defaultModelGovernance.gbm.useInDecision, true);
-assert.equal(defaultModelGovernance.hiddenMarkov.useInDecision, true);
+assert.equal(defaultModelGovernance.hiddenMarkov.useInDecision, false);
 const shadowModelGovernance = modelFactorGovernance(normalizeFactorLibraryConfig({
   factorSettings: { model_gbm_direction: { enabled: true, useInDecision: false } }
 }));
@@ -176,7 +176,7 @@ let governanceStatus = normalizeFactorLibraryStatus({
     }
   }
 });
-const governanceTrades = (beneficial) => Array.from({ length: 80 }, (_, index) => {
+const governanceTrades = (beneficial, count = 400) => Array.from({ length: count }, (_, index) => {
   const side = index % 2 ? "long" : "short";
   const sideDirection = side === "long" ? 1 : -1;
   return {
@@ -184,7 +184,7 @@ const governanceTrades = (beneficial) => Array.from({ length: 80 }, (_, index) =
     side,
     initialMaxLossAmount: 100,
     realizedPnl: beneficial ? 40 : -40,
-    closedAt: new Date(Date.parse("2026-07-01T00:00:00.000Z") + index * 3_600_000).toISOString(),
+    closedAt: new Date(Date.parse("2026-01-01T00:00:00.000Z") + index * 5 * 3_600_000).toISOString(),
     factorSnapshot: { factorLibrary: { values: { fourier_dominant_phase: sideDirection * 0.6 } } }
   };
 });
@@ -200,9 +200,16 @@ const governanceTrades = (beneficial) => Array.from({ length: 80 }, (_, index) =
   status: governanceStatus,
   snapshots: [],
   closedTrades: governanceTrades(true),
-  now: "2026-07-30T01:01:00.000Z"
+  now: "2026-07-31T00:01:00.000Z"
 }));
-assert.equal(governanceConfig.factorSettings.fourier_dominant_phase.useInDecision, true, "two validated runs should promote a shadow factor");
+({ config: governanceConfig, status: governanceStatus } = updateFactorLibraryRuntime({
+  config: governanceConfig,
+  status: governanceStatus,
+  snapshots: [],
+  closedTrades: governanceTrades(true),
+  now: "2026-08-01T00:02:00.000Z"
+}));
+assert.equal(governanceConfig.factorSettings.fourier_dominant_phase.useInDecision, true, "validated evidence must dwell for 48 hours before promotion");
 governanceStatus.metrics.fourier_dominant_phase[15] = {
   values: [...Array(72).fill(0.03), ...Array(48).fill(-0.03)],
   coverageValues: Array(120).fill(1),
@@ -212,15 +219,15 @@ governanceStatus.metrics.fourier_dominant_phase[15] = {
   config: governanceConfig,
   status: governanceStatus,
   snapshots: [],
-  closedTrades: governanceTrades(false),
-  now: "2026-07-30T08:01:00.000Z"
+  closedTrades: governanceTrades(false, 600),
+  now: "2026-08-03T00:03:00.000Z"
 }));
 ({ config: governanceConfig, status: governanceStatus } = updateFactorLibraryRuntime({
   config: governanceConfig,
   status: governanceStatus,
   snapshots: [],
-  closedTrades: governanceTrades(false),
-  now: "2026-07-30T09:02:00.000Z"
+  closedTrades: governanceTrades(false, 600),
+  now: "2026-08-04T00:04:00.000Z"
 }));
 assert.equal(governanceConfig.factorSettings.fourier_dominant_phase.useInDecision, false, "two invalid runs after cooldown should demote a factor to shadow");
 assert.ok(governanceStatus.autoGovernance.actions.some((item) => item.action === "promoted_to_decision"));
@@ -376,18 +383,18 @@ for (let leftIndex = 0; leftIndex < directionDefinitions.length && rejectedDefin
 }
 const rejectedMetrics = Object.fromEntries(rejectedDefinitions.map((definition) => [definition.id, {
   15: {
-    samples: 90,
+    samples: 200,
     meanIc: 0.001,
     icStd: 0.2,
     icir: 0.005,
     tStatistic: 0.05,
     coverage: 1,
     lastIc: 0.001,
-    historySamples: 60,
-    realtimeSamples: 30,
-    values: Array(90).fill(0.001),
-    coverageValues: Array(90).fill(1),
-    sourceValues: [...Array(60).fill(0), ...Array(30).fill(1)]
+    historySamples: 140,
+    realtimeSamples: 60,
+    values: Array(200).fill(0.001),
+    coverageValues: Array(200).fill(1),
+    sourceValues: [...Array(140).fill(0), ...Array(60).fill(1)]
   }
 }]));
 let recyclingConfig = normalizeFactorLibraryConfig({ miningEnabled: true });
@@ -413,7 +420,7 @@ assert.equal(recyclingStatus.retiredMinedFactors.length, 20, "mature rejected fa
 assert.equal(recyclingStatus.mining.retiredCount, 20);
 assert.equal(recyclingStatus.minedFactors.length, 1, "retirement must immediately free one slot for a new candidate");
 assert.ok(
-  recyclingStatus.retiredMinedFactors.every((item) => item.retiredMetrics?.[15]?.samples === 90),
+  recyclingStatus.retiredMinedFactors.every((item) => item.retiredMetrics?.[15]?.samples === 200),
   "retired factors must retain compact validation evidence"
 );
 assert.ok(
@@ -461,9 +468,9 @@ let validatedStatus = normalizeFactorLibraryStatus({
         icStd: 0.1,
         icir: 0.5,
         tStatistic: 5,
-        values: Array.from({ length: 90 }, (_, index) => index % 2 ? 0.04 : 0.06),
-        coverageValues: Array(90).fill(1),
-        sourceValues: [...Array(60).fill(0), ...Array(30).fill(1)]
+        values: Array.from({ length: 200 }, (_, index) => index % 2 ? 0.04 : 0.06),
+        coverageValues: Array(200).fill(1),
+        sourceValues: [...Array(140).fill(0), ...Array(60).fill(1)]
       }
     }
   }
@@ -664,9 +671,9 @@ const strictDecision = factorDecisionForSnapshot(
   normalizeFactorLibraryConfig({ enabled: true }),
   strictEvidenceStatus
 );
-assert.equal(strictDecision.requestedFactors, 10);
-assert.equal(strictDecision.sufficient, true, "ten direction factors with stable holdout evidence may influence the original decision");
-assert.ok(strictDecision.influence > 0);
+assert.equal(strictDecision.requestedFactors, 1, "perfectly correlated direction factors must collapse to one representative");
+assert.equal(strictDecision.sufficient, false, "one correlation-cluster representative cannot masquerade as ten independent factors");
+assert.equal(strictDecision.influence, 0);
 
 const layerFactorIds = Object.fromEntries(["context", "risk"].map((role) => [role,
   FACTOR_DEFINITIONS
@@ -675,7 +682,7 @@ const layerFactorIds = Object.fromEntries(["context", "risk"].map((role) => [rol
     .map((item) => item.id)
 ]));
 const layeredEvidenceStatus = normalizeFactorLibraryStatus({
-  metrics: Object.fromEntries([...validatedDirectionIds, ...layerFactorIds.context, ...layerFactorIds.risk].map((id) => [id, {
+  metrics: Object.fromEntries([...validatedDirectionIds, ...layerFactorIds.context, ...layerFactorIds.risk].map((id, definitionIndex) => [id, {
     15: {
       samples: stableHoldoutValues.length,
       meanIc: 0.025,
@@ -683,7 +690,7 @@ const layeredEvidenceStatus = normalizeFactorLibraryStatus({
       icir: 6.25,
       tStatistic: 60,
       coverage: 1,
-      values: stableHoldoutValues,
+      values: stableHoldoutValues.map((value, sampleIndex) => value + Math.sin((sampleIndex + 1) * (definitionIndex + 2)) * 0.012),
       coverageValues: Array(stableHoldoutValues.length).fill(1),
       sourceValues: Array(stableHoldoutValues.length).fill(0)
     }

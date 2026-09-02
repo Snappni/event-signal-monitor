@@ -15,7 +15,7 @@ import {
   estimateGarch11
 } from "./model-factors.mjs";
 
-const FACTOR_LIBRARY_VERSION = 7;
+const FACTOR_LIBRARY_VERSION = 8;
 const PRIMARY_IC_HORIZON_MINUTES = 15;
 const FACTOR_DECISION_ROLES = Object.freeze(["direction", "context", "risk"]);
 const MIN_ACTIVE_LAYER_FACTORS = 4;
@@ -30,12 +30,16 @@ const HISTORICAL_BACKFILL_VERSION = 4;
 export const FACTOR_HISTORICAL_SAMPLING_MODE = "hourly_anchors_non_overlapping_partitioned_v4";
 const MIN_CROSS_SECTION_SYMBOLS = 8;
 const MIN_SMART_WEIGHT_SAMPLES = 30;
-const MIN_MINED_FACTOR_SAMPLES = 90;
+const MIN_MINED_FACTOR_SAMPLES = 200;
 const AUTO_GOVERNANCE_PROMOTION_RUNS = 2;
 const AUTO_GOVERNANCE_DEMOTION_RUNS = 2;
-const AUTO_GOVERNANCE_COOLDOWN_MS = 6 * 60 * 60 * 1_000;
-const AUTO_GOVERNANCE_MIN_CLOSED_TRADES = 60;
-const AUTO_GOVERNANCE_MAX_CLOSED_TRADES = 240;
+const AUTO_GOVERNANCE_COOLDOWN_MS = 48 * 60 * 60 * 1_000;
+const AUTO_GOVERNANCE_MIN_NEW_LABELS = 100;
+const AUTO_GOVERNANCE_MIN_CLOSED_TRADES = 200;
+const AUTO_GOVERNANCE_MAX_CLOSED_TRADES = 2_000;
+const FACTOR_FDR_Q = 0.05;
+const CORRELATION_CLUSTER_THRESHOLD = 0.85;
+const VOLATILITY_ESTIMATOR_IDS = new Set(["parkinson_volatility", "garman_klass_volatility", "rogers_satchell_volatility", "yang_zhang_volatility"]);
 
 export const FACTOR_RESEARCH_REFERENCES = Object.freeze({
   formulaic_alpha: Object.freeze({
@@ -292,7 +296,7 @@ export const FACTOR_DEFINITIONS = Object.freeze([
   }),
   factor("hmm_regime_signal", "HMM方向模型因子", "模型与频域", "direction", "三状态HMM", "HMM牛熊状态概率差；因子库只治理其原有单一路径，不重复叠加。", {
     defaultEnabled: true,
-    defaultUseInDecision: true,
+    defaultUseInDecision: false,
     governanceTarget: "hiddenMarkov",
     autoGovernanceEligible: true,
     referenceIds: ["factor_pipeline", "factor_evaluation"]
@@ -508,7 +512,7 @@ export const DEFAULT_FACTOR_LIBRARY_CONFIG = Object.freeze({
   autoPromoteMined: false,
   decisionInfluence: 0.25,
   captureIntervalSeconds: 60,
-  adjustmentIntervalMinutes: 60,
+  adjustmentIntervalMinutes: 1440,
   miningIntervalMinutes: 15,
   maxFactorWeight: 0.1,
   maxCategoryWeight: 0.3,
@@ -891,6 +895,7 @@ export function modelFactorGovernance(configValue = {}) {
 
 export function normalizeFactorLibraryConfig(value = {}, extraDefinitions = []) {
   const raw = value && typeof value === "object" ? value : {};
+  const disableHmmForVersion8Migration = safeNumber(raw.version) < FACTOR_LIBRARY_VERSION;
   const definitions = [...FACTOR_DEFINITIONS, ...extraDefinitions];
   const mergedDuplicateIds = new Set(
     definitions.flatMap((definition) => Array.isArray(definition.mergedDuplicateIds) ? definition.mergedDuplicateIds : [])
@@ -911,7 +916,9 @@ export function normalizeFactorLibraryConfig(value = {}, extraDefinitions = []) 
       : primary;
     settings[definition.id] = {
       enabled: override.enabled ?? definition.defaultEnabled,
-      useInDecision: override.useInDecision ?? definition.defaultUseInDecision,
+      useInDecision: definition.id === "hmm_regime_signal" && disableHmmForVersion8Migration
+        ? false
+        : (override.useInDecision ?? definition.defaultUseInDecision),
       weight: clamp(safeNumber(override.weight, definition.defaultWeight), 0, 100),
       archived: override.archived === true
     };
@@ -930,17 +937,17 @@ export function normalizeFactorLibraryConfig(value = {}, extraDefinitions = []) 
     enabled: raw.enabled !== false,
     intelligentAdjustment: raw.intelligentAdjustment === true,
     autoGovernanceEnabled: raw.autoGovernanceEnabled === true,
-    autoGovernanceIntervalMinutes: Math.round(clamp(safeNumber(raw.autoGovernanceIntervalMinutes, 60), 15, 1440)),
+    autoGovernanceIntervalMinutes: Math.round(clamp(safeNumber(raw.autoGovernanceIntervalMinutes, 1440), 1440, 10_080)),
     miningEnabled: raw.miningEnabled === true,
     autoPromoteMined: raw.autoPromoteMined === true,
     decisionInfluence: clamp(safeNumber(raw.decisionInfluence, DEFAULT_FACTOR_LIBRARY_CONFIG.decisionInfluence), 0, 0.4),
     captureIntervalSeconds: Math.round(clamp(safeNumber(raw.captureIntervalSeconds, 60), 30, 300)),
-    adjustmentIntervalMinutes: Math.round(clamp(safeNumber(raw.adjustmentIntervalMinutes, 60), 15, 1440)),
+    adjustmentIntervalMinutes: Math.round(clamp(safeNumber(raw.adjustmentIntervalMinutes, 1440), 1440, 10_080)),
     miningIntervalMinutes: Math.round(clamp(safeNumber(raw.miningIntervalMinutes, 15), 5, 1440)),
     maxFactorWeight: clamp(safeNumber(raw.maxFactorWeight, 0.1), 0.03, 0.25),
     maxCategoryWeight: clamp(safeNumber(raw.maxCategoryWeight, 0.3), 0.15, 0.6),
     maxWeightStep: clamp(safeNumber(raw.maxWeightStep, 0.02), 0.005, 0.1),
-    horizonsMinutes: [5, 15, 60],
+    horizonsMinutes: [5, 15, 60, 240],
     factorSettings: settings,
     updatedAt: raw.updatedAt || null
   };
@@ -1466,6 +1473,11 @@ export function buildFactorSnapshots({ marketResults = [], eventsBySymbol = {}, 
       price: safeNumber(item.market.latest),
       capturedAt: item.factorContext?.capturedAt || item.capturedAt || new Date().toISOString(),
       values: Object.fromEntries(Object.entries(values).map(([id, value]) => [id, round(finiteOrNull(value))])),
+      modelReuse: {
+        gbm: Number.isFinite(Number(item.market.gbm?.signal)),
+        garch: Number.isFinite(Number(item.market.garch?.stabilityScore)),
+        hiddenMarkov: Number.isFinite(Number(item.market.hiddenMarkov?.signal))
+      },
       sources: item.factorContext?.derivatives?.sources || {}
     };
   });
@@ -1899,7 +1911,7 @@ function evidenceOrientation(definition, status) {
 }
 
 function decisionDefinitions(config, definitions, status, role) {
-  return definitions.filter((definition) => {
+  const eligible = definitions.filter((definition) => {
     const setting = factorSetting(config, definition);
     return definition.role === role &&
       !definition.governanceOnly &&
@@ -1908,6 +1920,25 @@ function decisionDefinitions(config, definitions, status, role) {
       !setting.archived &&
       evidenceOrientation(definition, status) != null;
   });
+  const selected = [];
+  for (const definition of eligible.sort((left, right) => {
+    const leftMetric = status.metrics?.[left.id]?.[PRIMARY_IC_HORIZON_MINUTES];
+    const rightMetric = status.metrics?.[right.id]?.[PRIMARY_IC_HORIZON_MINUTES];
+    return Math.abs(safeNumber(rightMetric?.meanIc)) - Math.abs(safeNumber(leftMetric?.meanIc)) ||
+      safeNumber(factorSetting(config, right).weight) - safeNumber(factorSetting(config, left).weight);
+  })) {
+    if (VOLATILITY_ESTIMATOR_IDS.has(definition.id) && selected.some((item) => VOLATILITY_ESTIMATOR_IDS.has(item.id))) continue;
+    if (role === "direction") {
+      const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
+      const duplicate = selected.some((item) => Math.abs(safeNumber(metricEvidenceCorrelation(
+        metric,
+        status.metrics?.[item.id]?.[PRIMARY_IC_HORIZON_MINUTES]
+      ))) >= CORRELATION_CLUSTER_THRESHOLD);
+      if (duplicate) continue;
+    }
+    selected.push(definition);
+  }
+  return selected;
 }
 
 function manualRoleWeights(config, definitions, status, role) {
@@ -2011,9 +2042,9 @@ function updateMinedValidation(status, nowMs) {
     const evidence = chronologicalFactorEvidence(metric, { minSamples: MIN_MINED_FACTOR_SAMPLES });
     return { definition, metric, evidence, pValue: approximatePValue(evidence.test.hacTStatistic) };
   }).filter((item) => item.evidence.hasHoldout).sort((a, b) => a.pValue - b.pValue);
-  let bhCutoff = 0;
+  let bhCutoff = null;
   tests.forEach((item, index) => {
-    if (item.pValue <= ((index + 1) / tests.length) * 0.1) bhCutoff = item.pValue;
+    if (item.pValue <= ((index + 1) / tests.length) * FACTOR_FDR_Q) bhCutoff = item.pValue;
   });
   status.minedFactors = candidates.map((definition) => {
     const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
@@ -2021,7 +2052,7 @@ function updateMinedValidation(status, nowMs) {
     const pValue = approximatePValue(evidence.test.hacTStatistic);
     const validated =
       evidence.passed &&
-      bhCutoff > 0 && pValue <= bhCutoff;
+      bhCutoff != null && pValue <= bhCutoff;
     const validationStatus = validated
       ? "validated"
       : evidence.hasHoldout
@@ -2035,6 +2066,10 @@ function updateMinedValidation(status, nowMs) {
     });
     return {
       ...definition,
+      frozenExpression: definition.frozenExpression || definition.expression || definition.formula || null,
+      expressionVersion: definition.expressionVersion || 1,
+      validationSetId: definition.validationSetId || `locked_${safeNumber(metric?.samples)}_${PRIMARY_IC_HORIZON_MINUTES}m`,
+      productionEligible: false,
       orientation: validated
         ? evidence.orientation
         : safeNumber(definition.orientation, 1),
@@ -2049,6 +2084,7 @@ function updateMinedValidation(status, nowMs) {
         icir: metric?.icir ?? null,
         tStatistic: metric?.tStatistic ?? null,
         pValue: round(pValue),
+        fdrQ: FACTOR_FDR_Q,
         bhCutoff: round(bhCutoff),
         hasHoldout: evidence.hasHoldout,
         sameDirection: evidence.sameDirection,
@@ -2297,22 +2333,43 @@ function closedTradeFactorEvidence(trades, definition, orientation) {
     const sideDirection = trade?.side === "long" ? 1 : trade?.side === "short" ? -1 : 0;
     const value = closedTradeFactorValue(trade, definition);
     const closedAtMs = Date.parse(trade?.closedAt || "");
+    const openedAtMs = Date.parse(trade?.openedAt || "");
     if (!id || realizedR == null || !sideDirection || value == null || Math.abs(value) < 0.05 || !Number.isFinite(closedAtMs)) continue;
     unique.set(id, {
       closedAtMs,
+      independentAtMs: Number.isFinite(openedAtMs) ? openedAtMs : closedAtMs,
+      symbol: String(trade?.symbol || "unknown"),
       benefitR: Math.sign(value * orientation) * sideDirection * realizedR
     });
   }
-  const observations = [...unique.values()]
+  const lastIndependentBySymbol = new Map();
+  const independent = [...unique.values()]
     .sort((left, right) => left.closedAtMs - right.closedAtMs)
+    .filter((item) => {
+      const prior = lastIndependentBySymbol.get(item.symbol);
+      if (Number.isFinite(prior) && item.independentAtMs - prior < 4 * 60 * 60 * 1_000) return false;
+      lastIndependentBySymbol.set(item.symbol, item.independentAtMs);
+      return true;
+    });
+  const observations = independent
     .slice(-AUTO_GOVERNANCE_MAX_CLOSED_TRADES)
     .map((item) => item.benefitR);
   const summarize = (values) => {
     const average = mean(values);
     const deviation = std(values);
+    const centered = values.map((value) => value - average);
+    const denominator = centered.reduce((sum, value) => sum + value * value, 0);
+    const rho1 = denominator > 1e-12
+      ? clamp(centered.slice(1).reduce((sum, value, index) => sum + value * centered[index], 0) / denominator, -0.95, 0.95)
+      : 0;
+    const effectiveSamples = values.length * (1 - rho1) / Math.max(1 + rho1, 0.05);
+    const standardError = effectiveSamples > 1 ? deviation / Math.sqrt(effectiveSamples) : Number.POSITIVE_INFINITY;
     return {
       samples: values.length,
+      rho1: round(rho1),
+      nEff: round(effectiveSamples),
       meanBenefitR: round(average),
+      lower95BenefitR: Number.isFinite(standardError) ? round(average - 1.645 * standardError) : null,
       positiveRate: round(values.length ? values.filter((value) => value > 0).length / values.length : 0),
       tStatistic: round(deviation > 0 ? average / (deviation / Math.sqrt(values.length)) : average > 0 ? 99 : 0)
     };
@@ -2323,15 +2380,15 @@ function closedTradeFactorEvidence(trades, definition, orientation) {
   const validation = summarize(observations.slice(trainEnd, validationEnd));
   const test = summarize(observations.slice(validationEnd));
   const overall = summarize(observations);
-  const sufficient = observations.length >= AUTO_GOVERNANCE_MIN_CLOSED_TRADES &&
-    [train, validation, test].every((item) => item.samples >= 12);
+  const foldSize = Math.floor(observations.length / 4);
+  const folds = Array.from({ length: 4 }, (_, index) => summarize(observations.slice(index * foldSize, index === 3 ? observations.length : (index + 1) * foldSize)));
+  const sameSignFolds = folds.filter((item) => item.meanBenefitR > 0).length;
+  const sufficient = overall.nEff >= AUTO_GOVERNANCE_MIN_CLOSED_TRADES &&
+    folds.every((item) => item.samples >= 20);
   const passed = sufficient &&
-    [train, validation, test].every((item) => item.meanBenefitR > 0) &&
-    overall.meanBenefitR >= 0.02 &&
-    test.meanBenefitR >= 0.01 &&
-    test.positiveRate >= 0.52 &&
-    test.tStatistic >= 1;
-  return { sufficient, passed, train, validation, test, overall };
+    sameSignFolds >= 3 &&
+    overall.lower95BenefitR > 0;
+  return { sufficient, passed, train, validation, test, folds, sameSignFolds, overall };
 }
 
 function applyAutomaticGovernance(config, status, definitions, nowMs, closedTrades) {
@@ -2345,8 +2402,23 @@ function applyAutomaticGovernance(config, status, definitions, nowMs, closedTrad
   const now = new Date(nowMs).toISOString();
   const nextSettings = { ...config.factorSettings };
   const actions = [];
+  const governanceTests = definitions
+    .filter((definition) => definition.role === "direction" && definition.origin !== "mined")
+    .map((definition) => {
+      const metric = status.metrics?.[definition.id]?.[PRIMARY_IC_HORIZON_MINUTES];
+      const evidence = chronologicalFactorEvidence(metric);
+      return { id: definition.id, pValue: approximatePValue(evidence.test.hacTStatistic), hasHoldout: evidence.hasHoldout };
+    })
+    .filter((item) => item.hasHoldout)
+    .sort((left, right) => left.pValue - right.pValue);
+  let governanceBhCutoff = null;
+  governanceTests.forEach((item, index) => {
+    if (item.pValue <= ((index + 1) / governanceTests.length) * FACTOR_FDR_Q) governanceBhCutoff = item.pValue;
+  });
   for (const definition of definitions) {
     if (definition.role !== "direction") continue;
+    if (definition.origin === "mined") continue;
+    if (definition.id === "hmm_regime_signal") continue;
     if (definition.governanceOnly && definition.autoGovernanceEligible !== true) continue;
     const setting = factorSetting(config, definition);
     if (setting.archived || definition.retired) continue;
@@ -2354,33 +2426,45 @@ function applyAutomaticGovernance(config, status, definitions, nowMs, closedTrad
     const evidence = chronologicalFactorEvidence(metric);
     const orientationAllowed = !definition.governanceOnly || evidence.orientation === 1;
     const tradeEvidence = closedTradeFactorEvidence(closedTrades, definition, evidence.orientation);
-    const validated = evidence.passed && tradeEvidence.passed && orientationAllowed &&
-      (definition.origin !== "mined" || definition.validationStatus === "validated");
+    const pValue = approximatePValue(evidence.test.hacTStatistic);
+    const fdrPassed = governanceBhCutoff != null && pValue <= governanceBhCutoff;
+    const validated = evidence.passed && tradeEvidence.passed && orientationAllowed && fdrPassed;
     const invalid = evidence.hasHoldout && tradeEvidence.sufficient && !validated;
     const previousState = status.autoGovernance.factors[definition.id] || {};
     const state = {
       promotionStreak: validated ? safeNumber(previousState.promotionStreak) + 1 : 0,
       demotionStreak: invalid ? safeNumber(previousState.demotionStreak) + 1 : 0,
+      eligibleSinceAt: validated ? (previousState.eligibleSinceAt || now) : null,
       lastEvaluatedAt: now,
       lastChangedAt: previousState.lastChangedAt || null,
       evidence: validated ? "validated" : invalid ? "invalid" : "collecting",
       marketEvidencePassed: evidence.passed,
+      fdrQ: FACTOR_FDR_Q,
+      pValue: round(pValue),
+      bhCutoff: round(governanceBhCutoff),
+      fdrPassed,
       tradeEvidence
     };
     const lastChangedMs = Date.parse(state.lastChangedAt || "");
-    const cooldownComplete = !Number.isFinite(lastChangedMs) || nowMs - lastChangedMs >= AUTO_GOVERNANCE_COOLDOWN_MS;
+    const labelsAtLastChange = safeNumber(previousState.labelsAtLastChange);
+    const independentLabels = safeNumber(tradeEvidence.overall?.samples);
+    const eligibleSinceMs = Date.parse(state.eligibleSinceAt || "");
+    const dwellComplete = Number.isFinite(eligibleSinceMs) && nowMs - eligibleSinceMs >= AUTO_GOVERNANCE_COOLDOWN_MS;
+    const cooldownComplete = (!Number.isFinite(lastChangedMs) || nowMs - lastChangedMs >= AUTO_GOVERNANCE_COOLDOWN_MS) &&
+      independentLabels - labelsAtLastChange >= AUTO_GOVERNANCE_MIN_NEW_LABELS;
     let useInDecision = setting.useInDecision;
     let action = null;
     if (useInDecision && invalid && state.demotionStreak >= AUTO_GOVERNANCE_DEMOTION_RUNS && cooldownComplete) {
       useInDecision = false;
       action = "demoted_to_shadow";
-    } else if (!useInDecision && validated && state.promotionStreak >= AUTO_GOVERNANCE_PROMOTION_RUNS && cooldownComplete) {
+    } else if (!useInDecision && validated && state.promotionStreak >= AUTO_GOVERNANCE_PROMOTION_RUNS && cooldownComplete && dwellComplete) {
       useInDecision = true;
       action = "promoted_to_decision";
     }
     nextSettings[definition.id] = { ...setting, enabled: true, useInDecision };
     if (action) {
       state.lastChangedAt = now;
+      state.labelsAtLastChange = independentLabels;
       actions.push({ factorId: definition.id, action, at: now, reason: state.evidence });
     }
     status.autoGovernance.factors[definition.id] = state;
@@ -2604,7 +2688,7 @@ export function publicFactorLibrary(configValue, statusValue) {
     architecture: {
       mode: "layered_multi_factor",
       progressiveActivation: "a layer starts with 4 validated active factors and scales linearly to full strength at 1/maxFactorWeight factors",
-      direction: "ordinary direction head + GBM/HMM model paths; may change direction only",
+      direction: "ordinary direction head + governed model paths; HMM is shadow/off after the v8 migration unless explicitly re-enabled",
       probability: "context head may attenuate confidence; Poisson/Bayesian/historical calibration estimate win probability",
       risk: "ordinary risk head + GARCH volatility floor determine stop distance",
       sizing: "calibrated probability + reward/risk + costs feed fractional Kelly; Markowitz and hard risk caps are applied afterward"
@@ -2626,7 +2710,7 @@ export function publicFactorLibrary(configValue, statusValue) {
         risk: "absolute forward return",
         context: "absolute forward return"
       },
-      validationMethod: "chronological 60/20/20 split, HAC t-statistic, realtime contradiction check and FDR for mined factors",
+      validationMethod: "n_eff>=200, FDR q<=0.05, at least 3/4 rolling folds same sign, and post-cost EV one-sided 95% lower bound >0",
       observationRetention: {
         historicalPerFactorHorizon: MAX_HISTORICAL_IC_OBSERVATIONS,
         realtimePerFactorHorizon: MAX_REALTIME_IC_OBSERVATIONS,
@@ -2635,7 +2719,7 @@ export function publicFactorLibrary(configValue, statusValue) {
     },
     limitations: [
       "IC is a rolling predictive association, not proof of causality or future profitability.",
-      "Automatic governance currently applies only to direction factors and requires both out-of-sample market evidence and at least 60 eligible closed paper trades; realized R is a strategy-specific counterfactual proxy, not proof of future profit.",
+      "Automatic governance applies only to built-in direction factors; promotion requires n_eff>=200, FDR q<=0.05, 3/4 same-sign folds, positive post-cost EV lower bound, 48-hour dwell and 100 new independent labels. Mined factors never auto-enter production.",
       "Context-factor IC targets absolute forward return, not directional hit rate, so the context head may attenuate a positive probability edge but cannot raise it.",
       "A sparse layer starts at four validated active factors; its total influence is reduced in proportion to active-factor count until the full-strength factor count is reached.",
       "Built-in means the mechanism, data requirements and formula passed catalog checks; it does not mean the factor has passed this market's out-of-sample gate.",
