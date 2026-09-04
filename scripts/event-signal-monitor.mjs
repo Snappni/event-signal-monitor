@@ -91,6 +91,7 @@ import {
   buildFeatureMissingMask,
   buildRealizedEvModel,
   compareShallowBoosting,
+  countIndependentBatches,
   createDecisionLearningState,
   evaluateRealizedEv,
   normalizeDecisionEvent,
@@ -2508,6 +2509,16 @@ function governedModelParticipates(market, key) {
   return market?.modelGovernance?.[key]?.useInDecision !== false;
 }
 
+function estimateObservedSlippageRate(market, configuredRate) {
+  const spreadBps = Math.max(0, safeNumber(market?.microstructure?.spreadBps));
+  const halfSpreadRate = spreadBps / 20_000;
+  return {
+    rate: clamp(Math.max(safeNumber(configuredRate), halfSpreadRate), 0, 0.02),
+    spreadBps,
+    method: "max_configured_rate_or_observed_half_spread"
+  };
+}
+
 function buildCandidate(
   market,
   eventAggregate,
@@ -2625,8 +2636,9 @@ function buildCandidate(
   );
   const rewardRiskRatio = highImpactEvent ? 1.85 : Math.abs(market.mathSignal) > 0.65 ? 1.65 : 1.45;
   const rewardPct = riskPct * rewardRiskRatio;
+  const slippageEstimate = estimateObservedSlippageRate(market, normalizedAccountConfig.slippageRate);
   const roundTripExecutionCostPct =
-    2 * (normalizedAccountConfig.takerFeeRate + normalizedAccountConfig.slippageRate);
+    2 * (normalizedAccountConfig.takerFeeRate + slippageEstimate.rate);
   const poisson = analyzePoissonEventArrival(eventAggregate, eventScoreNorm, highImpactEvent);
   const poissonForDecision = governedModelParticipates(market, "poisson")
     ? poisson
@@ -2663,6 +2675,8 @@ function buildCandidate(
     volatility: market.atrPct,
     order_flow: market.orderFlowSignal,
     funding: market.fundingSignal,
+    funding_rate: market.fundingRate,
+    spread_bps: slippageEstimate.spreadBps,
     open_interest: market.oiSignal
   };
   const learnedWinRate = predictQualifiedProbability(learningContext?.probabilityModel, {
@@ -2783,6 +2797,12 @@ function buildCandidate(
     expectancyPct,
     expectancyR,
     roundTripExecutionCostPct,
+    takerFeeRate: normalizedAccountConfig.takerFeeRate,
+    slippageRate: slippageEstimate.rate,
+    slippageMethod: slippageEstimate.method,
+    observedSpreadBps: slippageEstimate.spreadBps,
+    fundingRate: market.fundingRate,
+    fundingIntervalHours: normalizedAccountConfig.fundingIntervalHours,
     expectancyClass,
     adaptiveWinRateThreshold,
     breakEvenWinRate: gateResult.breakEvenWinRate,
@@ -3924,7 +3944,8 @@ function openPaperPosition(account, signal, now) {
   const scale = Math.min(concentrationScale, availabilityScale, portfolioRisk.scale);
   if (scale < 0.05) return null;
   const signalEntryPrice = signal.entry;
-  const entry = adverseExecutionPrice(signalEntryPrice, signal.side, "entry", config.slippageRate);
+  const executionSlippageRate = clamp(safeNumber(signal.slippageRate, config.slippageRate), 0, 0.02);
+  const entry = adverseExecutionPrice(signalEntryPrice, signal.side, "entry", executionSlippageRate);
   const rawQuantityAtExecutionPrice = Math.min(
     safeNumber(control.quantity),
     entry > 0 ? safeNumber(control.notional) / entry : 0
@@ -3951,7 +3972,7 @@ function openPaperPosition(account, signal, now) {
     signalId: signal.id,
     candidateId: signal.candidate_id || signal.id,
     candidateReasonCode: signal.reason_code || "accepted",
-    costModelVersion: 1,
+    costModelVersion: 2,
     openedAt: now,
     status: "open",
     calibrationCohort: signal.calibrationCohort || signal.factorSnapshot?.calibrationCohort || null,
@@ -3995,7 +4016,9 @@ function openPaperPosition(account, signal, now) {
     maxLossAmount,
     initialMaxLossAmount: maxLossAmount,
     feeRate: config.takerFeeRate,
-    slippageRate: config.slippageRate,
+    slippageRate: executionSlippageRate,
+    slippageMethod: signal.slippageMethod || "configured_rate",
+    observedEntrySpreadBps: safeNumber(signal.observedSpreadBps),
     fundingIntervalHours: config.fundingIntervalHours,
     entryFee,
     entrySlippageCost,
@@ -4792,7 +4815,13 @@ async function main({ onStage = () => {} } = {}) {
   }
   const realizedEvModel = buildRealizedEvModel([...calibrationTrades, ...state.decisionLearning.labels]);
   const priorProbabilityModel = state.decisionLearning.probabilityModel;
-  if (!priorProbabilityModel || state.decisionLearning.labels.length - safeNumber(priorProbabilityModel.samples) >= 100) {
+  const independentLabelBatches = countIndependentBatches(state.decisionLearning.labels);
+  if (
+    !priorProbabilityModel ||
+    priorProbabilityModel.data_policy_version !== 2 ||
+    (priorProbabilityModel.reason_code === "probability_model_insufficient_independent_batches" && independentLabelBatches >= 30) ||
+    independentLabelBatches - safeNumber(priorProbabilityModel.independent_batches) >= 100
+  ) {
     state.decisionLearning.probabilityModel = trainElasticNetProbability(state.decisionLearning.labels);
     state.decisionLearning.boostingComparison = compareShallowBoosting(
       state.decisionLearning.probabilityModel,
@@ -5204,12 +5233,14 @@ async function main({ onStage = () => {} } = {}) {
         evGate: "realized conditional net EV one-sided 95% lower bound > 0",
         labels: ["5m", "15m", "60m", "240m", "triple_barrier"],
         serviceInterruptionsTrainable: false,
-        probabilityGate: { auc: ">0.52", brier: "better_than_constant", ece: "<0.05" }
+        probabilityGate: { auc: ">0.52", brier: "better_than_constant", ece: "<0.05", independentBatches: ">=200", splitOverlap: 0 }
       },
       candidatesAudited: learningCycle.audits.length,
       labelsMatured: learningCycle.matured.length,
-      pendingIndependentLabels: state.decisionLearning.pending.length,
-      storedIndependentLabels: state.decisionLearning.labels.length,
+      pendingIndependentLabels: countIndependentBatches(state.decisionLearning.pending),
+      pendingLabelRows: state.decisionLearning.pending.length,
+      storedIndependentLabels: countIndependentBatches(state.decisionLearning.labels),
+      storedLabelRows: state.decisionLearning.labels.length,
       probabilityModel: state.decisionLearning.probabilityModel,
       boostingComparison: state.decisionLearning.boostingComparison,
       realizedEvBuckets: realizedEvModel.buckets,

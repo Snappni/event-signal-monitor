@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 
 const HORIZONS_MINUTES = Object.freeze([5, 15, 60, 240]);
+const DEFAULT_INDEPENDENCE_MINUTES = 240;
+const DATA_POLICY_VERSION = 2;
 const Z95_ONE_SIDED = 1.645;
 const EPSILON = 1e-12;
 
@@ -54,7 +56,38 @@ export function effectiveSampleSize(valuesOrCount, rho1Value) {
   const rho1 = Number.isFinite(Number(rho1Value))
     ? clamp(rho1Value, -0.95, 0.95)
     : lagOneAutocorrelation(Array.isArray(valuesOrCount) ? valuesOrCount : []);
-  return Math.max(0, count * (1 - rho1) / Math.max(1 + rho1, 0.05));
+  return Math.min(count, Math.max(0, count * (1 - rho1) / Math.max(1 + rho1, 0.05)));
+}
+
+function weightedMean(values, weights = []) {
+  if (!values.length) return 0;
+  const normalizedWeights = values.map((_, index) => Math.max(0, finite(weights[index], 1)));
+  const total = normalizedWeights.reduce((sum, value) => sum + value, 0);
+  return total > 0
+    ? values.reduce((sum, value, index) => sum + value * normalizedWeights[index], 0) / total
+    : mean(values);
+}
+
+function independenceBucketId(value, minutes = DEFAULT_INDEPENDENCE_MINUTES) {
+  const timestamp = Date.parse(value || "");
+  if (!Number.isFinite(timestamp)) return null;
+  const widthMs = Math.max(1, finite(minutes, DEFAULT_INDEPENDENCE_MINUTES)) * 60_000;
+  return `time_${new Date(Math.floor(timestamp / widthMs) * widthMs).toISOString()}`;
+}
+
+export function decisionIndependenceKey(item = {}, index = 0) {
+  return String(
+    item.independence_bucket_id ||
+    independenceBucketId(item.observed_at || item.openedAt) ||
+    item.decision_batch_id ||
+    item.candidate_id ||
+    item.id ||
+    `row_${index}`
+  );
+}
+
+export function countIndependentBatches(items = []) {
+  return new Set(items.map((item, index) => decisionIndependenceKey(item, index))).size;
 }
 
 export function summarizeNetEv(values = []) {
@@ -108,7 +141,7 @@ export function createCandidateId(candidate = {}, observedAt = new Date().toISOS
 export function createDecisionLearningState(value = {}) {
   const raw = value && typeof value === "object" ? value : {};
   return {
-    version: 1,
+    version: DATA_POLICY_VERSION,
     pending: Array.isArray(raw.pending) ? raw.pending.slice(-2_000) : [],
     labels: Array.isArray(raw.labels) ? raw.labels.slice(-20_000) : [],
     interruptions: Array.isArray(raw.interruptions) ? raw.interruptions.slice(-2_000) : [],
@@ -140,6 +173,33 @@ function overlapsInterruption(startMs, endMs, interruptions) {
   });
 }
 
+function marketObservation(prices, symbol, at) {
+  const market = prices?.[symbol];
+  const price = finite(market?.latest ?? market, NaN);
+  if (!Number.isFinite(price) || price <= 0) return null;
+  return { at, price, funding_rate: finiteOrNull(market?.fundingRate) };
+}
+
+function fundingSettlementSummary(anchor, endMs) {
+  const startMs = Date.parse(anchor.observed_at || "");
+  const intervalMs = Math.max(1, finite(anchor.funding_interval_hours, 8)) * 3_600_000;
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return { funding_cost_pct: 0, funding_pnl_pct: 0, funding_settlements: [] };
+  }
+  const direction = anchor.side === "short" ? -1 : 1;
+  const path = Array.isArray(anchor.price_path) ? anchor.price_path : [];
+  const settlements = [];
+  for (let timestamp = (Math.floor(startMs / intervalMs) + 1) * intervalMs; timestamp <= endMs; timestamp += intervalMs) {
+    const prior = path.filter((item) => Date.parse(item.at) <= timestamp && Number.isFinite(Number(item.funding_rate))).at(-1);
+    const following = path.find((item) => Date.parse(item.at) > timestamp && Number.isFinite(Number(item.funding_rate)));
+    const rate = finiteOrNull(prior?.funding_rate ?? following?.funding_rate ?? anchor.funding_rate);
+    if (rate == null) continue;
+    settlements.push({ at: new Date(timestamp).toISOString(), funding_rate: rate });
+  }
+  const fundingCostPct = direction * settlements.reduce((sum, item) => sum + item.funding_rate, 0);
+  return { funding_cost_pct: fundingCostPct, funding_pnl_pct: -fundingCostPct, funding_settlements: settlements };
+}
+
 function resolveTripleBarrier(anchor, observations, side, stopR = 1, targetR = 1.5) {
   const direction = side === "short" ? -1 : 1;
   const riskPct = Math.max(finite(anchor.risk_pct, 0.01), 0.0001);
@@ -165,11 +225,19 @@ function maturePendingAnchor(anchor, nowMs, interruptions) {
     if (!last) continue;
     const direction = anchor.side === "short" ? -1 : 1;
     const rawReturn = last.price / anchor.entry_price - 1;
+    const funding = fundingSettlementSummary(anchor, labelMs);
+    const executionCostPct = Math.max(finite(anchor.execution_cost_pct ?? anchor.cost_pct), 0);
+    const directionalReturn = direction * rawReturn;
     labels[`${horizon}m`] = {
       horizon_minutes: horizon,
       label_at: new Date(labelMs).toISOString(),
       future_return: rawReturn,
-      directional_return: direction * rawReturn,
+      directional_return: directionalReturn,
+      execution_cost_pct: executionCostPct,
+      funding_cost_pct: funding.funding_cost_pct,
+      funding_pnl_pct: funding.funding_pnl_pct,
+      funding_settlements: funding.funding_settlements,
+      net_directional_return: directionalReturn - executionCostPct - funding.funding_cost_pct,
       trainable: !overlapsInterruption(observedMs, labelMs, interruptions)
     };
   }
@@ -189,6 +257,8 @@ export function recordCandidateCycle(stateValue, { candidates = [], acceptedIds 
   const state = createDecisionLearningState(stateValue);
   const now = iso(observedAt, new Date().toISOString());
   const nowMs = Date.parse(now);
+  const decisionBatchId = `batch_${hash(now).slice(0, 20)}`;
+  const independenceId = independenceBucketId(now, independentMinutes);
   const accepted = new Set(acceptedIds);
   const normalizedEvents = events.map((event) => normalizeDecisionEvent(event, now));
   const seenEventIds = new Set(state.seenEventIds);
@@ -196,9 +266,9 @@ export function recordCandidateCycle(stateValue, { candidates = [], acceptedIds 
   for (const event of newEvents) seenEventIds.add(event.event_id);
   state.seenEventIds = [...seenEventIds].slice(-50_000);
   for (const anchor of state.pending) {
-    const price = finite(prices[anchor.symbol]?.latest ?? prices[anchor.symbol], NaN);
+    const observation = marketObservation(prices, anchor.symbol, now);
     const lastSampleMs = Date.parse(anchor.price_path.at(-1)?.at || "");
-    if (Number.isFinite(price) && price > 0 && (!Number.isFinite(lastSampleMs) || nowMs - lastSampleMs >= 60_000)) anchor.price_path.push({ at: now, price });
+    if (observation && (!Number.isFinite(lastSampleMs) || nowMs - lastSampleMs >= 60_000)) anchor.price_path.push(observation);
     anchor.price_path = anchor.price_path.slice(-300);
   }
   const audits = candidates.map((candidate, index) => {
@@ -212,6 +282,8 @@ export function recordCandidateCycle(stateValue, { candidates = [], acceptedIds 
         : "portfolio_rank_limit");
     const record = {
       candidate_id,
+      decision_batch_id: decisionBatchId,
+      independence_bucket_id: independenceId,
       observed_at: now,
       symbol: candidate.symbol,
       side: candidate.side,
@@ -224,7 +296,8 @@ export function recordCandidateCycle(stateValue, { candidates = [], acceptedIds 
     };
     const prior = Date.parse(state.lastIndependentAtBySymbol[candidate.symbol] || "");
     const independent = !Number.isFinite(prior) || nowMs - prior >= independentMinutes * 60_000;
-    const entryPrice = finite(prices[candidate.symbol]?.latest ?? prices[candidate.symbol] ?? candidate.entry, NaN);
+    const initialObservation = marketObservation(prices, candidate.symbol, now);
+    const entryPrice = finite(initialObservation?.price ?? candidate.entry, NaN);
     if (independent && Number.isFinite(entryPrice) && entryPrice > 0) {
       state.lastIndependentAtBySymbol[candidate.symbol] = now;
       state.pending.push({
@@ -235,8 +308,13 @@ export function recordCandidateCycle(stateValue, { candidates = [], acceptedIds 
         entry_price: entryPrice,
         risk_pct: Math.max(finite(candidate.riskPct, 0.01), 0.0001),
         cost_pct: Math.max(finite(candidate.roundTripExecutionCostPct ?? candidate.calculation?.expectancy?.roundTripExecutionCostPct), 0),
+        execution_cost_pct: Math.max(finite(candidate.roundTripExecutionCostPct ?? candidate.calculation?.expectancy?.roundTripExecutionCostPct), 0),
+        taker_fee_rate: Math.max(finite(candidate.takerFeeRate), 0),
+        slippage_rate: Math.max(finite(candidate.slippageRate), 0),
+        funding_rate: finiteOrNull(candidate.fundingRate ?? initialObservation?.funding_rate),
+        funding_interval_hours: Math.max(1, finite(candidate.fundingIntervalHours, 8)),
         event_cluster_ids: [...new Set(candidateEvents.map((event) => event.cluster_id))],
-        price_path: [{ at: now, price: entryPrice }],
+        price_path: [initialObservation || { at: now, price: entryPrice, funding_rate: finiteOrNull(candidate.fundingRate) }],
         labels: {}
       });
     }
@@ -265,8 +343,11 @@ export function recordCandidateCycle(stateValue, { candidates = [], acceptedIds 
 
 function tradeNetReturn(trade) {
   const fixedLabel = trade?.labels?.["60m"];
+  if (fixedLabel?.trainable === true && Number.isFinite(Number(fixedLabel.net_directional_return))) {
+    return Number(fixedLabel.net_directional_return);
+  }
   if (fixedLabel?.trainable === true && Number.isFinite(Number(fixedLabel.directional_return))) {
-    return Number(fixedLabel.directional_return) - Math.max(finite(trade?.cost_pct), 0);
+    return Number(fixedLabel.directional_return) - Math.max(finite(trade?.execution_cost_pct ?? trade?.cost_pct), 0) - finite(fixedLabel.funding_cost_pct);
   }
   const pnl = Number(trade?.realizedPnl ?? trade?.netPnl);
   const notional = Number(trade?.initialNotional ?? trade?.notional ?? (Number(trade?.entry) * Number(trade?.quantity)));
@@ -282,7 +363,7 @@ function tradeNetReturn(trade) {
 
 export function buildRealizedEvModel(trades = []) {
   const buckets = new Map();
-  for (const trade of trades) {
+  for (const [index, trade] of trades.entries()) {
     const value = tradeNetReturn(trade);
     if (!Number.isFinite(value)) continue;
     const mode = String(trade?.candidateMode || trade?.mode || "unknown");
@@ -290,10 +371,19 @@ export function buildRealizedEvModel(trades = []) {
     const side = String(trade?.side || "unknown");
     for (const key of [`${mode}|${regime}|${side}`, `${mode}|*|${side}`, `*|*|${side}`, "*|*|*"]) {
       if (!buckets.has(key)) buckets.set(key, []);
-      buckets.get(key).push(value);
+      buckets.get(key).push({ value, batch: decisionIndependenceKey(trade, index) });
     }
   }
-  return { version: 1, buckets: Object.fromEntries([...buckets].map(([key, values]) => [key, summarizeNetEv(values)])) };
+  const summarizeBucket = (entries) => {
+    const batches = new Map();
+    for (const entry of entries) {
+      if (!batches.has(entry.batch)) batches.set(entry.batch, []);
+      batches.get(entry.batch).push(entry.value);
+    }
+    const summary = summarizeNetEv([...batches.values()].map(mean));
+    return { ...summary, samples: entries.length, independent_batches: batches.size };
+  };
+  return { version: DATA_POLICY_VERSION, buckets: Object.fromEntries([...buckets].map(([key, entries]) => [key, summarizeBucket(entries)])) };
 }
 
 export function evaluateRealizedEv(model, candidate = {}, minimumEffectiveSamples = 200) {
@@ -328,28 +418,91 @@ function featureVector(label) {
   return [...base, ...categorical, finite(direction) * finite(event), finite(direction) * finite(volatility)];
 }
 
-function aucScore(y, scores) {
+function probabilityTarget(label) {
+  const fixed = label?.labels?.["60m"];
+  if (Number.isFinite(Number(fixed?.net_directional_return))) return Number(fixed.net_directional_return > 0);
+  const net = finite(fixed?.directional_return) - Math.max(finite(label?.execution_cost_pct ?? label?.cost_pct), 0) - finite(fixed?.funding_cost_pct);
+  return Number(net > 0);
+}
+
+function aucScore(y, scores, weights = []) {
   let wins = 0;
   let pairs = 0;
   for (let i = 0; i < y.length; i += 1) for (let j = 0; j < y.length; j += 1) {
     if (y[i] !== 1 || y[j] !== 0) continue;
-    pairs += 1;
-    wins += scores[i] > scores[j] ? 1 : (scores[i] === scores[j] ? 0.5 : 0);
+    const pairWeight = Math.max(0, finite(weights[i], 1)) * Math.max(0, finite(weights[j], 1));
+    pairs += pairWeight;
+    wins += pairWeight * (scores[i] > scores[j] ? 1 : (scores[i] === scores[j] ? 0.5 : 0));
   }
   return pairs ? wins / pairs : 0.5;
 }
 
-function calibrationMetrics(y, probabilities) {
-  const base = clamp(mean(y), 0.001, 0.999);
-  const brier = mean(y.map((value, index) => (probabilities[index] - value) ** 2));
-  const constantBrier = mean(y.map((value) => (base - value) ** 2));
+function calibrationMetrics(y, probabilities, weights = []) {
+  const base = clamp(weightedMean(y, weights), 0.001, 0.999);
+  const brier = weightedMean(y.map((value, index) => (probabilities[index] - value) ** 2), weights);
+  const constantBrier = weightedMean(y.map((value) => (base - value) ** 2), weights);
+  const totalWeight = y.reduce((sum, _, index) => sum + Math.max(0, finite(weights[index], 1)), 0);
   let ece = 0;
   for (let bin = 0; bin < 10; bin += 1) {
-    const members = y.map((value, index) => ({ value, probability: probabilities[index] }))
+    const members = y.map((value, index) => ({ value, probability: probabilities[index], weight: Math.max(0, finite(weights[index], 1)) }))
       .filter((item) => item.probability >= bin / 10 && (bin === 9 ? item.probability <= 1 : item.probability < (bin + 1) / 10));
-    if (members.length) ece += members.length / y.length * Math.abs(mean(members.map((item) => item.probability)) - mean(members.map((item) => item.value)));
+    const binWeight = members.reduce((sum, item) => sum + item.weight, 0);
+    if (members.length && totalWeight > 0) ece += binWeight / totalWeight * Math.abs(
+      weightedMean(members.map((item) => item.probability), members.map((item) => item.weight)) -
+      weightedMean(members.map((item) => item.value), members.map((item) => item.weight))
+    );
   }
-  return { auc: aucScore(y, probabilities), brier, constant_brier: constantBrier, ece };
+  return { auc: aucScore(y, probabilities, weights), brier, constant_brier: constantBrier, ece };
+}
+
+function groupByIndependenceBatch(rows) {
+  const groups = new Map();
+  for (const [index, row] of rows.entries()) {
+    const key = decisionIndependenceKey(row, index);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  return [...groups.entries()].map(([key, values]) => ({
+    key,
+    rows: values,
+    started_at: values.reduce((earliest, row) => Math.min(earliest, Date.parse(row.observed_at || row.openedAt || "")), Number.POSITIVE_INFINITY),
+    label_end_at: values.reduce((latest, row) => Math.max(latest, Date.parse(row.labels?.["60m"]?.label_at || row.closedAt || row.observed_at || row.openedAt || "")), Number.NEGATIVE_INFINITY)
+  })).sort((left, right) => left.started_at - right.started_at);
+}
+
+function purgedTimeSplit(rows) {
+  const groups = groupByIndependenceBatch(rows);
+  const trainEnd = Math.floor(groups.length * 0.6);
+  const validationEnd = Math.floor(groups.length * 0.8);
+  const trainGroups = groups.slice(0, trainEnd);
+  const trainLabelEnd = Math.max(...trainGroups.map((group) => group.label_end_at));
+  const validationGroups = groups.slice(trainEnd, validationEnd).filter((group) => group.started_at > trainLabelEnd);
+  const validationLabelEnd = Math.max(...validationGroups.map((group) => group.label_end_at));
+  const testGroups = groups.slice(validationEnd).filter((group) => group.started_at > validationLabelEnd);
+  const flatten = (values) => values.flatMap((group) => group.rows);
+  return {
+    train: flatten(trainGroups),
+    validation: flatten(validationGroups),
+    test: flatten(testGroups),
+    batch_ids: {
+      train: trainGroups.map((group) => group.key),
+      validation: validationGroups.map((group) => group.key),
+      locked_test: testGroups.map((group) => group.key)
+    },
+    purged_batches: groups.length - trainGroups.length - validationGroups.length - testGroups.length,
+    total_batches: groups.length
+  };
+}
+
+function equalBatchWeights(rows) {
+  const counts = rows.reduce((result, row, index) => {
+    const key = decisionIndependenceKey(row, index);
+    result[key] = (result[key] || 0) + 1;
+    return result;
+  }, {});
+  const raw = rows.map((row, index) => 1 / counts[decisionIndependenceKey(row, index)]);
+  const scale = raw.length / Math.max(raw.reduce((sum, value) => sum + value, 0), EPSILON);
+  return raw.map((value) => value * scale);
 }
 
 function standardize(trainX, datasets) {
@@ -359,14 +512,14 @@ function standardize(trainX, datasets) {
   return { means, scales, datasets: datasets.map((rows) => rows.map((row) => row.map((value, index) => (value - means[index]) / scales[index]))) };
 }
 
-function fitElasticNet(x, y, { lambda = 0.02, alpha = 0.5, iterations = 800, learningRate = 0.08 } = {}) {
+function fitElasticNet(x, y, { lambda = 0.02, alpha = 0.5, iterations = 800, learningRate = 0.08, sampleWeights = [] } = {}) {
   const weights = Array(x[0]?.length || 0).fill(0);
-  let intercept = Math.log(clamp(mean(y), 0.01, 0.99) / (1 - clamp(mean(y), 0.01, 0.99)));
+  let intercept = Math.log(clamp(weightedMean(y, sampleWeights), 0.01, 0.99) / (1 - clamp(weightedMean(y, sampleWeights), 0.01, 0.99)));
   for (let iteration = 0; iteration < iterations; iteration += 1) {
     const probabilities = x.map((row) => sigmoid(intercept + row.reduce((sum, value, index) => sum + value * weights[index], 0)));
-    intercept -= learningRate * mean(probabilities.map((probability, index) => probability - y[index]));
+    intercept -= learningRate * weightedMean(probabilities.map((probability, index) => probability - y[index]), sampleWeights);
     for (let feature = 0; feature < weights.length; feature += 1) {
-      const gradient = mean(x.map((row, index) => (probabilities[index] - y[index]) * row[feature])) + 2 * lambda * (1 - alpha) * weights[feature];
+      const gradient = weightedMean(x.map((row, index) => (probabilities[index] - y[index]) * row[feature]), sampleWeights) + 2 * lambda * (1 - alpha) * weights[feature];
       const stepped = weights[feature] - learningRate * gradient;
       const threshold = learningRate * lambda * alpha;
       weights[feature] = Math.sign(stepped) * Math.max(Math.abs(stepped) - threshold, 0);
@@ -379,14 +532,14 @@ function predict(model, rows) {
   return rows.map((row) => sigmoid(model.intercept + row.reduce((sum, value, index) => sum + value * model.weights[index], 0)));
 }
 
-function fitPlatt(probabilities, y) {
+function fitPlatt(probabilities, y, weights = []) {
   let slope = 1;
   let intercept = 0;
   const logits = probabilities.map((value) => Math.log(clamp(value, 1e-6, 1 - 1e-6) / (1 - clamp(value, 1e-6, 1 - 1e-6))));
   for (let iteration = 0; iteration < 400; iteration += 1) {
     const calibrated = logits.map((value) => sigmoid(intercept + slope * value));
-    intercept -= 0.05 * mean(calibrated.map((value, index) => value - y[index]));
-    slope -= 0.05 * mean(calibrated.map((value, index) => (value - y[index]) * logits[index]));
+    intercept -= 0.05 * weightedMean(calibrated.map((value, index) => value - y[index]), weights);
+    slope -= 0.05 * weightedMean(calibrated.map((value, index) => (value - y[index]) * logits[index]), weights);
   }
   return { slope, intercept };
 }
@@ -394,38 +547,71 @@ function fitPlatt(probabilities, y) {
 export function trainElasticNetProbability(labels = [], options = {}) {
   const rows = labels.filter((item) => item?.labels?.["60m"]?.trainable && Number.isFinite(Number(item.labels["60m"].directional_return)))
     .sort((left, right) => Date.parse(left.observed_at) - Date.parse(right.observed_at));
-  if (rows.length < 30) return { type: "elastic_net_logistic", qualified: false, reason_code: "probability_model_insufficient_samples", samples: rows.length };
-  const x = rows.map(featureVector);
-  const y = rows.map((item) => Number(item.labels["60m"].directional_return > 0));
-  const trainEnd = Math.floor(rows.length * 0.6);
-  const validationEnd = Math.floor(rows.length * 0.8);
-  const normalized = standardize(x.slice(0, trainEnd), [x.slice(0, trainEnd), x.slice(trainEnd, validationEnd), x.slice(validationEnd)]);
+  const independentBatches = countIndependentBatches(rows);
+  if (independentBatches < 30) return {
+    type: "elastic_net_logistic",
+    data_policy_version: DATA_POLICY_VERSION,
+    qualified: false,
+    reason_code: "probability_model_insufficient_independent_batches",
+    samples: rows.length,
+    independent_batches: independentBatches,
+    n_eff: independentBatches
+  };
+  const split = purgedTimeSplit(rows);
+  if (!split.train.length || !split.validation.length || !split.test.length) return {
+    type: "elastic_net_logistic",
+    data_policy_version: DATA_POLICY_VERSION,
+    qualified: false,
+    reason_code: "probability_model_purged_split_empty",
+    samples: rows.length,
+    independent_batches: independentBatches,
+    n_eff: 0,
+    split
+  };
+  const trainXRaw = split.train.map(featureVector);
+  const validationXRaw = split.validation.map(featureVector);
+  const testXRaw = split.test.map(featureVector);
+  const normalized = standardize(trainXRaw, [trainXRaw, validationXRaw, testXRaw]);
   const [trainX, validationX, testX] = normalized.datasets;
-  const trainY = y.slice(0, trainEnd);
-  const validationY = y.slice(trainEnd, validationEnd);
-  const testY = y.slice(validationEnd);
-  const fitted = fitElasticNet(trainX, trainY, options);
-  const platt = fitPlatt(predict(fitted, validationX), validationY);
+  const target = probabilityTarget;
+  const trainY = split.train.map(target);
+  const validationY = split.validation.map(target);
+  const testY = split.test.map(target);
+  const trainWeights = equalBatchWeights(split.train);
+  const validationWeights = equalBatchWeights(split.validation);
+  const testWeights = equalBatchWeights(split.test);
+  const fitted = fitElasticNet(trainX, trainY, { ...options, sampleWeights: trainWeights });
+  const platt = fitPlatt(predict(fitted, validationX), validationY, validationWeights);
   const rawTest = predict(fitted, testX);
   const testProbabilities = rawTest.map((value) => sigmoid(
     platt.intercept + platt.slope * Math.log(clamp(value, 1e-6, 1 - 1e-6) / (1 - clamp(value, 1e-6, 1 - 1e-6)))
   ));
-  const metrics = calibrationMetrics(testY, testProbabilities);
+  const metrics = calibrationMetrics(testY, testProbabilities, testWeights);
   metrics.samples = testY.length;
-  metrics.wins = testY.reduce((sum, value) => sum + value, 0);
-  metrics.average_probability = mean(testProbabilities);
-  const nEff = effectiveSampleSize(y);
+  metrics.independent_batches = split.batch_ids.locked_test.length;
+  metrics.wins = weightedMean(testY, testWeights) * testY.length;
+  metrics.average_probability = weightedMean(testProbabilities, testWeights);
+  const batchOutcomes = groupByIndependenceBatch(rows).map((group) => mean(group.rows.map(target)));
+  const nEff = effectiveSampleSize(batchOutcomes);
   const qualified = nEff >= 200 && metrics.auc > 0.52 && metrics.brier < metrics.constant_brier && metrics.ece < 0.05;
   return {
     type: "elastic_net_logistic",
-    version: `enet_${hash(`${rows[0].observed_at}|${rows.at(-1).observed_at}|${rows.length}`).slice(0, 16)}`,
+    data_policy_version: DATA_POLICY_VERSION,
+    version: `enet_${hash(`${rows[0].observed_at}|${rows.at(-1).observed_at}|${rows.length}|${independentBatches}`).slice(0, 16)}`,
     trained_at: new Date().toISOString(),
     samples: rows.length,
+    independent_batches: independentBatches,
     n_eff: nEff,
     coefficients: fitted,
     standardization: { means: normalized.means, scales: normalized.scales },
     calibration: platt,
     locked_test: metrics,
+    split: {
+      batch_counts: Object.fromEntries(Object.entries(split.batch_ids).map(([key, values]) => [key, values.length])),
+      batch_ids: split.batch_ids,
+      purged_batches: split.purged_batches,
+      overlap_count: 0
+    },
     qualified,
     reason_code: qualified ? "probability_model_qualified" : "probability_model_gate_failed"
   };
@@ -443,11 +629,14 @@ export function predictQualifiedProbability(model, candidate) {
 export function compareShallowBoosting(baseModel, labels = []) {
   if (!baseModel?.qualified) return { attempted: false, selected: "elastic_net_logistic", reason_code: "baseline_not_qualified" };
   const rows = labels.filter((item) => item?.labels?.["60m"]?.trainable).sort((a, b) => Date.parse(a.observed_at) - Date.parse(b.observed_at));
-  const split = Math.floor(rows.length * 0.8);
-  const trainRows = rows.slice(0, split);
-  const testRows = rows.slice(split);
-  const trainY = trainRows.map((item) => Number(item.labels["60m"].directional_return > 0));
-  const y = testRows.map((item) => Number(item.labels["60m"].directional_return > 0));
+  const split = purgedTimeSplit(rows);
+  const trainRows = [...split.train, ...split.validation];
+  const testRows = split.test;
+  if (!trainRows.length || !testRows.length) return { attempted: false, selected: "elastic_net_logistic", reason_code: "boosting_purged_split_empty" };
+  const trainY = trainRows.map(probabilityTarget);
+  const y = testRows.map(probabilityTarget);
+  const trainWeights = equalBatchWeights(trainRows);
+  const testWeights = equalBatchWeights(testRows);
   const trainFeatures = trainRows.map(featureVector);
   const trainBase = trainRows.map((item) => predictQualifiedProbability(baseModel, item) ?? 0.5);
   const base = testRows.map((item) => predictQualifiedProbability(baseModel, item) ?? 0.5);
@@ -462,16 +651,16 @@ export function compareShallowBoosting(baseModel, labels = []) {
         const threshold = sorted[Math.floor((sorted.length - 1) * quantile)];
         const leaf = (isLeft) => {
           const indices = trainFeatures.flatMap((row, index) => (row[feature] <= threshold) === isLeft ? [index] : []);
-          const numerator = indices.reduce((sum, index) => sum + trainY[index] - probabilities[index], 0);
-          const denominator = indices.reduce((sum, index) => sum + probabilities[index] * (1 - probabilities[index]), 0);
+          const numerator = indices.reduce((sum, index) => sum + trainWeights[index] * (trainY[index] - probabilities[index]), 0);
+          const denominator = indices.reduce((sum, index) => sum + trainWeights[index] * probabilities[index] * (1 - probabilities[index]), 0);
           return clamp(numerator / Math.max(denominator, 1e-6), -2, 2);
         };
         const left = leaf(true);
         const right = leaf(false);
-        const loss = mean(trainY.map((target, index) => {
+        const loss = weightedMean(trainY.map((target, index) => {
           const prediction = sigmoid(trainLogits[index] + 0.1 * (trainFeatures[index][feature] <= threshold ? left : right));
           return -(target * Math.log(clamp(prediction, 1e-9, 1)) + (1 - target) * Math.log(clamp(1 - prediction, 1e-9, 1)));
-        }));
+        }), trainWeights);
         if (!best || loss < best.loss) best = { feature, threshold, left, right, learning_rate: 0.1, loss };
       }
     }
@@ -485,10 +674,10 @@ export function compareShallowBoosting(baseModel, labels = []) {
     for (const stump of stumps) logit += stump.learning_rate * (features[stump.feature] <= stump.threshold ? stump.left : stump.right);
     return sigmoid(logit);
   });
-  const baseMetrics = calibrationMetrics(y, base);
-  const boostMetrics = calibrationMetrics(y, boosted);
+  const baseMetrics = calibrationMetrics(y, base, testWeights);
+  const boostMetrics = calibrationMetrics(y, boosted, testWeights);
   const retained = boostMetrics.brier < baseMetrics.brier && boostMetrics.auc >= baseMetrics.auc;
-  return { attempted: true, selected: retained ? "shallow_boosting" : "elastic_net_logistic", retained, stumps: retained ? stumps : [], base: baseMetrics, boosting: boostMetrics, reason_code: retained ? "locked_test_increment_retained" : "locked_test_increment_disappeared" };
+  return { attempted: true, selected: retained ? "shallow_boosting" : "elastic_net_logistic", retained, stumps: retained ? stumps : [], base: baseMetrics, boosting: boostMetrics, independent_test_batches: split.batch_ids.locked_test.length, reason_code: retained ? "locked_test_increment_retained" : "locked_test_increment_disappeared" };
 }
 
 export function evaluateExitShadowMatrix(anchor = {}) {
@@ -511,7 +700,20 @@ export function evaluateExitShadowMatrix(anchor = {}) {
       exitAt = point.at;
       if (currentR <= stopR) { exitR = stopR; break; }
     }
-    rows.push({ entry_model: "elastic_net_logistic", exit_policy: policy, exit_r: exitR, exit_at: exitAt, mfe_r: peakR, mae_r: Math.min(0, ...path.slice(1).map((point) => direction * (finite(point.price) / entry - 1) / riskPct)) });
+    const funding = fundingSettlementSummary(anchor, Date.parse(exitAt));
+    const executionCostR = Math.max(finite(anchor.execution_cost_pct ?? anchor.cost_pct), 0) / riskPct;
+    rows.push({
+      entry_model: "elastic_net_logistic",
+      exit_policy: policy,
+      exit_r: exitR,
+      exit_at: exitAt,
+      execution_cost_r: executionCostR,
+      funding_cost_r: funding.funding_cost_pct / riskPct,
+      net_exit_r: exitR - executionCostR - funding.funding_cost_pct / riskPct,
+      funding_settlements: funding.funding_settlements,
+      mfe_r: peakR,
+      mae_r: Math.min(0, ...path.slice(1).map((point) => direction * (finite(point.price) / entry - 1) / riskPct))
+    });
   }
   return rows;
 }
