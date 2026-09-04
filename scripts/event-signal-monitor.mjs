@@ -120,7 +120,7 @@ loadDotEnv(path.resolve(".env"));
 const isSelfTestInvocation = process.argv.some((argument) => argument.startsWith("--self-test-"));
 let tradeHistoryMigrated = false;
 
-const MONITOR_VERSION = "0.22.0";
+const MONITOR_VERSION = "0.23.0";
 const RUN_LAYER = "layered-multi-factor";
 const ENTRY_CALIBRATION_COHORT = "single-writer-layered-v2";
 const MIN_ENTRY_CALIBRATION_COHORT_TRADES = 30;

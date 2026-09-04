@@ -158,6 +158,7 @@ assert.equal(modelFactorGovernance(explicitlyReenabledHmm).hiddenMarkov.useInDec
 assert.deepEqual(factorConfig.horizonsMinutes, [5, 15, 60, 240]);
 assert.ok(factorConfig.adjustmentIntervalMinutes >= 1440);
 const monitorSource = fs.readFileSync(new URL("./event-signal-monitor.mjs", import.meta.url), "utf8");
+assert.match(monitorSource, /const MONITOR_VERSION = "0\.23\.0"/);
 assert.match(monitorSource, /VOLUME_DIRECTION_ENABLED = process\.env\.SIGNAL_VOLUME_DIRECTION_ENABLED === "1"/);
 assert.match(monitorSource, /max_configured_rate_or_observed_half_spread/);
 
