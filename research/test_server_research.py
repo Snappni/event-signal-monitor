@@ -10,6 +10,23 @@ from resource_budget import budget
 
 
 class ServerDataTests(unittest.TestCase):
+    def test_collecting_does_not_import_qlib_models(self):
+        import builtins
+        original_import=builtins.__import__
+        def guarded_import(name,*args,**kwargs):
+            if name=='qlib' or name.startswith('qlib.'):
+                raise AssertionError('collecting_run_imported_qlib')
+            return original_import(name,*args,**kwargs)
+        # Both early exits must stay ahead of heavy imports, even if Qlib is cached.
+        index=engine.pd.MultiIndex.from_product([range(40),['A','B']])
+        missing=engine.pd.DataFrame({'x':float('nan'),'_end':[t+1 for t,_ in index]},index=index)
+        for panel,reason in [(engine.pd.DataFrame(),'insufficient_time_batches'),
+                             (missing,'insufficient_feature_coverage')]:
+            with patch.object(engine,'load_panel',return_value=panel), \
+                    patch.object(builtins,'__import__',side_effect=guarded_import):
+                result=engine.qlib_experiment(None)
+            self.assertEqual(result,{'status':'collecting','reason':reason,'backend':'qlib'})
+
     def test_bounded_settlement_resumes_without_duplicate_labels(self):
         with tempfile.TemporaryDirectory() as tmp, closing(engine.database(Path(tmp)/'research.sqlite3')) as db:
             frames=[{'t':1700000000+i*60,'symbols':{'A':{'price':100+i,'values':{'x':i}}}} for i in range(301)]

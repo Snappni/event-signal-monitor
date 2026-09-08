@@ -323,11 +323,6 @@ def evaluate(db, catalog, progress=None):
 
 def qlib_experiment(db):
     """Run a real Qlib DatasetH + model pipeline. Research only, no live promotion."""
-    import qlib
-    from qlib.data.dataset import DatasetH
-    from qlib.data.dataset.handler import DataHandlerLP
-    from qlib.contrib.model.linear import LinearModel
-    from qlib.contrib.eva.alpha import calc_ic
     panel = load_panel(db,60)
     if panel.empty or len(panel.index.get_level_values(0).unique())<30:
         return {"status":"collecting", "reason":"insufficient_time_batches", "backend":"qlib"}
@@ -336,6 +331,12 @@ def qlib_experiment(db):
     cols = [c for c in panel if not c.startswith('_') and train[c].notna().mean()>=.95 and train[c].std()>1e-9]
     if not cols or any(s.empty for s in splits):
         return {"status":"collecting", "reason":"insufficient_feature_coverage", "backend":"qlib"}
+    # A collecting-only run needs no Qlib model imports or their startup memory.
+    import qlib
+    from qlib.data.dataset import DatasetH
+    from qlib.data.dataset.handler import DataHandlerLP
+    from qlib.contrib.model.linear import LinearModel
+    from qlib.contrib.eva.alpha import calc_ic
     means=train[cols].mean(); scales=train[cols].std().clip(lower=1e-6)
     x=((panel[cols].fillna(means)-means)/scales).clip(-10,10)
     frame=pd.concat({"feature":x,"label":panel[["_return"]]},axis=1)
