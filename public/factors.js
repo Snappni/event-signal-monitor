@@ -19,15 +19,15 @@ const actionNames={update:'自动采样与研究更新',evaluate:'立即评估',
 const phaseNames={starting:'启动研究环境',ingesting:'写入观测',settling_labels:'生成成熟标签',evaluating_ic:'计算因子IC',qlib_model:'训练与评估Qlib模型',reuse_evaluation:'复用未过期评估',mining_expressions:'搜索多因子表达式',governance:'处理因子应用状态',saving_report:'保存研究结果',completed:'计算完成'};
 function renderTask(r) {
   const w=r.worker || {}, task=r.userTask || w, p=task.progress || {}, active=w.state==='running';
-  const names={running:'运行中',idle:'已完成',error:'失败',interrupted:'已中断',not_started:'尚未启动'};
+  const names={running:'运行中',idle:'已完成',error:'失败',interrupted:'已中断',deferred:'已让出资源',not_started:'尚未启动'};
   const state=task.outcome==='timed_out'?'已超时':names[task.state] || '等待状态';
   $('factorRuntimeState').textContent=active?'研究计算中':names[w.state] || '等待状态';
   $('researchTaskTitle').textContent=`${actionNames[task.action] || '研究任务'} · ${state}`;
   $('researchTaskIdentity').textContent=task.taskId?`任务编号：${task.taskId} · ${task.requestedBy==='automatic'?'自动触发':'用户触发'}`:'没有已记录的任务';
   $('researchTaskProgress').textContent=task.state==='running'?`阶段：${phaseNames[p.phase] || '等待进程报告阶段'}${p.total!=null?` · ${p.completed ?? 0}/${p.total}`:''}${p.detail?` · ${p.detail}`:''}`:'';
   $('researchTaskTiming').textContent=task.startedAt?`开始：${new Date(task.startedAt).toLocaleString()} · 耗时 ${task.elapsedSeconds || 0} 秒${p.heartbeatAt?` · 最近心跳：${new Date(p.heartbeatAt).toLocaleTimeString()}`:''}${task.finishedAt?` · 结束：${new Date(task.finishedAt).toLocaleString()}`:''}`:'';
-  $('researchTaskResult').textContent=task.error || (task.heartbeatStale?'进程仍存在，但超过30秒没有心跳；尚未确认任务正常推进。':task.result?`完成：已结算标签 ${task.result.counts?.matured || 0}${task.action==='mine'?`；挖掘状态 ${task.result.miningStatus || '未知'}；隔离表达式 ${task.result.candidates}`:''}`:'');
-  $('researchOtherTask').textContent=active&&w.taskId!==task.taskId?`另有后台任务：${actionNames[w.action] || w.action} · ${phaseNames[w.progress?.phase] || '启动中'}`:'';
+  $('researchTaskResult').textContent=(task.error || (task.heartbeatStale?'进程仍存在，但超过30秒没有心跳；尚未确认任务正常推进。':task.result?`完成：已结算标签 ${task.result.counts?.matured || 0}${task.action==='mine'?`；挖掘状态 ${task.result.miningStatus || '未知'}；隔离表达式 ${task.result.candidates}`:''}`:''))+(task.state==='deferred'?`。未完成本次研究，保留旧结果；${task.reason==='julia_maintenance_required'?'需先完成服务器维护验收':`最早重试 ${new Date(task.retryAfter*1000).toLocaleTimeString()}`}，手动请求未排队。`:'');
+  $('researchOtherTask').textContent=w.taskId!==task.taskId&&w.taskId?`后台任务：${actionNames[w.action] || w.action} · ${names[w.state] || w.state}${w.error?` · ${w.error}`:''}`:'';
   const request=r.lastRequest;
   if(request && !requestPending) $('researchActionState').textContent=request.started?`最近请求已受理，结果见任务面板。` : request.reason==='worker_busy'?`最近的${actionNames[request.requestedAction] || '请求'}未启动：已有任务占用，未排队。` : request.error || request.reason;
   for(const id of ['evaluateResearch','mineResearch']) $(id).disabled=active || requestPending;
@@ -60,6 +60,7 @@ function render() {
   $('factorWeightVersion').textContent=data.weightVersion || '尚未发布';
   $('factorGeneratedAt').textContent=r.evaluatedAt ? new Date(r.evaluatedAt*1000).toLocaleString() : '尚未评估';
   $('researchHealth').textContent=r.error || `排除标签 ${counts.excluded || 0}；中断区间 ${counts.gaps || 0}；${messages[r.publication?.reason] || r.publication?.reason || '尚无发布'}。手续费及滑点是估计；已核验历史按结算资金费处理，实时账本仍需区分。`;
+  if(r.executionProfile==='server-low') $('researchHealth').textContent+=' 服务器资源预算已启用：每周期使用最近90天内至多12000行完整时间截面；7/30/90日IC仅基于实际覆盖数据，不代表已补齐对应天数。';
   const model=r.model || {}, mining=r.mining || {};
   $('factorMiningDetails').innerHTML=`<div><strong>Qlib · Ridge研究基线</strong><p>${escape(model.status || '尚未计算')} · 样本外Rank IC ${fmt(model.rankIc)}</p><p>不接管入场概率或账户风控</p></div><div><strong>PySR · 多变量符号回归</strong><p>${escape(mining.status || '未运行')} ${escape(mining.reason || '')} · ${mining.candidates?.length || 0}个隔离表达式</p>${(mining.candidates || []).slice(0,8).map(c=>`<p><code>${escape(c.expression)}</code> · ${escape(c.id)} · 前向IC ${fmt(r.factors?.[c.id]?.metrics?.['60']?.meanIc)}</p>`).join('')}</div>`;
   const horizon=$('factorHorizon').value, term=$('factorSearch').value.toLowerCase(), filter=$('factorEvidence').value;

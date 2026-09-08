@@ -11,6 +11,37 @@
 - 历史导入：`npm run research:import -- DIRECTORY [last-bars]`；目录含 `{symbol,klines:[Binance格式行]}` 的 `.json.gz`，至少8个币种。无 last-bars 限制时导入全部；不会下载、编造缺失行情。
 - 原始账户、登录会话和旧研究状态不删除；新数据库在 `SIGNAL_RUNTIME_DIR/factor-research`，旧 IC 不导入。
 
+## 同服务器资源预算（显式启用，本地保持原配置）
+
+默认 `standard`，不根据 Windows/Linux、内存大小自动限流。本次改动不修改任何实际 `.env`。
+仅在服务器 monitor **和** dashboard 服务的环境中设置 `FACTOR_RESEARCH_PROFILE=server-low`，重启对应服务后启用；两处应一致，避免手工请求绕过服务器预算。
+
+| 项目 | 本地／standard | 服务器／server-low |
+|---|---|---|
+| 采样 | 每分钟 | 仍每分钟，不降采样 |
+| 自动启动研究 | 每分钟尝试 | 至少间隔5分钟，资源退避期间不启动；不排队按钮请求 |
+| IC重评 | 配置规定，默认60分钟 | 同左，立即评估仍可强制；不放宽统计门槛 |
+| 面板 | 最近730天 | 先按目标周期取固定桶内首个时点，再保留最近90天内最新至多12000行；每个时间截面保持完整 |
+| 单轮消费 | 全部收件包／成熟标签 | 至多10包，每包至多8MiB；每周期至多2000条标签，已提交部分可恢复 |
+| 数值线程／PySR | 原有设置 | 数值线程1；PySR 2轮、1种群、最近100个训练时间批次、fit 30秒 |
+| 整轮时限 | 原有10／30分钟 | 独立监督进程300秒，包含导入数值库与Julia，不仅是fit |
+
+服务器执行路径：Node任务锁 → 仅标准库的Python监督进程 → 独立进程组中的数值研究。
+启动前检查 `/proc/meminfo` 的 MemAvailable≥512MiB、memory PSI some avg10<1%、I/O PSI some avg10<10%、交易心跳≤15秒、最近决策完成≤60秒且连续失败为0。
+运行时每2秒检查；可用内存<256MiB、研究进程组RSS≥450MiB、压力／交易状态越界时结束整个数值进程组，记录 `deferred`、原因、观测值和5分钟退避。缺少监测数据也退避，不当作零压力。低优先级及单数值线程不是CPU硬配额；轮询阈值也不是内核内存硬上限，Linux进程组和实际负载仍须服务器验收，不能据此保证2GB机器承载全部计算强度。
+
+失败或资源中断的服务器任务不替换旧报告；只有成功退出且最终健康检查通过才原子发布新报告。SQLite提交和已消费收件包保留；标签按主键增量结算。**IC统计本身是有界窗口重算，不是已实现逐点IC缓存**；下一次继续消费未处理包／标签，未完成的统计计算重新做，不承诺从中断的某个因子继续。原始数据库不裁剪、不插值；滚动IC只表示实际覆盖数据，每个指标的 `dataWindow` 给出决策起止时间与面板行数，不声称补齐90天。时间切分、FDR、EV、发布2小时有效期和账户风控全部保留；旧报告留存不代表过期发布继续交易。
+
+### 服务器Julia维护边界
+
+`server-low` 默认不运行PySR；自动任务仍写观测、结算标签和评估IC/Qlib，手动挖掘显示“需维护验收”，不会因Julia未就绪而每轮阻塞数据消费。
+只在另行安排的受控维护窗口完成Julia安装及**真实fit**、确认资源余量后，才设置 `FACTOR_RESEARCH_SERVER_PYSR=ready`，并同时指定已有的绝对路径 `PYTHON_JULIAPKG_EXE` 和 `PYTHON_JULIAPKG_PROJECT`（后者含Manifest.toml）。配置开关是操作者的验收声明，不是软件自行证明初始化已成功。
+服务器运行时强制 `PYTHON_JULIAPKG_OFFLINE=yes`，不下载Julia或Julia包；关闭自动预编译不等于完全不存在即时编译，残余编译同样受监督时限和压力检查。此次本地测试不安装Julia，不创建ready标记，不执行服务器初始化。标准本地PySR流程不改。
+
+验证：`npm run signal:test:research-resources`。Windows执行策略、数据库和任务状态故障注入；真实Linux进程组测试在Windows明确跳过，部署验收须在Linux补跑。取消服务器预算需移除上述服务环境配置并重启；不删除数据库、账户或历史报告。
+
+实现依据：[Linux PSI](https://www.kernel.org/doc/html/latest/accounting/psi.html)、[Python独立进程会话](https://docs.python.org/3.11/library/subprocess.html)。
+
 ## 决策权责
 
 | 内容 | 当前实现 |

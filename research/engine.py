@@ -10,6 +10,10 @@ import sqlite3
 import time
 import threading
 from datetime import datetime, timezone
+from resource_budget import budget, server_low, mining_ready
+
+if server_low() and os.environ.get('FACTOR_RESEARCH_SUPERVISED') != '1':
+    raise RuntimeError('server_research_requires_resource_supervisor')
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("OMP_NUM_THREADS", "2")
@@ -77,6 +81,9 @@ def finite(value):
 def database(path):
     db = sqlite3.connect(path, timeout=20)
     db.execute("PRAGMA journal_mode=WAL")
+    if server_low():
+        db.execute('PRAGMA cache_size=-16384')
+        db.execute('PRAGMA temp_store=FILE')
     db.executescript('''
       CREATE TABLE IF NOT EXISTS observations(
         t INTEGER, symbol TEXT, price REAL, features TEXT, source TEXT, cost REAL,
@@ -133,7 +140,7 @@ def settle(db, tolerance=90):
         rows = db.execute('''SELECT o.t,o.symbol,o.price,o.cost,o.source FROM observations o
           LEFT JOIN labels l ON l.t=o.t AND l.symbol=o.symbol AND l.horizon=?
           WHERE l.t IS NULL AND o.t+?<=? AND (o.source NOT LIKE 'historical_%' OR o.features!='{}')
-          ORDER BY o.t''', (h, h*60, last)).fetchall()
+          ORDER BY o.t LIMIT ?''', (h, h*60, last, budget()['labelsPerHorizon'] or -1))
         for t, symbol, price, cost, source in rows:
             due = t + h*60
             end = db.execute('''SELECT t,price FROM observations WHERE symbol=? AND source=?
@@ -147,6 +154,8 @@ def settle(db, tolerance=90):
                 t, symbol, h, end[0] if end else due, end[1]/price-1 if end else None,
                 cost, int(reason == "ok"), reason))
             added += 1
+            if added % 250 == 0:
+                db.commit()
     db.commit()
     return added
 
@@ -172,18 +181,42 @@ def interval_stats(values, block=4):
 
 def load_panel(db, horizon, limit_days=730):
     latest = db.execute("SELECT max(t) FROM observations").fetchone()[0] or 0
+    limits = budget()
+    cutoff = latest-min(limit_days, limits['panelDays'])*86400
+    selected_times = None
+    if limits['panelRows']:
+        # Anchor BEFORE capping rows, or 1-minute data erases all long-horizon evidence.
+        # One deterministic earliest timestamp per horizon bucket, all available assets.
+        times = db.execute('''WITH available AS (SELECT o.t,count(*) AS n FROM observations o JOIN labels l
+            ON o.t=l.t AND o.symbol=l.symbol WHERE l.horizon=? AND l.trainable=1
+            AND o.features!='{}' AND o.t>=? GROUP BY o.t),
+            anchors AS (SELECT min(t) AS t FROM available GROUP BY CAST(t / ? AS INTEGER))
+            SELECT available.t,n FROM available JOIN anchors USING(t) ORDER BY t DESC LIMIT ?''',
+            (horizon, cutoff, horizon*60, limits['panelRows']+1))
+        count = 0
+        selected_times = []
+        for t, n in times:
+            if count+n > limits['panelRows']:
+                if count == 0: raise ValueError('cross_section_exceeds_server_row_budget')
+                break
+            count += n
+            selected_times.append(t)
+            cutoff = t
+        if not selected_times:
+            return pd.DataFrame()
+    selected_sql = ' AND o.t IN ('+','.join('?' for _ in selected_times)+')' if selected_times else ''
     rows = db.execute('''SELECT o.t,o.symbol,o.features,l.gross,l.cost,l.end_t,o.source,
         CASE WHEN o.source LIKE 'historical_binance_%' THEN COALESCE((SELECT sum(f.rate*f.mark_price/o.price)
           FROM funding_settlements f WHERE f.venue='binance_um' AND f.symbol=o.symbol
           AND f.t>o.t AND f.t<=l.end_t),0) ELSE 0 END FROM observations o
         JOIN labels l ON o.t=l.t AND o.symbol=l.symbol
-        WHERE l.horizon=? AND l.trainable=1 AND o.features!='{}' AND o.t>=? ORDER BY o.t,o.symbol''',
-        (horizon, latest-limit_days*86400)).fetchall()
-    if not rows:
-        return pd.DataFrame()
+        WHERE l.horizon=? AND l.trainable=1 AND o.features!='{}' AND o.t>=?'''+selected_sql+' ORDER BY o.t,o.symbol',
+        (horizon, cutoff, *(selected_times or [])))
     panel = pd.DataFrame([{**json.loads(v), "t": t, "symbol": symbol,
         "_return": gross, "_cost": cost, "_end": end, "_source": source,
         "_funding": funding} for t, symbol, v, gross, cost, end, source, funding in rows])
+    if panel.empty:
+        return panel
     return panel.set_index(["t", "symbol"]).sort_index()
 
 
@@ -275,6 +308,10 @@ def evaluate(db, catalog, progress=None):
                 "target": "forward_return" if roles[fid]=="direction" else "absolute_forward_return",
                 "values": [float(v) for v in ic.iloc[-90:]],
                 "asOf": int(part._end.max()), "split": [len(x) for x in (train,validation,test)]}
+            output[fid]['metrics'][str(h)]['dataWindow'] = {
+                'firstDecisionAt': int(part.index.get_level_values(0).min()),
+                'lastDecisionAt': int(part.index.get_level_values(0).max()),
+                'panelRows': len(panel), 'budget': budget()}
         keys = [fid for fid,v in output.items() if str(h) in v["metrics"]]
         # Include all registered hypotheses, not just surviving candidates.
         pvalues = [output[fid]["metrics"].get(str(h),{}).get("test",{}).get("p",1) for fid in output]
@@ -318,6 +355,8 @@ def qlib_experiment(db):
 
 
 def mine(db, outdir):
+    if server_low() and not mining_ready():
+        raise RuntimeError('julia_maintenance_required')
     panel=load_panel(db,60)
     if panel.empty:
         return {"status":"collecting", "reason":"no_mature_labels", "candidates":[]}
@@ -326,13 +365,17 @@ def mine(db, outdir):
     if len(cols)<2 or len(train)<100:
         return {"status":"collecting", "reason":"insufficient_training_data", "candidates":[]}
     train=train.dropna(subset=cols)
+    if server_low():
+        times=train.index.get_level_values(0).unique().sort_values()
+        # Bound fit size without mixing test data into training or splitting a batch.
+        train=train[train.index.get_level_values(0).isin(times[-100:])]
     x=train[cols].to_numpy(); y=train._return.to_numpy()
     # Time-series operators are precomputed inputs. Search never sees held-out rows.
     from pysr import PySRRegressor
-    model=PySRRegressor(niterations=8,populations=4,population_size=20,tournament_selection_n=5,maxsize=15,maxdepth=5,
+    model=PySRRegressor(niterations=2 if server_low() else 8,populations=1 if server_low() else 4,population_size=20,tournament_selection_n=5,maxsize=15,maxdepth=5,
         binary_operators=['+','-','*'],unary_operators=['tanh'],
         parallelism='serial',deterministic=True,random_state=17,verbosity=0,progress=False,
-        timeout_in_seconds=120,output_directory=str(outdir),run_id=str(int(time.time())))
+        timeout_in_seconds=30 if server_low() else 120,output_directory=str(outdir),run_id=str(int(time.time())))
     model.fit(x,y)
     candidates=[]
     for _,row in model.equations_.iterrows():
@@ -461,8 +504,12 @@ def _run(root, force=False, mining=False, progress=None):
     added=0
     # Crash after commit, before unlink is harmless: primary keys are idempotent.
     packets=sorted((root/'inbox').glob('*.json'))
+    if budget()['inboxPackets']:
+        packets=packets[:budget()['inboxPackets']]
     for i,p in enumerate(packets):
         if progress:progress('ingesting',i,len(packets))
+        if server_low() and p.stat().st_size > 8*1024*1024:
+            raise ValueError('inbox_packet_exceeds_server_budget_split_import_packet')
         packet=json.loads(p.read_text(encoding='utf-8'))
         added+=ingest(db,packet)
         p.unlink()
@@ -470,7 +517,7 @@ def _run(root, force=False, mining=False, progress=None):
     settled=settle(db)
     old_path=root/'report.json'
     old=json.loads(old_path.read_text(encoding='utf-8')) if old_path.exists() else {}
-    due=force or time.time()-old.get('evaluatedAt',0)>=config.get('evaluationMinutes',60)*60
+    due=force or old.get('resourcePolicy',{}).get('profile','standard')!=budget()['profile'] or time.time()-old.get('evaluatedAt',0)>=config.get('evaluationMinutes',60)*60
     metrics=evaluate(db,catalog,progress) if due else old.get('factors',{})
     if progress:progress('qlib_model' if due else 'reuse_evaluation')
     model=qlib_experiment(db) if due else old.get('model',{})
@@ -506,8 +553,11 @@ def _run(root, force=False, mining=False, progress=None):
             'funding':'historical_binance: signed settled rate * settlement mark / entry; live funding not backfilled',
             'productionEntryEvGate':'unchanged'},
         'lastRun':{'ingested':added,'settled':settled}}
+    report['resourcePolicy']={**budget(), 'remainingPackets':sum(1 for _ in (root/'inbox').glob('*.json')),
+                              'evaluation':'bounded_window_recalculation' if server_low() else 'standard',
+                              'entryRiskGates':'unchanged'}
     if progress:progress('saving_report')
-    atomic_json(old_path,report)
+    atomic_json(os.environ.get('FACTOR_RESEARCH_REPORT_OUTPUT') or old_path,report)
     db.close()
     if progress:progress('completed',1,1)
     return report

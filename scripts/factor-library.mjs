@@ -12,6 +12,13 @@ const VOLATILITY_ANCHORS = new Set(['realized_volatility','parkinson_volatility'
 // These two catalog entries have no standalone numeric feature output.
 const NO_MANUAL_VALUE = new Set(['model_bayesian_calibration','model_markowitz_allocator']);
 const children = new Set();
+const serverLow = () => process.env.FACTOR_RESEARCH_PROFILE === 'server-low';
+function serverMiningReady() {
+  const exe = process.env.PYTHON_JULIAPKG_EXE || '', project = process.env.PYTHON_JULIAPKG_PROJECT || '';
+  return process.env.FACTOR_RESEARCH_SERVER_PYSR === 'ready' && path.isAbsolute(exe) && path.isAbsolute(project)
+    && fs.existsSync(exe) && fs.statSync(exe).isFile() && fs.existsSync(path.join(project, 'Manifest.toml'));
+}
+const resourceReasons = { host_memory_low: '主机可用内存不足', host_memory_pressure: '主机内存压力升高', host_io_pressure: '磁盘 I/O 压力升高', trading_heartbeat_stale: '交易心跳不新鲜', trading_decision_unhealthy: '交易决策未及时完成或存在失败', research_memory_budget: '研究进程组达到内存预算', research_time_budget: '研究任务达到时间预算', research_parent_exited: '启动研究的进程已退出', julia_maintenance_required: '服务器 Julia 尚未完成独立维护验收，暂停挖掘；采样与 IC 评估不受此项影响', server_profile_requires_linux: '服务器低资源配置仅适用于 Linux' };
 function terminateWorker(child) {
   if (!child.pid || child.exitCode !== null) return;
   if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: 5000 });
@@ -79,7 +86,7 @@ export function readFactorResearch() {
   const root = researchRoot(), report = read(path.join(root, 'report.json')), failure = read(path.join(root, 'error.json'));
   const pointer = read(path.join(root, 'last-user-task.json'));
   const userTask = /^[a-f0-9-]{36}$/.test(pointer.taskId || '') ? taskStatus(root, read(path.join(root, 'tasks', `${pointer.taskId}.json`))) : null;
-  return { ...report, worker: taskStatus(root, read(path.join(root, 'worker.json'))), userTask,
+  return { ...report, executionProfile: serverLow() ? 'server-low' : 'standard', worker: taskStatus(root, read(path.join(root, 'worker.json'))), userTask,
     lastRequest: read(path.join(root, 'last-request.json')),
     error: failure.at > (report.generatedAt || 0) ? failure.error : null };
 }
@@ -90,19 +97,26 @@ function prepare(config) {
   return root;
 }
 export function enqueueResearchFrames(frames, config, source = 'live') {
-  const root = prepare(config); if (!frames.length) return;
+  const root = researchRoot(); if (!frames.length) return;
+  fs.mkdirSync(path.join(root, 'inbox'), { recursive: true });
   if (fs.readdirSync(path.join(root, 'inbox')).length >= 5000) throw new Error('research_backlog_full');
   write(path.join(root, 'inbox', `${Date.now()}-${randomUUID()}.json`), { schema: 1, source, frames });
 }
 export function startFactorResearch(config, action = 'update', { requestedBy = action === 'update' ? 'automatic' : 'user' } = {}) {
   if (!['update', 'evaluate', 'mine'].includes(action)) throw new Error('unknown_research_action');
-  const root = prepare(config), lock = path.join(root, 'worker.lock');
+  const root = researchRoot(), lock = path.join(root, 'worker.lock');
+  fs.mkdirSync(root, { recursive: true });
   const requestedAt = new Date().toISOString();
   const respond = result => {
     const response = { ...result, requestedAction: action, requestedAt, queued: false };
     if (requestedBy === 'user') write(path.join(root, 'last-request.json'), response);
     return response;
   };
+  const previous = read(path.join(root, 'worker.json'));
+  if (serverLow() && previous.retryAfter > Date.now()/1000 && previous.reason !== 'julia_maintenance_required') {
+    return respond({ started: false, reason: 'resource_cooldown', retryAfter: previous.retryAfter,
+      error: '研究任务正在资源退避，尚未启动也未排队；到期后自动调度可重试。' });
+  }
   try { fs.writeFileSync(lock, JSON.stringify({ pid: process.pid }), { flag: 'wx' }); }
   catch (error) {
     if (error.code !== 'EEXIST') throw error;
@@ -113,11 +127,15 @@ export function startFactorResearch(config, action = 'update', { requestedBy = a
     if (read(lock).pid === prior.pid) fs.unlinkSync(lock);
     return startFactorResearch(config, action, { requestedBy });
   }
+  // Only the lock owner freezes this run's settings; capture/busy requests never rewrite them.
+  try { prepare(config); } catch (error) { fs.unlinkSync(lock); throw error; }
   const taskId = randomUUID(), startedAt = requestedAt;
   const taskFile = path.join(root, 'tasks', `${taskId}.json`);
   const python = process.env.FACTOR_RESEARCH_PYTHON || path.join(ROOT, '.runtime/factor-research-venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
-  const args = [path.join(ROOT, 'research/engine.py'), '--root', root];
-  if (action === 'evaluate') args.push('--evaluate'); if (action === 'mine') args.push('--mine');
+  const args = serverLow()
+    ? [path.join(ROOT, 'research/resource_budget.py'), '--root', root, '--action', action, '--parent', String(process.pid)]
+    : [path.join(ROOT, 'research/engine.py'), '--root', root];
+  if (!serverLow()) { if (action === 'evaluate') args.push('--evaluate'); if (action === 'mine') args.push('--mine'); }
   let stderr = '', finished = false, timedOut = false;
   const child = spawn(python, args, { cwd: ROOT, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', FACTOR_RESEARCH_TASK_ID: taskId } });
   children.add(child);
@@ -136,15 +154,18 @@ export function startFactorResearch(config, action = 'update', { requestedBy = a
   const done = (code, error = null, outcome = null) => {
     if (finished) return; finished = true; children.delete(child); clearTimeout(timeout); process.removeListener('exit', onExit);
     const report = read(path.join(root, 'report.json'));
+    const resource = read(path.join(root, 'resource-result.json'));
+    const deferred = code === 75 && resource.taskId === taskId;
     const miningError = action === 'mine' && report.mining?.status === 'error' ? report.mining.reason : null;
     const success = code === 0 && !miningError && !timedOut;
-    const reason = timedOut ? '任务超过运行时限，已停止' : error || miningError || (success ? null : stderr || 'research_worker_failed');
+    const reason = deferred ? resourceReasons[resource.reason] || `资源检查未通过：${resource.reason}` : timedOut ? '任务超过运行时限，已停止' : error || miningError || (success ? null : stderr || 'research_worker_failed');
     const progress = read(path.join(root, 'progress.json'));
-    persist({ ...task, state: success ? 'idle' : outcome === 'interrupted' ? 'interrupted' : 'error', outcome: outcome || (timedOut ? 'timed_out' : success ? 'completed' : 'failed'),
+    persist({ ...task, state: deferred ? 'deferred' : success ? 'idle' : outcome === 'interrupted' ? 'interrupted' : 'error', outcome: deferred ? 'resource_deferred' : outcome || (timedOut ? 'timed_out' : success ? 'completed' : 'failed'),
+      ...(deferred ? { reason: resource.reason, retryAfter: resource.retryAfter, resources: resource.resources } : {}),
       code, finishedAt: new Date().toISOString(), error: reason,
       progress: progress.taskId === taskId ? progress : null,
       result: success ? { counts: report.counts, miningStatus: action === 'mine' ? report.mining?.status : undefined, candidates: report.mining?.candidates?.length || 0 } : null });
-    if (!success) write(path.join(root, 'error.json'), { at: Date.now() / 1000, taskId, error: reason });
+    if (!success && !deferred) write(path.join(root, 'error.json'), { at: Date.now() / 1000, taskId, error: reason });
     else if (fs.existsSync(path.join(root, 'error.json'))) fs.unlinkSync(path.join(root, 'error.json'));
     if (read(lock).taskId === taskId) fs.unlinkSync(lock);
   };
@@ -171,8 +192,12 @@ export function updateFactorLibraryRuntime({ config, status, snapshots = [], now
         ...Object.fromEntries(candidates.filter(c => t > c.trainedUntil).map(c => [c.id, evaluateMinedAst(c.ast, snapshot.values)])) } }));
       const symbols = Object.fromEntries(snapshots.filter(x => number(x.price) > 0).map(x => [x.symbol, { price: x.price, values: x.values, cost: number(x.roundTripCost, .0016) }]));
       enqueueResearchFrames([{ t, intervalSeconds: 60, symbols }], c); s.lastCaptureAt = now;
-      const r = readFactorResearch(), mine = c.miningEnabled && t - (r.mining?.completedAt || 0) >= c.miningIntervalMinutes * 60;
-      startFactorResearch(c, mine ? 'mine' : 'update', { requestedBy: 'automatic' });
+      const r = readFactorResearch(), mine = c.miningEnabled && t - (r.mining?.completedAt || 0) >= c.miningIntervalMinutes * 60
+        && (!serverLow() || serverMiningReady());
+      if (!serverLow() || Date.parse(now) - (Date.parse(s.lastResearchAttemptAt) || 0) >= 300_000) {
+        startFactorResearch(c, mine ? 'mine' : 'update', { requestedBy: 'automatic' });
+        s.lastResearchAttemptAt = now;
+      }
     } catch (e) { error = e.message; }
   }
   const r = readFactorResearch();
