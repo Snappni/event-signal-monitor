@@ -16,3 +16,6 @@ coverage/
 /tools/stop-server-dashboard.ps1
 /打开服务器前端.cmd
 /关闭服务器前端隧道.cmd
+
+# Generated Python bytecode (research sources and lockfile remain versioned).
+/research/__pycache__/

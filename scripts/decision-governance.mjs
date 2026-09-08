@@ -4,8 +4,8 @@ export const EXIT_REVIEW_MODE = "validated_exit_only";
 
 export const DECISION_WRITER_BINDINGS = Object.freeze([
   Object.freeze({ field: "legacyDirectionWeights", owner: "fixed_legacy_champion" }),
-  Object.freeze({ field: "factorParticipation", owner: "factor_library_auto_governance" }),
-  Object.freeze({ field: "factorLayerWeights", owner: "factor_library_weight_engine" }),
+  Object.freeze({ field: "factorParticipation", owner: "factor_mode_router" }),
+  Object.freeze({ field: "factorLayerWeights", owner: "factor_mode_router" }),
   Object.freeze({ field: "entryProbability", owner: "candidate_probability_pipeline" }),
   Object.freeze({ field: "exitWeights", owner: "post_trade_review" }),
   Object.freeze({ field: "hardRiskLimits", owner: "paper_risk_policy" })
@@ -62,7 +62,7 @@ export function buildDecisionGovernanceAudit({
     const layerEntries = Object.entries(market?.factorLayers || {});
     const activeIds = layerEntries.flatMap(([, layer]) => list(layer?.activeFactors).map((factor) => factor?.id));
     const duplicateLayerIds = duplicateIds(activeIds);
-    const modelFactorIds = Object.values(market?.modelGovernance || {}).map((model) => model?.factorId).filter(Boolean);
+    const modelFactorIds = Object.values(market?.modelGovernance || {}).filter(model => model?.useInDecision !== false).map((model) => model?.factorId).filter(Boolean);
     const modelOrdinaryOverlap = [...new Set(activeIds.filter((id) => modelFactorIds.includes(id)))].sort();
     const symbol = market?.symbol || "unknown";
     checks.push(check(

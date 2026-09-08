@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>因子库 | 事件信号监控引擎</title>
+    <title>因子研究中心 | 事件信号监控引擎</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -22,81 +22,45 @@
       </nav>
     </header>
     <main class="detail-page factor-page">
-      <section class="page-heading">
-        <div><span class="eyebrow">FACTOR RESEARCH</span><h2>因子库</h2><p>方向、情景、风险因子分别进入独立决策层；IC 只表示预测相关性，不等于盈利保证</p></div>
-        <span id="factorRuntimeState" class="live-state"><i></i>因子引擎独立运行</span>
+      <section class="page-heading"><div><span class="eyebrow">CAUSAL FACTOR RESEARCH</span><h2>因子研究中心</h2><p>采样 → 成熟标签 → 样本外评估 → 隔离验证 → 发布方向组合。研究不依赖账户开仓。</p></div><span id="factorRuntimeState" class="live-state">等待状态</span></section>
+      <section class="summary-grid detail-summary factor-summary" aria-label="研究摘要">
+        <div class="metric"><span>特征目录</span><strong id="factorCount">—</strong></div>
+        <div class="metric"><span>观测行 / 时间批次</span><strong id="observationCount">—</strong></div>
+        <div class="metric"><span>成熟 / 待成熟标签</span><strong id="labelCount">—</strong></div>
+        <div class="metric"><span>实际参与因子</span><strong id="factorDecisionCount">—</strong></div>
+        <div class="metric"><span>发布版本</span><strong id="factorWeightVersion">—</strong></div>
+        <div class="metric"><span>评估时间</span><strong id="factorGeneratedAt" class="metric-time">—</strong></div>
       </section>
-      <section class="summary-grid detail-summary factor-summary" aria-label="因子摘要">
-        <div class="metric"><span>内置 / 总活跃</span><strong id="factorCount">0 / 0</strong></div>
-        <div class="metric"><span>已启用</span><strong id="factorEnabledCount">0</strong></div>
-        <div class="metric"><span>样本外通过 / 分层可交易</span><strong id="factorDecisionCount">0 / 0</strong></div>
-        <div class="metric"><span>挖掘 / 已验证</span><strong id="factorMinedCount">0 / 0</strong></div>
-        <div class="metric"><span>权重版本</span><strong id="factorWeightVersion">v1</strong></div>
-        <div class="metric"><span>数据时间</span><strong id="factorGeneratedAt" class="metric-time">-</strong></div>
-      </section>
-
       <section class="panel detail-panel factor-settings-panel">
-        <div class="section-title"><h2>运行设置</h2><span id="factorSaveNotice">修改后会出现保存栏</span></div>
+        <div class="section-title"><h2>运行与发布</h2><span id="factorSaveNotice" role="status">修改后保存</span></div>
         <div class="factor-settings-grid">
-          <label class="factor-switch"><input id="factorLibraryEnabled" type="checkbox" /><span>启用因子引擎</span></label>
-          <label class="factor-switch"><input id="factorIntelligentAdjustment" type="checkbox" /><span>智能自适应权重</span></label>
-          <label class="factor-switch"><input id="factorAutoGovernanceEnabled" type="checkbox" /><span>自动治理方向因子</span></label>
-          <label class="factor-switch"><input id="factorMiningEnabled" type="checkbox" /><span>实时自动挖掘</span></label>
-          <label>普通方向因子组合最大融合权重<input id="factorDecisionInfluence" type="number" min="0" max="40" step="1" /><span class="input-suffix">%</span></label>
+          <label for="factorDecisionMode">因子应用流程<select id="factorDecisionMode"><option value="validated">自动验证流程</option><option value="manual">手动直接应用（分层选因子）</option></select></label>
+          <label class="factor-switch"><input id="factorLibraryEnabled" type="checkbox">启用研究采样</label>
+          <label class="factor-switch"><input id="factorAutoGovernanceEnabled" type="checkbox">自动治理方向组合</label>
+          <label class="factor-switch"><input id="factorMiningEnabled" type="checkbox">自动挖掘（最多每日一次）</label>
+          <label>普通方向因子组合最大融合权重<input id="factorDecisionInfluence" type="number" min="0" max="40" step="1">%</label>
         </div>
-        <p id="factorAutoGovernanceStatus" class="muted">自动治理未启用；当前只对有平仓反事实证据的方向因子执行自动切换。</p>
-        <p class="factor-policy-note">方向因子只融合方向；情景因子只收缩概率置信度；风险因子只调整止损尺度。普通因子层 4 个有效因子开始参与，默认到 10 个才达到完整强度；模型治理因子沿各自路径启停。</p>
+        <p id="factorModePolicy" class="factor-policy-note"></p>
+        <div id="manualLayerGuide" class="manual-layer-guide" hidden><strong>手动配置清单：每层至少1个，风险层必须包含波动率估计因子</strong><div id="manualLayerCards" class="factor-mining-grid"></div><p id="manualLayerMessage" role="status"></p></div>
+        <p class="factor-policy-note">Qlib收益模型仅研究，不冒充胜率。手动模式只跳过因子资格验证：方向组合、状态置信调整、波动风险调整各走一层；原账户概率、净EV和风险门槛继续生效。选齐不等于一定开仓。</p>
+        <div class="factor-toolbar"><button id="evaluateResearch" type="button">立即评估</button><button id="mineResearch" type="button">挖掘多因子表达式</button><span id="researchActionState" role="status"></span></div>
+        <section id="researchTaskPanel" class="research-task-panel" aria-label="研究任务状态" aria-live="polite"><strong id="researchTaskTitle">尚未启动任务</strong><p id="researchTaskIdentity"></p><p id="researchTaskProgress"></p><p id="researchTaskTiming"></p><p id="researchTaskResult"></p><p id="researchOtherTask"></p></section>
+        <p id="researchHealth" class="muted"></p>
       </section>
-
+      <section class="panel detail-panel"><div class="section-title"><h2>模型与挖掘隔离区</h2><span>候选不会自动进入生产</span></div><div id="factorMiningDetails" class="factor-mining-grid"></div></section>
       <section class="panel detail-panel">
-        <div class="section-title"><h2>自动挖掘状态</h2><span id="factorMiningActivity">未启用</span></div>
-        <div id="factorMiningDetails" class="factor-mining-grid"></div>
-      </section>
-
-      <section class="panel detail-panel">
-        <div class="section-title"><h2>因子清单</h2><span>删除采用可恢复的软删除，避免历史快照失去定义</span></div>
+        <div class="section-title"><h2>因子证据</h2><span id="factorFilteredCount"></span></div>
         <div class="factor-toolbar">
-          <input id="factorSearch" type="search" placeholder="搜索名称、说明或数据源" />
-          <select id="factorCategory"><option value="">全部分类</option></select>
-          <select id="factorEvidence">
-            <option value="">全部证据状态</option>
-            <option value="effective">当前有效</option>
-            <option value="inverse_effective">反向有效</option>
-            <option value="unstable">不稳定</option>
-            <option value="insufficient_samples">样本不足</option>
-            <option value="data_unavailable">数据不可用</option>
-          </select>
-          <button id="factorIcSort" class="factor-sort-button" type="button" aria-pressed="false" aria-label="按有效IC排序：默认">
-            <span>有效 IC</span><strong id="factorIcSortDirection">默认</strong>
-          </button>
-          <label class="factor-switch compact"><input id="factorShowArchived" type="checkbox" /><span>显示已删除</span></label>
+          <input id="factorSearch" type="search" aria-label="搜索因子" placeholder="名称、公式或说明">
+          <select id="factorHorizon" aria-label="未来收益周期"><option value="5">5分钟</option><option value="15">15分钟</option><option value="60" selected>1小时</option><option value="240">4小时</option></select>
+          <select id="factorLayerFilter" aria-label="因子层筛选"><option value="">全部层</option><option value="direction">方向层</option><option value="risk">波动／风险层</option><option value="context">市场状态层</option></select>
+          <select id="factorEvidence" aria-label="证据筛选"><option value="">全部状态</option><option value="passed">验证通过</option><option value="active">实际参与</option><option value="collecting">尚无IC</option></select>
+          <button id="factorIcSort" type="button" aria-pressed="false">按 |IC| 排序</button>
         </div>
-        <div class="factor-bulk-tools">
-          <label><input id="factorSelectAll" type="checkbox" /> 全选当前结果</label>
-          <button id="factorBulkEnable" type="button">启用</button>
-          <button id="factorBulkDecision" type="button">加入交易判断</button>
-          <button id="factorBulkArchive" type="button" class="danger-ghost">删除</button>
-          <button id="factorBulkRestore" type="button">恢复</button>
-          <span id="factorFilteredCount">0 项</span>
-        </div>
-        <div class="factor-table-wrap">
-          <table class="factor-table">
-            <thead><tr><th>选</th><th>因子</th><th>分类 / 来源</th><th>启用</th><th>交易判断</th><th>权重</th><th>15m IC</th><th>证据</th></tr></thead>
-            <tbody id="factorList"></tbody>
-          </table>
-        </div>
+        <div class="factor-table-wrap"><table class="factor-table"><thead><tr><th>因子 / 角色</th><th>启用</th><th>参与本层判断</th><th>相对权重</th><th>IC / 95%区间</th><th>n_eff / q</th><th>7 / 30 / 90日IC</th><th>应用状态</th></tr></thead><tbody id="factorList"></tbody></table></div>
       </section>
     </main>
-    <aside id="factorSaveBar" class="factor-save-bar" aria-live="polite" hidden>
-      <div class="factor-save-context">
-        <span class="factor-save-indicator" aria-hidden="true"></span>
-        <div><strong>有未保存的更改</strong><span id="factorSaveMessage">保存后将在下一轮监控中应用</span></div>
-      </div>
-      <div class="factor-save-actions">
-        <button id="discardFactorConfig" type="button" class="factor-save-discard">放弃更改</button>
-        <button id="saveFactorConfig" type="button" class="factor-save-primary">保存更改</button>
-      </div>
-    </aside>
+    <aside id="factorSaveBar" class="factor-save-bar" aria-live="polite" hidden><div class="factor-save-context"><div><strong>有未保存的更改</strong><span id="factorSaveHint">修改后保存生效</span></div></div><div class="factor-save-actions"><button id="discardFactorConfig" type="button">放弃更改</button><button id="saveFactorConfig" type="button" class="factor-save-primary">保存更改</button></div></aside>
     <script src="/factors.js" type="module"></script>
   </body>
 </html>

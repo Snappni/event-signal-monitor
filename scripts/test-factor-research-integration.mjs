@@ -1,0 +1,42 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+const root=path.resolve('.');
+const runtime=fs.mkdtempSync(path.join(root,'.runtime/research-integration-'));
+process.env.SIGNAL_RUNTIME_DIR=runtime;
+const lib=await import('./factor-library.mjs');
+const python=process.env.FACTOR_RESEARCH_PYTHON || path.join(root,'.runtime/factor-research-venv',process.platform==='win32'?'Scripts/python.exe':'bin/python');
+assert.ok(fs.existsSync(python),'install research/requirements.txt in .runtime/factor-research-venv');
+const unit=spawnSync(python,['research/test_engine.py'],{cwd:root,encoding:'utf8',env:{...process.env,PYTHONUTF8:'1',MLFLOW_DISABLE_AGENT_HINT:'1'}});
+if(unit.status!==0) console.error(unit.stdout,unit.stderr);assert.equal(unit.status,0);
+const c=lib.normalizeFactorLibraryConfig();
+const t=Math.floor(Date.now()/1000)-3600;
+const frames=Array.from({length:22},(_,i)=>({t:t+i*60,symbols:Object.fromEntries(['BTC','ETH','SOL','XRP','DOGE','BNB','ADA','LTC'].map((s,j)=>[s,{price:100+i*(j+1)/100,values:{return_1m:(j-3)/10},cost:.0016}]))}));
+lib.enqueueResearchFrames(frames,c);
+const start=lib.startFactorResearch(c,'evaluate');assert.equal(start.started,true);
+const busy=lib.startFactorResearch(c,'evaluate');assert.equal(busy.reason,'worker_busy');assert.equal(busy.queued,false);assert.equal(busy.worker.taskId,start.taskId);
+let ticks=0,report;
+for(let i=0;i<600;i++){await new Promise(r=>setTimeout(r,100));ticks++;report=lib.readFactorResearch();if(report.worker.state!=='running')break;}
+assert.equal(report.worker.state,'idle',JSON.stringify(report));assert.equal(report.counts.observations,176);
+assert.equal(report.counts.timeBatches,22);assert.ok(report.counts.matured>0);assert.equal(report.publication.configHash,lib.configDigest(c));
+assert.equal(report.publication.status,'shadow');assert.ok(ticks>1,'parent event loop keeps ticking');
+assert.equal(fs.existsSync(path.join(runtime,'paper-account.json')),false);
+assert.equal(report.worker.taskId,start.taskId);assert.equal(report.userTask.taskId,start.taskId);
+assert.equal(report.userTask.outcome,'completed');assert.equal(report.worker.progress.phase,'completed');
+assert.ok(report.worker.progress.heartbeatAt);
+const reload=spawnSync(process.execPath,['--input-type=module','-e',"import {readFactorResearch} from './scripts/factor-library.mjs';console.log(JSON.stringify(readFactorResearch().userTask));"],{cwd:root,env:process.env,encoding:'utf8'});
+assert.equal(JSON.parse(reload.stdout).taskId,start.taskId);assert.equal(JSON.parse(reload.stdout).outcome,'completed');
+const automatic=lib.startFactorResearch(c,'update',{requestedBy:'automatic'});assert.equal(automatic.started,true);
+for(let i=0;i<600;i++){await new Promise(r=>setTimeout(r,100));if(lib.readFactorResearch().worker.state!=='running')break;}
+assert.equal(lib.readFactorResearch().worker.outcome,'completed');
+assert.equal(lib.readFactorResearch().worker.requestedBy,'automatic');
+assert.equal(lib.readFactorResearch().userTask.taskId,start.taskId,'automatic updates preserve the last user task');
+process.env.FACTOR_RESEARCH_PYTHON=path.join(runtime,'missing-python.exe');
+const failure=lib.startFactorResearch(c,'mine');assert.equal(failure.started,true);
+for(let i=0;i<100;i++){await new Promise(r=>setTimeout(r,30));if(lib.readFactorResearch().worker.state!=='running')break;}
+const failed=lib.readFactorResearch();assert.equal(failed.worker.state,'error');assert.equal(failed.userTask.outcome,'failed');assert.ok(failed.worker.error);
+fs.writeFileSync(path.join(runtime,'factor-research/worker.json'),JSON.stringify({state:'running',pid:2147483647,taskId:'dead',startedAt:new Date().toISOString()}));
+assert.equal(lib.readFactorResearch().worker.state,'interrupted');
+delete process.env.FACTOR_RESEARCH_PYTHON;
+console.log(JSON.stringify({passed:true,pythonTests:7,observations:176,labels:report.counts.matured,workerIsolation:true,duplicateSuppressed:true,accountUntouched:true,persistentTask:true,progressReported:true,spawnFailureVisible:true,deadWorkerDetected:true,components:report.components}));

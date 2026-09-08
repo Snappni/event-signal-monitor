@@ -40,8 +40,8 @@ try {
   assert.match(pageHtml, />保存更改</);
   assert.match(pageHtml, /id="factorIcSort"/);
   assert.match(pageHtml, /普通方向因子组合最大融合权重/);
-  assert.match(pageHtml, /方向因子只融合方向；情景因子只收缩概率置信度；风险因子只调整止损尺度/);
-  assert.match(pageHtml, /4 个有效因子开始参与，默认到 10 个才达到完整强度/);
+  assert.match(pageHtml, /因子研究中心/);
+  assert.match(pageHtml, /研究不依赖账户开仓/);
   assert.doesNotMatch(pageHtml, /参与原决策的最大占比/);
   assert.doesNotMatch(pageHtml, /保存全部设置/);
   assert.doesNotMatch(pageHtml, /href="\/models\.html"/);
@@ -51,19 +51,19 @@ try {
   assert.equal(api.counts.builtIn, 108);
   assert.equal(api.counts.modelFactors, 6);
   assert.deepEqual(Object.keys(api.decisionReadiness.layers), ["direction", "context", "risk"]);
-  assert.equal(api.decisionReadiness.layers.direction.minimumActiveFactors, 4);
-  assert.equal(api.decisionReadiness.layers.direction.fullStrengthFactors, 10);
-  assert.equal(api.catalogAudit.passed, true);
-  assert.equal(api.samplingPolicy.observationRetention.sourcePartitioned, true);
+  assert.equal(api.decisionReadiness.layers.direction.minimumActiveFactors, 1);
+  assert.equal(api.decisionReadiness.layers.direction.fullStrengthFactors, 1);
+  assert.equal(api.engine, "causal_research_v1");
+  assert.equal(api.counts.inDecision, 0);
   const payload = {
     decisionInfluence: 0.33,
     miningEnabled: true,
     autoGovernanceEnabled: true,
-    factorUpdates: [
-      { id: "return_1m", enabled: false, useInDecision: false, weight: 2 },
-      { id: "volume_zscore", enabled: true, useInDecision: true, weight: 1 },
-      { id: "realized_volatility", enabled: true, useInDecision: true, weight: 1 }
-    ]
+    factorSettings: {
+      return_1m: { enabled: false, useInDecision: false, weight: 2 },
+      volume_zscore: { enabled: true, useInDecision: true, weight: 1 },
+      realized_volatility: { enabled: true, useInDecision: true, weight: 1 }
+    }
   };
   const saveResponse = await fetch(`http://127.0.0.1:${port}/api/factors/config`, {
     method: "POST",
@@ -75,9 +75,21 @@ try {
   assert.equal(saved.config.decisionInfluence, 0.33);
   assert.equal(saved.config.autoGovernanceEnabled, true);
   assert.equal(saved.config.factorSettings.return_1m.enabled, false);
-  assert.equal(saved.config.factorSettings.volume_zscore.useInDecision, true);
-  assert.equal(saved.config.factorSettings.realized_volatility.useInDecision, true);
-  console.log(JSON.stringify({ passed: true, pageStatus: page.status, factorCount: api.counts.total, savedInfluence: saved.config.decisionInfluence }));
+  assert.equal(saved.config.factorSettings.volume_zscore.useInDecision, false);
+  assert.equal(saved.config.factorSettings.realized_volatility.useInDecision, false);
+  const bad = await fetch(`http://127.0.0.1:${port}/api/factors/research`, {
+    method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action:"arbitrary_command"})
+  });
+  assert.equal(bad.status,400);
+  const incomplete = await fetch(`http://127.0.0.1:${port}/api/factors/config`, { method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({decisionMode:'manual'}) });
+  assert.equal(incomplete.status,400);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(runtime,'factor-library-config.json'))).decisionMode,'validated');
+  const manual = await fetch(`http://127.0.0.1:${port}/api/factors/config`, { method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({decisionMode:'manual',factorSettings:{return_1m:{enabled:true,useInDecision:true},realized_volatility:{enabled:true,useInDecision:true},volume_zscore:{enabled:true,useInDecision:true}}}) });
+  assert.equal(manual.status,200);const manualData=await manual.json();assert.equal(manualData.manualReadiness.ready,true);assert.equal(manualData.config.autoGovernanceEnabled,false);
+  assert.equal(manualData.counts.inDecision,0,'selected factors without live data do not masquerade as active');
+  assert.match(pageHtml,/id="manualLayerGuide"/);assert.match(pageHtml,/id="researchTaskPanel"/);
+  const task=await fetch(`http://127.0.0.1:${port}/api/factors/research`);assert.equal(task.status,200);assert.equal((await task.json()).worker.state,'not_started');
+  console.log(JSON.stringify({ passed: true, pageStatus: page.status, factorCount: api.counts.builtIn, savedInfluence: saved.config.decisionInfluence }));
 } finally {
   child.kill();
 }

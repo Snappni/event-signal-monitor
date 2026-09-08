@@ -78,6 +78,8 @@ child.stderr.on("data", (chunk) => {
 
 try {
   await waitForDashboard(baseUrl, child);
+  const localLoginResponse = await fetch(`${baseUrl}/login`, { redirect: "manual" });
+  assert.equal(localLoginResponse.status, 404, "local dashboard must not expose server-only login when auth is disabled");
   const [indexResponse, summaryPageResponse, reviewPageResponse, signalsPageResponse, messagesPageResponse, modelsPageResponse, logsPageResponse, appScriptResponse, summaryScriptResponse, reviewScriptResponse, clockScriptResponse, echartsResponse] =
     await Promise.all([
       fetch(baseUrl),
@@ -177,7 +179,7 @@ try {
   assert.ok(appScript.includes('timeZone: "Asia/Shanghai"'), "dashboard timestamps must use Beijing time explicitly");
   assert.ok(appScript.includes("北京时间 UTC+8"), "dashboard timestamps must label their timezone");
   assert.ok(appScript.includes('setInterval(() => refreshLog().catch(showError), 1_000)'), "log page must poll incremental updates every second");
-  assert.match(appScript, /\? 1_000\r?\n      : 3_000/, "overview must refresh once per second");
+  assert.ok(appScript.includes('? 1_000\n      : 3_000'), "overview must refresh once per second");
   assert.ok(appScript.includes("决策循环已停滞"), "overview must distinguish a stalled decision loop from a stopped process");
   assert.ok(appScript.includes("信号结果观察中（最长 72 小时，非仓位）"), "tracked signals must expose their bounded observation window");
   assert.ok(appScript.includes("清晰视图时间：北京时间 UTC+8"), "clean log view must label converted timestamps");

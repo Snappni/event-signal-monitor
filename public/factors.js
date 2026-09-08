@@ -1,310 +1,106 @@
-import "./beijing-clock.js";
-import "./navigation.js";
-
-const state = { data: null, selected: new Set(), dirty: false, icSort: "default" };
-const $ = (selector) => document.querySelector(selector);
-const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (character) => ({
-  "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
-}[character]));
-const number = (value, digits = 3) => Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "-";
-const time = (value) => value ? new Intl.DateTimeFormat("zh-CN", {
-  timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
-}).format(new Date(value)) : "-";
-const evidenceLabels = {
-  effective: "当前有效",
-  inverse_effective: "反向有效",
-  unstable: "不稳定",
-  insufficient_samples: "样本不足",
-  data_unavailable: "数据不可用"
-};
-const minedValidationLabels = {
-  validated: "已验证",
-  rejected: "已拒绝",
-  quarantine: "隔离验证"
-};
-const miningAlgorithmLabels = {
-  deterministic_typed_beam_search_v1: "确定性类型束搜索 v1",
-  deterministic_typed_beam_search_v2: "最多四因子类型束搜索 v2"
-};
-const icSortModes = {
-  default: { label: "默认", next: "desc" },
-  desc: { label: "高 → 低", next: "asc" },
-  asc: { label: "低 → 高", next: "default" }
-};
-const factorRoleLabels = { direction: "方向层", context: "情景层", risk: "风险层" };
-const decisionChannelLabels = {
-  model_direction_path: "方向模型路径",
-  model_probability_path: "概率模型路径",
-  model_risk_path: "风险模型路径",
-  model_sizing_path: "仓位模型路径",
-  direction_head: "方向因子头",
-  context_head: "情景因子头",
-  risk_head: "风险因子头"
-};
-
-function setSaveBar({ visible = state.dirty, saving = false, error = "" } = {}) {
-  const bar = $("#factorSaveBar");
-  bar.hidden = !visible;
-  bar.classList.toggle("is-saving", saving);
-  bar.classList.toggle("is-error", Boolean(error));
-  document.body.classList.toggle("factor-save-bar-visible", visible);
-  $("#factorSaveMessage").textContent = error || (saving ? "正在写入因子配置…" : "保存后将在下一轮监控中应用");
-  $("#saveFactorConfig").disabled = saving;
-  $("#discardFactorConfig").disabled = saving;
-  $("#saveFactorConfig").textContent = saving ? "保存中…" : "保存更改";
+const $ = id => document.getElementById(id);
+const escape = s => String(s ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
+const fmt = (n, digits = 3) => n != null && Number.isFinite(Number(n)) ? Number(n).toFixed(digits) : '—';
+let data, draft, dirty = false, sorted = false, requestPending = false;
+const messages = { manual_active:'手动参与', manual_waiting_data:'已选中，等待完整分层数据', manual_mode:'手动应用，不等待研究发布', collecting:'样本收集中', not_requested:'未申请', research_only_role:'仅研究', validation_failed:'验证未通过', probation_48h_100_labels:'48h / 100标签观察期', eligible:'可发布', no_validated_basket:'尚无合格组合', daily_write_limit:'每日调权限额', basket_ev_failed:'组合净EV未通过' };
+async function api(url, body) {
+  const r = await fetch(url, body === undefined ? {} : { method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body) });
+  if (r.status === 401) { window.location.assign('/login.html'); throw new Error('需要登录'); }
+  const value = await r.json(); if (!r.ok) throw new Error(value.error || `HTTP ${r.status}`); return value;
 }
-
-function markDirty() {
-  state.dirty = true;
-  $("#factorSaveNotice").textContent = "存在未保存的修改；自动刷新已暂停";
-  setSaveBar({ visible: true });
+function markDirty() { dirty=true; $('factorSaveBar').hidden=false; renderMode(); }
+function settings() {
+  $('factorDecisionMode').value=draft.decisionMode || 'validated';
+  $('factorLibraryEnabled').checked=draft.enabled; $('factorAutoGovernanceEnabled').checked=draft.autoGovernanceEnabled;
+  $('factorMiningEnabled').checked=draft.miningEnabled; $('factorDecisionInfluence').value=Math.round(draft.decisionInfluence*100);
 }
-
-function discardChanges() {
-  state.dirty = false;
-  render();
-  setSaveBar({ visible: false });
-  $("#factorSaveNotice").textContent = "已放弃未保存的修改";
+const roleNames={direction:'方向层',risk:'波动／风险层',context:'市场状态层'};
+const actionNames={update:'自动采样与研究更新',evaluate:'立即评估',mine:'挖掘多因子表达式'};
+const phaseNames={starting:'启动研究环境',ingesting:'写入观测',settling_labels:'生成成熟标签',evaluating_ic:'计算因子IC',qlib_model:'训练与评估Qlib模型',reuse_evaluation:'复用未过期评估',mining_expressions:'搜索多因子表达式',governance:'处理因子应用状态',saving_report:'保存研究结果',completed:'计算完成'};
+function renderTask(r) {
+  const w=r.worker || {}, task=r.userTask || w, p=task.progress || {}, active=w.state==='running';
+  const names={running:'运行中',idle:'已完成',error:'失败',interrupted:'已中断',not_started:'尚未启动'};
+  const state=task.outcome==='timed_out'?'已超时':names[task.state] || '等待状态';
+  $('factorRuntimeState').textContent=active?'研究计算中':names[w.state] || '等待状态';
+  $('researchTaskTitle').textContent=`${actionNames[task.action] || '研究任务'} · ${state}`;
+  $('researchTaskIdentity').textContent=task.taskId?`任务编号：${task.taskId} · ${task.requestedBy==='automatic'?'自动触发':'用户触发'}`:'没有已记录的任务';
+  $('researchTaskProgress').textContent=task.state==='running'?`阶段：${phaseNames[p.phase] || '等待进程报告阶段'}${p.total!=null?` · ${p.completed ?? 0}/${p.total}`:''}${p.detail?` · ${p.detail}`:''}`:'';
+  $('researchTaskTiming').textContent=task.startedAt?`开始：${new Date(task.startedAt).toLocaleString()} · 耗时 ${task.elapsedSeconds || 0} 秒${p.heartbeatAt?` · 最近心跳：${new Date(p.heartbeatAt).toLocaleTimeString()}`:''}${task.finishedAt?` · 结束：${new Date(task.finishedAt).toLocaleString()}`:''}`:'';
+  $('researchTaskResult').textContent=task.error || (task.heartbeatStale?'进程仍存在，但超过30秒没有心跳；尚未确认任务正常推进。':task.result?`完成：已结算标签 ${task.result.counts?.matured || 0}${task.action==='mine'?`；挖掘状态 ${task.result.miningStatus || '未知'}；隔离表达式 ${task.result.candidates}`:''}`:'');
+  $('researchOtherTask').textContent=active&&w.taskId!==task.taskId?`另有后台任务：${actionNames[w.action] || w.action} · ${phaseNames[w.progress?.phase] || '启动中'}`:'';
+  const request=r.lastRequest;
+  if(request && !requestPending) $('researchActionState').textContent=request.started?`最近请求已受理，结果见任务面板。` : request.reason==='worker_busy'?`最近的${actionNames[request.requestedAction] || '请求'}未启动：已有任务占用，未排队。` : request.error || request.reason;
+  for(const id of ['evaluateResearch','mineResearch']) $(id).disabled=active || requestPending;
 }
-
-function effectiveIcForSort(factor) {
-  if (!["effective", "inverse_effective"].includes(factor.evidenceStatus)) return null;
-  const value = Number(factor.metrics?.[15]?.meanIc);
-  return Number.isFinite(value) ? Math.abs(value) : null;
-}
-
-function updateIcSortButton() {
-  const mode = icSortModes[state.icSort];
-  const button = $("#factorIcSort");
-  $("#factorIcSortDirection").textContent = mode.label;
-  button.classList.toggle("is-active", state.icSort !== "default");
-  button.setAttribute("aria-pressed", String(state.icSort !== "default"));
-  button.setAttribute("aria-label", `按有效IC排序：${mode.label}`);
-}
-
-function filteredFactors() {
-  const search = $("#factorSearch").value.trim().toLowerCase();
-  const category = $("#factorCategory").value;
-  const evidence = $("#factorEvidence").value;
-  const showArchived = $("#factorShowArchived").checked;
-  const factors = (state.data?.factors || []).filter((factor) => {
-    if (factor.archived !== showArchived) return false;
-    if (category && factor.category !== category) return false;
-    if (evidence && factor.evidenceStatus !== evidence) return false;
-    if (search && ![
-      factor.name,
-      factor.description,
-      factor.source,
-      factor.category,
-      factor.operatorLabel,
-      factor.formula,
-      factor.id
-    ].join(" ").toLowerCase().includes(search)) return false;
-    return true;
+function renderMode() {
+  if(!data || !draft)return;
+  const manual=draft.decisionMode==='manual';
+  $('factorAutoGovernanceEnabled').disabled=manual;
+  $('factorAutoGovernanceEnabled').checked=manual?false:draft.autoGovernanceEnabled;
+  $('manualLayerGuide').hidden=!manual;
+  $('factorModePolicy').textContent=manual?'手动模式：选中的因子按本层权重直接应用，不要求IC、q值、观察期或研究发布通过。每个标的均须有完整分层数据；缺失层时暂停新开仓，不影响已有持仓退出。':'自动验证流程：手选为申请，仍需统计验证及前向观察；自动治理开启后可自动挑选方向组合。HMM及成交量方向在此流程保持关闭。';
+  const layers=Object.entries(roleNames).map(([role,label])=>{
+    const selected=data.factors.filter(f=>f.role===role && f.manualSupported!==false && draft.factorSettings[f.id]?.enabled && draft.factorSettings[f.id]?.useInDecision && !draft.factorSettings[f.id]?.archived && draft.factorSettings[f.id]?.weight>0);
+    const vol=selected.filter(f=>f.volatilityAnchor).length;
+    return {role,label,count:selected.length,ready:selected.length>=1&&(role!=='risk'||vol>=1),vol};
   });
-  if (state.icSort === "default") return factors;
-  const direction = state.icSort === "desc" ? -1 : 1;
-  return factors.map((factor, index) => ({ factor, index, value: effectiveIcForSort(factor) }))
-    .sort((left, right) => {
-      if (left.value == null && right.value == null) return left.index - right.index;
-      if (left.value == null) return 1;
-      if (right.value == null) return -1;
-      return (left.value - right.value) * direction || left.index - right.index;
-    })
-    .map((item) => item.factor);
+  const ready=layers.every(x=>x.ready)&&draft.decisionInfluence>0;
+  $('manualLayerCards').innerHTML=layers.map(x=>`<button type="button" data-layer="${x.role}" class="manual-layer-card ${x.ready?'ready':''}"><strong>${x.label} ${x.ready?'✓':'待补齐'}</strong><span>已选 ${x.count} 个 / 至少1个${x.role==='risk'?`（波动估计 ${x.vol} 个）`:''}</span><small>点击筛选本层，勾选启用与参与判断</small></button>`).join('');
+  $('manualLayerMessage').textContent=ready?'配置数量已齐全；保存后直接应用。每个标的仍需要各层有实时有效值，选齐不保证产生订单。':`待补齐：${layers.filter(x=>!x.ready).map(x=>x.label).join('、')}${draft.decisionInfluence<=0?'；方向融合权重须大于0':''}。未完成前不能保存启用的手动方案。`;
+  $('saveFactorConfig').disabled=manual&&draft.enabled&&!ready;
+  $('factorSaveHint').textContent=manual?'分层配置齐全后保存；直接应用，不等待研究验证':'保存会使旧发布失效，等待新的验证发布';
 }
-
-function renderSummary() {
-  const data = state.data;
-  $("#factorCount").textContent = `${data.counts.builtIn || 0} / ${data.counts.total}`;
-  $("#factorEnabledCount").textContent = data.counts.enabled;
-  $("#factorDecisionCount").textContent = `${data.counts.empiricalValidatedBuiltIn || 0} / ${data.counts.decisionEligible || 0}`;
-  $("#factorMinedCount").textContent = `${data.counts.mined} / ${data.counts.validatedMined}`;
-  $("#factorWeightVersion").textContent = `v${data.weightVersion}`;
-  $("#factorGeneratedAt").textContent = time(data.generatedAt);
-  const history = data.historicalBackfill || {};
-  $("#factorRuntimeState").lastChild.textContent = history.status === "complete"
-    ? `因子引擎独立运行 · 已回填${history.lookbackMonths || 3}个月历史`
-    : "因子引擎独立运行 · 等待历史回填";
-  $("#factorLibraryEnabled").checked = data.config.enabled;
-  $("#factorIntelligentAdjustment").checked = data.config.intelligentAdjustment;
-  $("#factorAutoGovernanceEnabled").checked = data.config.autoGovernanceEnabled;
-  $("#factorMiningEnabled").checked = data.config.miningEnabled;
-  $("#factorDecisionInfluence").value = Math.round(data.config.decisionInfluence * 100);
-  const readiness = data.decisionReadiness?.layers || {};
-  const layerSummary = ["direction", "context", "risk"].map((role) => {
-    const layer = readiness[role] || {};
-    return `${factorRoleLabels[role]} ${layer.eligibleFactors || 0}/${layer.minimumActiveFactors || 0} · 强度 ${Math.round(Number(layer.strength || 0) * 100)}%`;
-  }).join(" · ");
-  $("#factorMiningActivity").textContent = data.decisionReadiness?.ready
-    ? `${data.mining.currentActivity || "idle"} · ${layerSummary}`
-    : `分层未就绪：${layerSummary}`;
-  const governance = data.autoGovernance || {};
-  $("#factorAutoGovernanceStatus").textContent = data.config.autoGovernanceEnabled
-    ? `方向因子自动治理运行 ${governance.runCount || 0} 次 · 最近检查 ${time(governance.lastRunAt)} · 最近切换 ${time(governance.lastActionAt)}`
-    : "自动治理未启用；当前只对有平仓反事实证据的方向因子执行自动切换。";
-  $("#factorMiningDetails").innerHTML = [
-    ["算法", miningAlgorithmLabels[data.mining.algorithm] || data.mining.algorithm || "受限 DSL"], ["运行次数", data.mining.runCount], ["活跃池", `${data.counts.mined}/${data.mining.activeLimit || 20}`],
-    ["隔离候选", data.counts.mined - data.counts.validatedMined],
-    ["已验证", data.mining.validatedCount], ["已拒绝", data.mining.rejectedCount],
-    ["自动淘汰", data.mining.retiredCount || 0],
-    ["已合并重复", data.mining.mergedDuplicateCount || 0],
-    ["待结算快照", data.pendingFrameCount], ["最近挖掘", time(data.mining.lastRunAt)]
-  ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
-}
-
-function renderCategories() {
-  const selected = $("#factorCategory").value;
-  const categories = [...new Set((state.data?.factors || []).map((factor) => factor.category))].sort();
-  $("#factorCategory").innerHTML = '<option value="">全部分类</option>' + categories.map((category) =>
-    `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`
-  ).join("");
-  $("#factorCategory").value = selected;
-}
-
-function renderFactors() {
-  const factors = filteredFactors();
-  const selectableFactors = factors.filter((factor) => !factor.retired);
-  updateIcSortButton();
-  const sortLabel = state.icSort === "default" ? "" : ` · 有效 IC ${icSortModes[state.icSort].label}`;
-  $("#factorFilteredCount").textContent = `${factors.length} 项${sortLabel}`;
-  $("#factorSelectAll").checked = selectableFactors.length > 0 && selectableFactors.every((factor) => state.selected.has(factor.id));
-  $("#factorList").innerHTML = factors.map((factor) => {
-    const metric = factor.metrics?.[15];
-    const origin = factor.origin === "mined"
-      ? `<span class="factor-origin mined">挖掘·${escapeHtml(factor.operatorLabel || "组合")} · ${escapeHtml(factor.retired ? "已淘汰" : minedValidationLabels[factor.validationStatus] || factor.validationStatus)}</span>`
-      : `<span class="factor-origin">内置·${factor.governanceOnly ? "模型治理" : factor.empiricalStage === "out_of_sample_validated" ? "样本外通过" : "观察中"}</span>`;
-    const holdout = metric?.holdout;
-    const holdoutLine = holdout?.hasHoldout
-      ? `<small>训练 ${number(holdout.train?.meanIc)} / 验证 ${number(holdout.validation?.meanIc)} / 测试 ${number(holdout.test?.meanIc)}</small>`
-      : '<small>尚未形成完整时间样本外切分</small>';
-    const referenceId = Array.isArray(factor.referenceIds) ? factor.referenceIds[0] : null;
-    const reference = state.data?.researchReferences?.[referenceId];
-    const tradeEvidence = factor.autoGovernanceState?.tradeEvidence;
-    const governanceLine = factor.autoGovernanceEligible
-      ? `<small>自动治理：${escapeHtml(factor.autoGovernanceState?.evidence || "collecting")} · 平仓 n=${tradeEvidence?.overall?.samples || 0} · 贡献R ${number(tradeEvidence?.overall?.meanBenefitR)}</small>`
-      : "";
-    return `<tr data-factor-id="${escapeHtml(factor.id)}" class="${factor.archived ? "is-archived" : ""}">
-      <td><input class="factor-select" type="checkbox" ${state.selected.has(factor.id) ? "checked" : ""} ${factor.retired ? "disabled" : ""} aria-label="选择${escapeHtml(factor.name)}" /></td>
-      <td><div class="factor-name">${escapeHtml(factor.name)} ${origin}</div><code>${escapeHtml(factor.id)}</code><p>${escapeHtml(factor.description)}</p>${factor.formula ? `<small>${escapeHtml(factor.formula)}</small>` : ""}${factor.retiredAt ? `<small>淘汰于 ${escapeHtml(time(factor.retiredAt))} · 证据已压缩归档且禁止重复挖掘</small>` : ""}</td>
-      <td><strong>${escapeHtml(factor.category)}</strong><span>${escapeHtml(factor.source)}</span><small>层：${escapeHtml(factor.decisionLayer === "probability" ? "概率层" : factor.decisionLayer === "sizing" ? "仓位层" : factorRoleLabels[factor.decisionLayer] || factor.decisionLayer || factorRoleLabels[factor.role] || factor.role)}</small><small>数据：${escapeHtml((factor.dataRequirements || []).join(" + "))}</small><small>覆盖 ${(Number(factor.availability?.coverage || 0) * 100).toFixed(0)}%</small></td>
-      <td><input class="factor-enabled" type="checkbox" ${factor.enabled ? "checked" : ""} ${factor.archived ? "disabled" : ""} /></td>
-      <td><input class="factor-decision" type="checkbox" ${factor.useInDecision ? "checked" : ""} ${factor.archived ? "disabled" : ""} /><small>${escapeHtml(decisionChannelLabels[factor.decisionChannel] || factorRoleLabels[factor.role] || "仅观察")}</small></td>
-      <td><input class="factor-weight" type="number" min="0" max="100" step="0.1" value="${escapeHtml(factor.weight)}" ${factor.archived ? "disabled" : ""} /><small>当前层绝对占比 ${number(factor.effectiveWeight * 100, 1)}%</small></td>
-      <td><strong>${number(metric?.meanIc)}</strong><span>ICIR ${number(metric?.icir)}</span><small>n=${metric?.samples || 0} · 历史 ${metric?.historySamples || 0} / 实时 ${metric?.realtimeSamples || 0}</small>${holdoutLine}</td>
-      <td><span class="factor-evidence ${escapeHtml(factor.evidenceStatus)}">${escapeHtml(evidenceLabels[factor.evidenceStatus] || factor.evidenceStatus)}</span><small>目录：机制已校验</small>${governanceLine}${reference ? `<small title="${escapeHtml(reference.scope)}">依据：<a href="${escapeHtml(reference.url)}" target="_blank" rel="noreferrer">${escapeHtml(reference.title)}</a></small>` : ""}</td>
-    </tr>`;
-  }).join("") || '<tr><td colspan="8" class="empty-state">当前筛选条件下没有因子</td></tr>';
-}
-
 function render() {
-  renderSummary();
-  renderCategories();
-  renderFactors();
+  const r=data.research || {}, counts=r.counts || {};
+  renderTask(r); renderMode();
+  $('factorCount').textContent=data.counts.builtIn;
+  $('observationCount').textContent=`${counts.observations || 0} / ${counts.timeBatches || 0}`;
+  $('labelCount').textContent=`${counts.matured || 0} / ${counts.pending || 0}`;
+  $('factorDecisionCount').textContent=data.counts.inDecision;
+  $('factorWeightVersion').textContent=data.weightVersion || '尚未发布';
+  $('factorGeneratedAt').textContent=r.evaluatedAt ? new Date(r.evaluatedAt*1000).toLocaleString() : '尚未评估';
+  $('researchHealth').textContent=r.error || `排除标签 ${counts.excluded || 0}；中断区间 ${counts.gaps || 0}；${messages[r.publication?.reason] || r.publication?.reason || '尚无发布'}。手续费及滑点是估计；已核验历史按结算资金费处理，实时账本仍需区分。`;
+  const model=r.model || {}, mining=r.mining || {};
+  $('factorMiningDetails').innerHTML=`<div><strong>Qlib · Ridge研究基线</strong><p>${escape(model.status || '尚未计算')} · 样本外Rank IC ${fmt(model.rankIc)}</p><p>不接管入场概率或账户风控</p></div><div><strong>PySR · 多变量符号回归</strong><p>${escape(mining.status || '未运行')} ${escape(mining.reason || '')} · ${mining.candidates?.length || 0}个隔离表达式</p>${(mining.candidates || []).slice(0,8).map(c=>`<p><code>${escape(c.expression)}</code> · ${escape(c.id)} · 前向IC ${fmt(r.factors?.[c.id]?.metrics?.['60']?.meanIc)}</p>`).join('')}</div>`;
+  const horizon=$('factorHorizon').value, term=$('factorSearch').value.toLowerCase(), filter=$('factorEvidence').value;
+  let factors=data.factors.filter(f => `${f.name} ${f.id} ${f.description} ${f.formula}`.toLowerCase().includes(term));
+  factors=factors.filter(f => !$('factorLayerFilter').value || f.role===$('factorLayerFilter').value);
+  factors=factors.filter(f => !filter || (filter==='passed' ? f.eligibility.passed : filter==='active' ? f.actualInDecision : !f.metrics[horizon]));
+  if (sorted) factors.sort((a,b) => ((b.metrics[horizon]?.meanIc == null ? -Infinity : Math.abs(b.metrics[horizon].meanIc)))-((a.metrics[horizon]?.meanIc == null ? -Infinity : Math.abs(a.metrics[horizon].meanIc))));
+  $('factorFilteredCount').textContent=`${factors.length} 项`;
+  $('factorList').innerHTML=factors.map(f => {
+    const s=draft.factorSettings[f.id], m=f.metrics[horizon] || {}, blocked=draft.decisionMode==='manual' ? f.manualSupported===false : (f.role!=='direction' || f.governanceOnly || f.id==='hmm_regime_signal' || (f.role==='direction' && f.category==='成交量与成交流'));
+    return `<tr data-id="${escape(f.id)}"><td><strong>${escape(f.name)}</strong><small>${escape(f.role)} · ${escape(f.id)}</small><small>${escape(f.formula || f.description)}</small>${draft.decisionMode==='manual'&&f.manualSupported===false?'<small>尚无独立数值输出，不计入分层配置</small>':''}</td><td><input aria-label="启用 ${escape(f.name)}" data-field="enabled" type="checkbox" ${s.enabled?'checked':''} ${(draft.decisionMode!=='manual'&&(f.id==='hmm_regime_signal'||(f.role==='direction'&&f.category==='成交量与成交流')))?'disabled':''}></td><td><input aria-label="交易判断 ${escape(f.name)}" data-field="useInDecision" type="checkbox" ${s.useInDecision?'checked':''} ${blocked?'disabled':''}></td><td><input aria-label="权重 ${escape(f.name)}" data-field="weight" type="number" min="0" max="100" step="0.1" value="${s.weight}"></td><td>${fmt(m.meanIc)}<small>[${fmt(m.lower95)}, ${fmt(m.upper95)}]</small></td><td>${fmt(m.nEff,1)} / ${fmt(m.q)}<small>${m.sameSignFolds ?? 0}/4 同号</small></td><td>${[7,30,90].map(d=>fmt(m.rollingIc?.[d])).join(' / ')}</td><td>${f.actualInDecision?(draft.decisionMode==='manual'?'手动参与':'已发布参与'):escape(messages[f.eligibility.reason] || f.eligibility.reason)}</td></tr>`;
+  }).join('');
 }
-
-async function loadFactors({ quiet = false } = {}) {
-  if (quiet && state.dirty) return;
-  try {
-    const response = await fetch("/api/factors", { cache: "no-store" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    state.data = await response.json();
-    render();
-    if (!quiet) $("#factorSaveNotice").textContent = "因子状态已刷新";
-  } catch (error) {
-    $("#factorSaveNotice").textContent = `读取失败：${error.message}`;
-  }
+async function refresh() {
+  try { data=await api('/api/factors'); if (!dirty) {draft=structuredClone(data.config);settings();} render(); }
+  catch(e) { $('factorSaveNotice').textContent=e.message; }
 }
-
-function factorUpdates() {
-  return [...document.querySelectorAll("#factorList tr[data-factor-id]")].map((row) => ({
-    id: row.dataset.factorId,
-    enabled: row.querySelector(".factor-enabled")?.checked === true,
-    useInDecision: row.querySelector(".factor-decision")?.checked === true,
-    weight: Number(row.querySelector(".factor-weight")?.value || 0)
-  }));
-}
-
-async function save(patch = {}) {
-  $("#factorSaveNotice").textContent = "正在保存…";
-  setSaveBar({ visible: true, saving: true });
-  try {
-    const response = await fetch("/api/factors/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        enabled: $("#factorLibraryEnabled").checked,
-        intelligentAdjustment: $("#factorIntelligentAdjustment").checked,
-        autoGovernanceEnabled: $("#factorAutoGovernanceEnabled").checked,
-        miningEnabled: $("#factorMiningEnabled").checked,
-        decisionInfluence: Number($("#factorDecisionInfluence").value || 0) / 100,
-        factorUpdates: factorUpdates(),
-        ...patch
-      })
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
-    state.data = result;
-    state.selected.clear();
-    state.dirty = false;
-    render();
-    setSaveBar({ visible: false });
-    $("#factorSaveNotice").textContent = "保存成功；下一轮监控开始使用新配置";
-  } catch (error) {
-    $("#factorSaveNotice").textContent = `保存失败：${error.message}`;
-    setSaveBar({ visible: state.dirty, error: `保存失败：${error.message}` });
-  }
-}
-
-function updateSelected(action) {
-  const updates = [...state.selected].map((id) => {
-    const factor = state.data.factors.find((item) => item.id === id);
-    if (action === "enable") return { id, enabled: true };
-    if (action === "decision") return { id, enabled: true, useInDecision: Boolean(factor) };
-    if (action === "restore") return { id, archived: false };
-    return null;
-  }).filter(Boolean);
-  if (action === "archive") return save({ archiveIds: [...state.selected] });
-  return save({ factorUpdates: updates });
-}
-
-$("#saveFactorConfig").addEventListener("click", () => save());
-$("#discardFactorConfig").addEventListener("click", discardChanges);
-$("#refreshButton").addEventListener("click", () => loadFactors());
-$("#factorIcSort").addEventListener("click", () => {
-  state.icSort = icSortModes[state.icSort].next;
-  renderFactors();
+$('factorList').addEventListener('change', e => {
+  const id=e.target.closest('tr')?.dataset.id, field=e.target.dataset.field; if (!id || !field) return;
+  draft.factorSettings[id][field]=field==='weight'?Math.min(100,Math.max(0,Number(e.target.value)||0)):e.target.checked; markDirty();
 });
-for (const selector of ["#factorLibraryEnabled", "#factorIntelligentAdjustment", "#factorAutoGovernanceEnabled", "#factorMiningEnabled", "#factorDecisionInfluence"]) {
-  $(selector).addEventListener("change", markDirty);
-}
-$("#factorDecisionInfluence").addEventListener("input", markDirty);
-for (const selector of ["#factorSearch", "#factorCategory", "#factorEvidence", "#factorShowArchived"]) {
-  $(selector).addEventListener(selector === "#factorSearch" ? "input" : "change", renderFactors);
-}
-$("#factorSelectAll").addEventListener("change", (event) => {
-  for (const factor of filteredFactors().filter((item) => !item.retired)) event.target.checked ? state.selected.add(factor.id) : state.selected.delete(factor.id);
-  renderFactors();
+for (const [id,key] of [['factorLibraryEnabled','enabled'],['factorAutoGovernanceEnabled','autoGovernanceEnabled'],['factorMiningEnabled','miningEnabled']]) $(id).addEventListener('change', e=>{draft[key]=e.target.checked;markDirty();});
+$('factorDecisionInfluence').addEventListener('change',e=>{draft.decisionInfluence=Math.min(.4,Math.max(0,Number(e.target.value)/100 || 0));markDirty();});
+for (const id of ['factorSearch','factorHorizon','factorEvidence','factorLayerFilter']) $(id).addEventListener('input',()=>data&&render());
+$('factorIcSort').addEventListener('click',()=>{sorted=!sorted;$('factorIcSort').setAttribute('aria-pressed',String(sorted));render();});
+$('refreshButton').addEventListener('click',refresh);
+$('discardFactorConfig').addEventListener('click',()=>{dirty=false;$('factorSaveBar').hidden=true;draft=structuredClone(data.config);settings();render();});
+$('saveFactorConfig').addEventListener('click',async()=>{
+  $('saveFactorConfig').disabled=true;
+  try {data=await api('/api/factors/config',draft);draft=structuredClone(data.config);dirty=false;$('factorSaveBar').hidden=true;settings();render();$('factorSaveNotice').textContent='已保存';}
+  catch(e){$('factorSaveNotice').textContent=e.message;} finally{renderMode();}
 });
-$("#factorList").addEventListener("change", (event) => {
-  if (event.target.classList.contains("factor-select")) {
-    const id = event.target.closest("tr").dataset.factorId;
-    event.target.checked ? state.selected.add(id) : state.selected.delete(id);
-    const selectableFactors = filteredFactors().filter((factor) => !factor.retired);
-    $("#factorSelectAll").checked = selectableFactors.length > 0 && selectableFactors.every((factor) => state.selected.has(factor.id));
-    return;
-  }
-  if (event.target.matches(".factor-enabled, .factor-decision, .factor-weight")) {
-    markDirty();
-  }
+$('factorDecisionMode').addEventListener('change',e=>{draft.decisionMode=e.target.value;if(draft.decisionMode==='manual')draft.autoGovernanceEnabled=false;markDirty();render();});
+$('manualLayerCards').addEventListener('click',e=>{const role=e.target.closest('[data-layer]')?.dataset.layer;if(role){$('factorLayerFilter').value=role;render();$('factorList').scrollIntoView({block:'start',behavior:'smooth'});}});
+for (const [id,action] of [['evaluateResearch','evaluate'],['mineResearch','mine']]) $(id).addEventListener('click',async()=>{
+  if(dirty){$('researchActionState').textContent='请先保存设置';return;}
+  requestPending=true;renderTask(data.research || {});$('researchActionState').textContent='正在提交任务请求…';
+  try{await api('/api/factors/research',{action});}
+  catch(e){$('researchTaskResult').textContent=`提交结果未确认：${e.message}。正在查询后台任务状态，请勿重复点击。`;}
+  finally{requestPending=false;try{renderTask(await api('/api/factors/research'));}catch(e){$('researchTaskResult').textContent=`状态读取失败：${e.message}`;}}
 });
-$("#factorList").addEventListener("input", (event) => {
-  if (event.target.classList.contains("factor-weight")) markDirty();
-});
-$("#factorBulkEnable").addEventListener("click", () => updateSelected("enable"));
-$("#factorBulkDecision").addEventListener("click", () => updateSelected("decision"));
-$("#factorBulkArchive").addEventListener("click", () => updateSelected("archive"));
-$("#factorBulkRestore").addEventListener("click", () => updateSelected("restore"));
-
-loadFactors();
-setInterval(() => loadFactors({ quiet: true }), 5_000);
+await refresh();
+setInterval(async()=>{ if(document.hidden)return; try { const r=await api('/api/factors/research');renderTask(r); } catch(e) { $('researchTaskResult').textContent=`状态读取失败：${e.message}；保留上次结果，不代表任务已停止。`; } },3000);
+setInterval(()=>{if(!document.hidden&&!dirty)refresh();},15000);

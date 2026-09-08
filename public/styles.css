@@ -2770,6 +2770,7 @@ body.factor-save-bar-visible .factor-page {
 }
 
 .factor-settings-grid input[type="number"],
+.factor-settings-grid select,
 .factor-toolbar input,
 .factor-toolbar select,
 .factor-weight {
@@ -3100,3 +3101,23 @@ body.factor-save-bar-visible .factor-page {
     display: none;
   }
 }
+/* Research center: retain shared theme, give two research backends readable space. */
+.research-task-panel, .manual-layer-guide { padding: 16px; margin: 16px; border: 1px solid var(--border, #284455); border-radius: 12px; background: rgba(25, 57, 73, .25); overflow-wrap: anywhere; }
+.research-task-panel p { margin: 8px 0; line-height: 1.6; }
+.manual-layer-guide [hidden] { display: none; }
+.manual-layer-card { display: grid; text-align: left; gap: 8px; padding: 16px; white-space: normal; }
+#factorWeightVersion { font-size: 15px; overflow-wrap: anywhere; }
+#factorDecisionMode { width: 100%; min-width: 0; }
+.manual-layer-card.ready { border-color: #36bba5; }
+.manual-layer-guide .factor-mining-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 12px; }
+@media (max-width: 700px) { .manual-layer-guide .factor-mining-grid { grid-template-columns: 1fr; } }
+.factor-page #factorMiningDetails { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 16px; }
+.factor-page #factorMiningDetails > div { padding: 16px; min-width: 0; overflow-wrap: anywhere; }
+.factor-page .factor-settings-panel > :not(.section-title) { margin-left: 16px; margin-right: 16px; }
+.factor-page .factor-settings-grid { align-items: center; padding: 12px 0; }
+.factor-page .factor-policy-note { line-height: 1.8; }
+.factor-page .factor-table small { display: block; color: var(--muted, #90a5b6); line-height: 1.6; }
+.factor-page .factor-table td:first-child { min-width: 220px; max-width: 330px; white-space: normal; }
+.factor-page .factor-table input[type="number"] { width: 70px; }
+.factor-page #researchHealth { overflow-wrap: anywhere; line-height: 1.7; }
+@media (max-width: 700px) { .factor-page #factorMiningDetails { grid-template-columns: 1fr; } }

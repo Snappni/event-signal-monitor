@@ -154,7 +154,7 @@ assert.equal(replay.results[1].reason_code, "cluster_exposure_limit");
 const factorConfig = normalizeFactorLibraryConfig({ factorSettings: { hmm_regime_signal: { enabled: true, useInDecision: true } } });
 assert.equal(modelFactorGovernance(factorConfig).hiddenMarkov.useInDecision, false);
 const explicitlyReenabledHmm = normalizeFactorLibraryConfig({ version: 8, factorSettings: { hmm_regime_signal: { enabled: true, useInDecision: true } } });
-assert.equal(modelFactorGovernance(explicitlyReenabledHmm).hiddenMarkov.useInDecision, true);
+assert.equal(modelFactorGovernance(explicitlyReenabledHmm).hiddenMarkov.useInDecision, false);
 assert.deepEqual(factorConfig.horizonsMinutes, [5, 15, 60, 240]);
 assert.ok(factorConfig.adjustmentIntervalMinutes >= 1440);
 const monitorSource = fs.readFileSync(new URL("./event-signal-monitor.mjs", import.meta.url), "utf8");

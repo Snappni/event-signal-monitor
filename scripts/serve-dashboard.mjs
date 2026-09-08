@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
@@ -33,8 +33,12 @@ import {
   normalizeFactorLibraryConfig,
   normalizeFactorLibraryStatus,
   publicFactorLibrary,
-  updateFactorLibraryConfig
+  updateFactorLibraryConfig,
+  startFactorResearch,
+  readFactorResearch,
+  manualFactorReadiness
 } from "./factor-library.mjs";
+import { createDashboardAuth } from "./dashboard-auth.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -53,6 +57,7 @@ const MESSAGE_AGGREGATOR_STATUS_PATH = path.join(RUNTIME_DIR, "message-aggregato
 const DEMO_POSITION_PREVIEW_PATH = path.join(RUNTIME_DIR, "demo-position-preview.json");
 const FACTOR_LIBRARY_CONFIG_PATH = path.join(RUNTIME_DIR, "factor-library-config.json");
 const FACTOR_LIBRARY_STATUS_PATH = path.join(RUNTIME_DIR, "factor-library-status.json");
+const MONITOR_SUPERVISOR_PID_PATH = path.join(RUNTIME_DIR, "fast-loop.pid");
 const MONITOR_SUPERVISOR_PATH = path.join(__dirname, "supervise-event-signal-service.mjs");
 const ENV_PATH = path.join(ROOT_DIR, ".env");
 const PORT = Number(process.env.SIGNAL_DASHBOARD_PORT || 8788);
@@ -60,6 +65,15 @@ const SERVICE_STALE_SECONDS = Math.max(3, Number(process.env.SIGNAL_SERVICE_STAL
 const DEFAULT_DECISION_CYCLE_TIMEOUT_MS = 120_000;
 const DECISION_STALL_GRACE_MS = 5_000;
 const AUTO_START_MONITOR_SERVICE = process.env.SIGNAL_DASHBOARD_AUTO_START_SERVICE !== "false";
+const LOCAL_DASHBOARD_AUTO_STOP = process.env.LOCAL_DASHBOARD_AUTO_STOP === "1";
+const LOCAL_DASHBOARD_LEASE_TIMEOUT_MS = Math.max(
+  5_000,
+  Number(process.env.LOCAL_DASHBOARD_LEASE_TIMEOUT_MS || 10_000)
+);
+const LOCAL_DASHBOARD_SHUTDOWN_GRACE_MS = Math.max(
+  3_000,
+  Number(process.env.LOCAL_DASHBOARD_SHUTDOWN_GRACE_MS || 6_000)
+);
 const SERVICE_ENSURE_INTERVAL_MS = Math.max(
   1_000,
   Number(process.env.SIGNAL_SERVICE_ENSURE_INTERVAL_MS || 5_000)
@@ -83,6 +97,10 @@ const translationCache = new Map(
   )
 );
 const translationRequests = new Map();
+const localDashboardClients = new Map();
+let localDashboardClientSeen = false;
+let localDashboardLastActiveAt = Date.now();
+let localDashboardShuttingDown = false;
 
 const CONTENT_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -92,6 +110,12 @@ const CONTENT_TYPES = {
   ".svg": "image/svg+xml",
   ".txt": "text/plain; charset=utf-8"
 };
+const dashboardAuth = createDashboardAuth({
+  env: process.env,
+  loginHtmlPath: path.join(ROOT_DIR, "server", "login.html"),
+  sessionFilePath: path.join(RUNTIME_DIR, "dashboard-auth-sessions.json"),
+  logger: console
+});
 
 function readJson(filePath, fallback = null) {
   try {
@@ -633,15 +657,90 @@ function readAccountBundle() {
   return { config, account };
 }
 
-async function readRequestJson(request) {
+async function readRequestJson(request, maxBytes = 1_000_000) {
   const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
+  let bytes = 0;
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > maxBytes) throw new Error("Request body is too large.");
+    chunks.push(chunk);
+  }
   if (!chunks.length) return {};
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function localDashboardLifecycleStatus() {
+  const now = Date.now();
+  for (const [clientId, lastSeenAt] of localDashboardClients) {
+    if (now - lastSeenAt > LOCAL_DASHBOARD_LEASE_TIMEOUT_MS) localDashboardClients.delete(clientId);
+  }
+  return {
+    enabled: LOCAL_DASHBOARD_AUTO_STOP,
+    activeClients: localDashboardClients.size,
+    clientSeen: localDashboardClientSeen,
+    leaseTimeoutMs: LOCAL_DASHBOARD_LEASE_TIMEOUT_MS,
+    shutdownGraceMs: LOCAL_DASHBOARD_SHUTDOWN_GRACE_MS,
+    shuttingDown: localDashboardShuttingDown
+  };
+}
+
+function stopMonitorSupervisor() {
+  let supervisorPid = null;
+  try {
+    supervisorPid = Number(fs.readFileSync(MONITOR_SUPERVISOR_PID_PATH, "utf8").trim());
+  } catch {
+    // The monitor was not started.
+  }
+  if (Number.isInteger(supervisorPid) && supervisorPid > 0 && isProcessRunning(supervisorPid)) {
+    if (process.platform === "win32") {
+      spawnSync("taskkill.exe", ["/PID", String(supervisorPid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+        timeout: 10_000
+      });
+    } else {
+      process.kill(supervisorPid, "SIGTERM");
+    }
+  }
+  try {
+    fs.rmSync(MONITOR_SUPERVISOR_PID_PATH, { force: true });
+  } catch {
+    // A concurrent supervisor shutdown may already have removed it.
+  }
+  const serviceStatus = readJson(path.join(RUNTIME_DIR, "service-status.json"), {});
+  if (!isProcessRunning(Number(serviceStatus?.pid))) {
+    try {
+      fs.rmSync(path.join(RUNTIME_DIR, "service.lock"), { force: true });
+    } catch {
+      // The service may already have cleaned up its lock.
+    }
+  }
+}
+
+function requestLocalDashboardShutdown(reason) {
+  if (!LOCAL_DASHBOARD_AUTO_STOP || localDashboardShuttingDown) return;
+  localDashboardShuttingDown = true;
+  console.log(`Local dashboard auto-stop: ${reason}`);
+  stopMonitorSupervisor();
+  server.close(() => {
+    process.exitCode = 0;
+  });
+  setTimeout(() => process.exit(0), 5_000).unref();
+}
+
+function checkLocalDashboardLeases() {
+  if (!LOCAL_DASHBOARD_AUTO_STOP || !localDashboardClientSeen || localDashboardShuttingDown) return;
+  const status = localDashboardLifecycleStatus();
+  if (
+    status.activeClients === 0 &&
+    Date.now() - localDashboardLastActiveAt >= LOCAL_DASHBOARD_SHUTDOWN_GRACE_MS
+  ) {
+    requestLocalDashboardShutdown("all browser pages closed");
+  }
 }
 
 function isProcessRunning(pid) {
@@ -1101,6 +1200,8 @@ function publicPostTradeReview(account, archive = tradeHistoryStats(RUNTIME_DIR)
     review: {
       version: review.version,
       sessionId: review.sessionId,
+      directionMode: review.directionMode,
+      exitMode: review.exitMode,
       completedReviews: safeNumber(review.completedReviews),
       reviewedTradeCount: safeNumber(review.reviewedTradeCount),
       weightVersion: safeNumber(review.weightVersion),
@@ -1201,10 +1302,21 @@ function closeAllPaperPositions(account, now = new Date().toISOString()) {
   return { closed, failed };
 }
 
-function sendStatic(response, requestPath) {
+function sendStatic(response, requestPath, method = "GET") {
+  if (!["GET", "HEAD"].includes(method)) {
+    response.writeHead(405, { Allow: "GET, HEAD" });
+    response.end("Method not allowed");
+    return;
+  }
   const relativePath = requestPath === "/" ? "index.html" : requestPath.replace(/^\/+/, "");
   const filePath = path.resolve(PUBLIC_DIR, relativePath);
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  const publicRelative = path.relative(PUBLIC_DIR, filePath);
+  if (
+    !relativePath ||
+    publicRelative.startsWith("..") ||
+    path.isAbsolute(publicRelative) ||
+    publicRelative.split(path.sep).some((segment) => segment.startsWith("."))
+  ) {
     response.writeHead(403);
     response.end("Forbidden");
     return;
@@ -1215,16 +1327,57 @@ function sendStatic(response, requestPath) {
       response.end("Not found");
       return;
     }
+    let responseData = data;
+    if (LOCAL_DASHBOARD_AUTO_STOP && path.extname(filePath) === ".html") {
+      responseData = Buffer.from(
+        data.toString("utf8").replace(
+          "</body>",
+          '  <script src="/local-dashboard-lifecycle.js" type="module"></script>\n  </body>'
+        ),
+        "utf8"
+      );
+    }
     response.writeHead(200, {
       "Content-Type": CONTENT_TYPES[path.extname(filePath)] || "application/octet-stream",
       "Cache-Control": "no-store"
     });
-    response.end(data);
+    response.end(method === "HEAD" ? undefined : responseData);
   });
 }
 
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+  dashboardAuth.applySecurityHeaders(request, response);
+  if (await dashboardAuth.handlePublic(request, response, url)) return;
+  if (!dashboardAuth.authorize(request, response, url)) return;
+  if (url.pathname === "/api/local-dashboard/heartbeat" && request.method === "POST") {
+    try {
+      const body = await readRequestJson(request);
+      const clientId = String(body.clientId || "").slice(0, 128);
+      if (!clientId) throw new Error("clientId is required");
+      if (LOCAL_DASHBOARD_AUTO_STOP) {
+        localDashboardClients.set(clientId, Date.now());
+        localDashboardClientSeen = true;
+        localDashboardLastActiveAt = Date.now();
+      }
+      sendJson(response, localDashboardLifecycleStatus());
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+    return;
+  }
+  if (url.pathname === "/api/local-dashboard/release" && request.method === "POST") {
+    try {
+      const body = await readRequestJson(request);
+      const clientId = String(body.clientId || "").slice(0, 128);
+      if (clientId) localDashboardClients.delete(clientId);
+      localDashboardLastActiveAt = Date.now();
+      sendJson(response, localDashboardLifecycleStatus());
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+    return;
+  }
   if (url.pathname === "/api/factors" && request.method === "GET") {
     const status = normalizeFactorLibraryStatus(
       readJson(FACTOR_LIBRARY_STATUS_PATH, createFactorLibraryStatus())
@@ -1234,6 +1387,20 @@ const server = http.createServer(async (request, response) => {
       status.minedFactors
     );
     sendJson(response, publicFactorLibrary(config, status));
+    return;
+  }
+  if (url.pathname === "/api/factors/research" && request.method === "GET") {
+    const { worker, userTask, lastRequest, error } = readFactorResearch();
+    sendJson(response, { worker, userTask, lastRequest, error });
+    return;
+  }
+  if (url.pathname === "/api/factors/research" && request.method === "POST") {
+    try {
+      const { action } = await readRequestJson(request);
+      if (!["evaluate", "mine"].includes(action)) throw new Error("unknown_research_action");
+      const config = normalizeFactorLibraryConfig(readJson(FACTOR_LIBRARY_CONFIG_PATH, {}));
+      sendJson(response, startFactorResearch(config, action, { requestedBy: 'user' }));
+    } catch (error) { sendJson(response, { error: error.message }, 400); }
     return;
   }
   if (url.pathname === "/api/factors/config" && request.method === "POST") {
@@ -1247,6 +1414,10 @@ const server = http.createServer(async (request, response) => {
         status.minedFactors
       );
       const config = updateFactorLibraryConfig(current, patch, status.minedFactors);
+      if (config.enabled && config.decisionMode === 'manual' && !manualFactorReadiness(config).ready) {
+        sendJson(response, { error: '手动模式需方向、市场状态各至少1个因子，风险层至少1个波动率估计因子；均需启用、参与判断且权重大于0，融合权重也须大于0。', readiness: manualFactorReadiness(config) }, 400);
+        return;
+      }
       writeJson(FACTOR_LIBRARY_CONFIG_PATH, config);
       sendJson(response, publicFactorLibrary(config, status));
     } catch (error) {
@@ -1681,10 +1852,10 @@ const server = http.createServer(async (request, response) => {
     return;
   }
   if (url.pathname === "/api/status") {
-    sendJson(response, loopStatus());
+    sendJson(response, { ...loopStatus(), localDashboardAutoStop: localDashboardLifecycleStatus() });
     return;
   }
-  sendStatic(response, url.pathname);
+  sendStatic(response, url.pathname, request.method);
 });
 
 server.listen(PORT, "127.0.0.1", () => {
@@ -1694,4 +1865,10 @@ server.listen(PORT, "127.0.0.1", () => {
 
 const serviceEnsureTimer = setInterval(ensureMonitorSupervisor, SERVICE_ENSURE_INTERVAL_MS);
 serviceEnsureTimer.unref();
-server.once("close", () => clearInterval(serviceEnsureTimer));
+const localDashboardLeaseTimer = setInterval(checkLocalDashboardLeases, 1_000);
+localDashboardLeaseTimer.unref();
+server.once("close", () => {
+  clearInterval(serviceEnsureTimer);
+  clearInterval(localDashboardLeaseTimer);
+  dashboardAuth.close();
+});
