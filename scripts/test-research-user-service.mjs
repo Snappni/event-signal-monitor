@@ -3,6 +3,25 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+function smokeFrames(now = Date.now()) {
+  const t = Math.floor(now/300000)*300 - 60*300;
+  return Array.from({ length: 60 }, (_, i) => ({ t: t+i*300, intervalSeconds: 300,
+    symbols: Object.fromEntries(['BTC','ETH','SOL','XRP','DOGE','BNB','ADA','LTC'].map((s,j) => [s,
+      { price: 100+i*(j+1)/100, values: { return_1m: (j-3)/10 }, cost: .0016 }])) }));
+}
+if (process.argv.includes('--check-fixture')) {
+  for (const now of [1788960335226, 1788960300000, Date.now()]) {
+    const frames = smokeFrames(now);
+    assert.equal(frames.length,60);
+    assert.equal(frames.flatMap(f=>Object.keys(f.symbols)).length,480);
+    assert.ok(frames.every(f=>Number.isInteger(f.t) && f.t<now/1000 && f.intervalSeconds===300));
+    assert.equal(frames.at(-1).t-frames[0].t,59*300);
+    assert.ok(frames.every((f,i)=>!i || f.t-frames[i-1].t===f.intervalSeconds));
+    assert.ok(now/1000-frames.at(-1).t>=300 && now/1000-frames.at(-1).t<600);
+  }
+  console.log(JSON.stringify({passed:true,pastTimestamps:true,intervalSeconds:300,observations:480}));
+  process.exit(0);
+}
 assert.equal(process.platform, 'linux', 'requires Linux user systemd');
 assert.equal(process.env.FACTOR_RESEARCH_PROFILE, 'server-low', 'explicit server opt-in required');
 assert.ok(process.getuid() > 0, 'run as the production service user, not root');
@@ -20,10 +39,7 @@ fs.symlinkSync(healthFile, path.join(runtime, 'service-status.json'));
 process.env.SIGNAL_RUNTIME_DIR = runtime;
 const lib = await import('./factor-library.mjs');
 const config = lib.normalizeFactorLibraryConfig();
-const t = Math.floor(Date.now()/300)*300 - 60*300;
-lib.enqueueResearchFrames(Array.from({ length: 60 }, (_, i) => ({ t: t+i*300,
-  symbols: Object.fromEntries(['BTC','ETH','SOL','XRP','DOGE','BNB','ADA','LTC'].map((s,j) => [s,
-    { price: 100+i*(j+1)/100, values: { return_1m: (j-3)/10 }, cost: .0016 }])) })), config, 'test-fixture');
+lib.enqueueResearchFrames(smokeFrames(), config, 'test-fixture');
 console.log(`TEST_RUNTIME=${runtime}`);
 const busEnv = { ...process.env, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}`,
   DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${process.getuid()}/bus` };
