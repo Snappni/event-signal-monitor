@@ -82,6 +82,31 @@ def stop_group(child):
     child.wait(timeout=5)
 
 
+def parent_alive(pid):
+    # A transient service is parented by systemd, not by the requesting Node process.
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return fields[0] != 'Z' and fields[19] == os.environ.get('FACTOR_RESEARCH_PARENT_START', '')
+    except (OSError, IndexError):
+        return False
+
+
+def verify_cgroup():
+    unit = os.environ.get('FACTOR_RESEARCH_SYSTEMD_UNIT', '')
+    expected = 'event-signal-research-'+os.environ['FACTOR_RESEARCH_TASK_ID']+'.service'
+    group = next(line[3:] for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
+    if unit != expected or not group.startswith(f'/user.slice/user-{os.getuid()}.slice/') or not group.endswith('/'+unit):
+        raise ValueError('research_cgroup_identity')
+    root = Path('/sys/fs/cgroup'+group)
+    memory = int((root/'memory.max').read_text())
+    swap = int((root/'memory.swap.max').read_text())
+    quota, period = map(int, (root/'cpu.max').read_text().split())
+    tasks = int((root/'pids.max').read_text())
+    if not (0 < memory <= 384*1048576 and swap == 0 and 0 < quota <= period/2 and 0 < tasks <= 32):
+        raise ValueError('research_cgroup_limits')
+    return {'path': group, 'memoryMax': memory, 'swapMax': swap, 'cpuMax': [quota, period], 'tasksMax': tasks}
+
+
 def supervise(root, action, parent_pid):
     root = Path(root)
     task_id = os.environ['FACTOR_RESEARCH_TASK_ID']
@@ -97,6 +122,9 @@ def supervise(root, action, parent_pid):
     try:
         if not server_low() or not sys.platform.startswith('linux'):
             return deferred('server_profile_requires_linux')
+        try: isolation = verify_cgroup()
+        except (OSError, ValueError, KeyError, StopIteration): return deferred('research_cgroup_unverified')
+        if not parent_alive(parent_pid): return deferred('research_parent_exited')
         last = snapshot(root.parent)
         reason = pressure_reason(last)
         if reason: return deferred(reason)
@@ -112,13 +140,14 @@ def supervise(root, action, parent_pid):
         child = subprocess.Popen(args, env=env, start_new_session=True)
         limit = {'update': 300, 'evaluate': 300, 'mine': 300}[action]
         while child.poll() is None:
-            if os.getppid() != parent_pid: return deferred('research_parent_exited')
+            if not parent_alive(parent_pid): return deferred('research_parent_exited')
             if time.monotonic()-started >= limit: return deferred('research_time_budget')
             last = snapshot(root.parent, child.pid)
             reason = pressure_reason(last, running=True)
             if reason: return deferred(reason)
             time.sleep(2)
         if child.returncode: return child.returncode if child.returncode > 0 else 1
+        if not parent_alive(parent_pid): return deferred('research_parent_exited')
         last = snapshot(root.parent)
         reason = pressure_reason(last, running=True)
         if reason: return deferred(reason)
@@ -127,6 +156,8 @@ def supervise(root, action, parent_pid):
         if action == 'mine' and candidate.get('mining', {}).get('status') == 'error':
             print('research_mining_failed: '+str(candidate['mining'].get('reason')), file=sys.stderr)
             return 1
+        candidate.setdefault('resourcePolicy', {})['isolation'] = isolation
+        atomic(pending, candidate)
         # Only a successful, healthy run replaces the prior report/publication.
         os.replace(pending, root/'report.json')
         return 0

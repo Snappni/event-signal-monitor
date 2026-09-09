@@ -13,13 +13,35 @@ const VOLATILITY_ANCHORS = new Set(['realized_volatility','parkinson_volatility'
 const NO_MANUAL_VALUE = new Set(['model_bayesian_calibration','model_markowitz_allocator']);
 const children = new Set();
 const serverLow = () => process.env.FACTOR_RESEARCH_PROFILE === 'server-low';
+export function buildResearchLaunch(python, args, taskId, { env = process.env, platform = process.platform, uid = process.getuid?.(), parentStart = '' } = {}) {
+  if (env.FACTOR_RESEARCH_PROFILE !== 'server-low' || platform !== 'linux') {
+    return { command: python, args, env: { ...env, PYTHONUTF8: '1', FACTOR_RESEARCH_TASK_ID: taskId } };
+  }
+  const unit = `event-signal-research-${taskId}.service`;
+  const busEnv = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: env.HOME || '',
+    XDG_RUNTIME_DIR: `/run/user/${uid}`, DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${uid}/bus` };
+  const workerEnv = { PATH: busEnv.PATH, HOME: busEnv.HOME, PYTHONUTF8: '1',
+    FACTOR_RESEARCH_PROFILE: 'server-low', FACTOR_RESEARCH_TASK_ID: taskId,
+    FACTOR_RESEARCH_PARENT_START: parentStart, FACTOR_RESEARCH_SYSTEMD_UNIT: unit };
+  for (const key of ['FACTOR_RESEARCH_SERVER_PYSR', 'PYTHON_JULIAPKG_EXE', 'PYTHON_JULIAPKG_PROJECT', 'JULIA_DEPOT_PATH']) {
+    if (env[key]) workerEnv[key] = env[key];
+  }
+  return { command: '/usr/bin/systemd-run', unit, env: busEnv, args: ['--user', '--wait', '--pipe', '--collect',
+    '--expand-environment=no', `--unit=${unit}`, `--working-directory=${ROOT}`,
+    '-p', 'MemoryMax=384M', '-p', 'MemorySwapMax=0', '-p', 'CPUQuota=50%', '-p', 'TasksMax=32',
+    '-p', 'RuntimeMaxSec=330', '-p', 'TimeoutStopSec=5', '-p', 'KillMode=control-group', '-p', 'OOMPolicy=kill',
+    '--', '/usr/bin/env', '-i', ...Object.entries(workerEnv).map(([key, value]) => `${key}=${value}`), python, ...args] };
+}
 function serverMiningReady() {
   const exe = process.env.PYTHON_JULIAPKG_EXE || '', project = process.env.PYTHON_JULIAPKG_PROJECT || '';
   return process.env.FACTOR_RESEARCH_SERVER_PYSR === 'ready' && path.isAbsolute(exe) && path.isAbsolute(project)
     && fs.existsSync(exe) && fs.statSync(exe).isFile() && fs.existsSync(path.join(project, 'Manifest.toml'));
 }
-const resourceReasons = { host_memory_low: '主机可用内存不足', host_memory_pressure: '主机内存压力升高', host_io_pressure: '磁盘 I/O 压力升高', trading_heartbeat_stale: '交易心跳不新鲜', trading_decision_unhealthy: '交易决策未及时完成或存在失败', research_memory_budget: '研究进程组达到内存预算', research_time_budget: '研究任务达到时间预算', research_parent_exited: '启动研究的进程已退出', julia_maintenance_required: '服务器 Julia 尚未完成独立维护验收，暂停挖掘；采样与 IC 评估不受此项影响', server_profile_requires_linux: '服务器低资源配置仅适用于 Linux' };
+const resourceReasons = { research_unit_failed: '研究隔离服务启动或执行失败，已退避；详情见 launcherError', research_cgroup_unverified: '研究进程的内核资源限额核验未通过', host_memory_low: '主机可用内存不足', host_memory_pressure: '主机内存压力升高', host_io_pressure: '磁盘 I/O 压力升高', trading_heartbeat_stale: '交易心跳不新鲜', trading_decision_unhealthy: '交易决策未及时完成或存在失败', research_memory_budget: '研究进程组达到内存预算', research_time_budget: '研究任务达到时间预算', research_parent_exited: '启动研究的进程已退出', julia_maintenance_required: '服务器 Julia 尚未完成独立维护验收，暂停挖掘；采样与 IC 评估不受此项影响', server_profile_requires_linux: '服务器低资源配置仅适用于 Linux' };
 function terminateWorker(child) {
+  if (child.researchUnit) {
+    spawnSync('/usr/bin/systemctl', ['--user', 'stop', child.researchUnit], { env: child.researchBusEnv, stdio: 'ignore', timeout: 7000 });
+  }
   if (!child.pid || child.exitCode !== null) return;
   if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore', timeout: 5000 });
   else child.kill();
@@ -77,7 +99,9 @@ function taskStatus(root, task) {
   if (!task?.state) return { state: 'not_started' };
   const progress = read(path.join(root, 'progress.json'));
   const result = { ...task, ...(progress.taskId && progress.taskId === task.taskId ? { progress } : {}) };
-  if (task.state === 'running' && !processAlive(task.pid)) return { ...result, state: 'interrupted', outcome: 'interrupted', error: '研究进程已退出，任务未确认完成；可重新启动。' };
+  // A locally owned child may have exited while its close callback is still draining stderr.
+  const completing = [...children].some(child => child.pid === task.pid);
+  if (task.state === 'running' && !completing && !processAlive(task.pid)) return { ...result, state: 'interrupted', outcome: 'interrupted', error: '研究进程已退出，任务未确认完成；可重新启动。' };
   result.elapsedSeconds = Math.max(0, Math.floor(((Date.parse(task.finishedAt) || Date.now()) - Date.parse(task.startedAt)) / 1000)) || 0;
   result.heartbeatStale = task.state === 'running' && Date.now() - (Date.parse(result.progress?.heartbeatAt) || Date.parse(task.startedAt)) > 30000;
   return result;
@@ -137,10 +161,19 @@ export function startFactorResearch(config, action = 'update', { requestedBy = a
     : [path.join(ROOT, 'research/engine.py'), '--root', root];
   if (!serverLow()) { if (action === 'evaluate') args.push('--evaluate'); if (action === 'mine') args.push('--mine'); }
   let stderr = '', finished = false, timedOut = false;
-  const child = spawn(python, args, { cwd: ROOT, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', FACTOR_RESEARCH_TASK_ID: taskId } });
+  let parentStart = '';
+  if (serverLow() && process.platform === 'linux') {
+    try {
+      const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8');
+      parentStart = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[19];
+    } catch { /* Supervisor rejects missing owner identity before numerical imports. */ }
+  }
+  const launch = buildResearchLaunch(python, args, taskId, { parentStart });
+  const child = spawn(launch.command, launch.args, { cwd: ROOT, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'], env: launch.env });
+  child.researchUnit = launch.unit; child.researchBusEnv = launch.env;
   children.add(child);
   write(lock, { pid: child.pid || process.pid, taskId });
-  const task = { state: 'running', taskId, action, requestedBy, pid: child.pid || process.pid, startedAt };
+  const task = { state: 'running', taskId, action, requestedBy, pid: child.pid || process.pid, startedAt, ...(launch.unit ? { unit: launch.unit } : {}) };
   const persist = value => { write(taskFile, value); if (read(lock).taskId === taskId) write(path.join(root, 'worker.json'), value); };
   persist(task);
   if (requestedBy === 'user') write(path.join(root, 'last-user-task.json'), { taskId });
@@ -154,14 +187,20 @@ export function startFactorResearch(config, action = 'update', { requestedBy = a
   const done = (code, error = null, outcome = null) => {
     if (finished) return; finished = true; children.delete(child); clearTimeout(timeout); process.removeListener('exit', onExit);
     const report = read(path.join(root, 'report.json'));
-    const resource = read(path.join(root, 'resource-result.json'));
-    const deferred = code === 75 && resource.taskId === taskId;
+    let resource = read(path.join(root, 'resource-result.json'));
+    if (launch.unit && code !== 0) {
+      // The CLI may die before the service: stop the exact owned unit before releasing its lock.
+      terminateWorker(child);
+      if (resource.taskId !== taskId) resource = { taskId, reason: 'research_unit_failed', retryAfter: Date.now()/1000 + 360, resources: null };
+    }
+    const deferred = (code === 75 || (launch.unit && code !== 0)) && resource.taskId === taskId;
     const miningError = action === 'mine' && report.mining?.status === 'error' ? report.mining.reason : null;
     const success = code === 0 && !miningError && !timedOut;
     const reason = deferred ? resourceReasons[resource.reason] || `资源检查未通过：${resource.reason}` : timedOut ? '任务超过运行时限，已停止' : error || miningError || (success ? null : stderr || 'research_worker_failed');
     const progress = read(path.join(root, 'progress.json'));
     persist({ ...task, state: deferred ? 'deferred' : success ? 'idle' : outcome === 'interrupted' ? 'interrupted' : 'error', outcome: deferred ? 'resource_deferred' : outcome || (timedOut ? 'timed_out' : success ? 'completed' : 'failed'),
       ...(deferred ? { reason: resource.reason, retryAfter: resource.retryAfter, resources: resource.resources } : {}),
+      ...(launch.unit && !success ? { launcherError: error || stderr || null } : {}),
       code, finishedAt: new Date().toISOString(), error: reason,
       progress: progress.taskId === taskId ? progress : null,
       result: success ? { counts: report.counts, miningStatus: action === 'mine' ? report.mining?.status : undefined, candidates: report.mining?.candidates?.length || 0 } : null });
