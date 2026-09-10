@@ -36,6 +36,8 @@ const unstableTransition = evaluateAdaptiveEntryGate({
 });
 
 assert.equal(stableTrend.passesGate, true);
+assert.ok(stableTrend.probabilityLowerBound < stableTrend.winRate);
+assert.ok(stableTrend.lowerBoundExpectancyR >= 0.05);
 assert.equal(unstableTransition.passesGate, false);
 assert.ok(unstableTransition.adaptiveWinRateThreshold > stableTrend.adaptiveWinRateThreshold);
 
@@ -64,6 +66,15 @@ const negativeEv = evaluateAdaptiveEntryGate({
 });
 assert.equal(negativeEv.passesGate, false);
 
+const fragilePointEstimate = evaluateAdaptiveEntryGate({
+  ...shared,
+  expectancyPct: 0.0002,
+  winRate: 0.45,
+  riskProfile: "aggressive",
+  calibration: { samples: 0 }
+});
+assert.equal(fragilePointEstimate.passesGate, false, "positive point EV alone must not pass the conservative EV gate");
+
 const tradeCalibration = buildTradeCalibration([
   ...Array.from({ length: 12 }, (_, index) => ({
     status: "closed",
@@ -82,6 +93,26 @@ const tradeCalibration = buildTradeCalibration([
 ]);
 assert.equal(tradeCalibration.samples, 32);
 assert.equal(tradeCalibration.byMode.math_only.wins, 2);
+const cohortCalibration = buildTradeCalibration([
+  ...Array.from({ length: 8 }, (_, index) => ({
+    status: "closed",
+    calibrationCohort: "layered-v1",
+    winRate: 0.6,
+    realizedPnl: index < 4 ? 1 : -1
+  })),
+  ...Array.from({ length: 20 }, () => ({
+    status: "closed",
+    calibrationCohort: "legacy",
+    winRate: 0.8,
+    realizedPnl: -1
+  }))
+], { cohort: "layered-v1" });
+assert.equal(cohortCalibration.samples, 8);
+assert.equal(cohortCalibration.closedSamples, 28);
+assert.equal(cohortCalibration.excludedIncompatibleSamples, 20);
+assert.equal(buildTradeCalibration([
+  { status: "closed", calibrationCohort: "legacy", winRate: 0.8, realizedPnl: -1 }
+], { cohort: "layered-v1" }).samples, 0, "legacy architecture trades must not calibrate the current decision cohort");
 const weakMode = calibrateCandidateWinRate({
   winRate: 0.7,
   calibration: tradeCalibration,

@@ -30,12 +30,29 @@ function updateClock() {
   if (clock) clock.textContent = `北京时间 ${formatter.format(new Date())}（UTC+8）`;
 }
 
-function startClock() {
-  updateClock();
-  setTimeout(() => {
+let clockTimer = null;
+
+function scheduleClock() {
+  clearTimeout(clockTimer);
+  const delay = Math.max(20, 1_000 - (Date.now() % 1_000) + 10);
+  clockTimer = setTimeout(() => {
     updateClock();
-    setInterval(updateClock, 1_000);
-  }, 1_000 - (Date.now() % 1_000));
+    scheduleClock();
+  }, delay);
+}
+
+function syncClock() {
+  updateClock();
+  scheduleClock();
+}
+
+function startClock() {
+  syncClock();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) syncClock();
+  });
+  window.addEventListener("focus", syncClock);
+  window.addEventListener("pageshow", syncClock);
 }
 
 if (document.readyState === "loading") {

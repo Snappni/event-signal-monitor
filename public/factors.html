@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>因子研究中心 | 事件信号监控引擎</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark" aria-hidden="true">ES</div><div><span class="eyebrow">SIGNAL OPERATIONS</span><h1>事件信号监控引擎</h1><p id="subtitle">读取因子证据</p></div></div>
+      <nav class="toolbar" aria-label="主导航">
+        <span class="nav-caption">分析工作台</span>
+        <a class="toolbar-link" href="/"><span aria-hidden="true">⌂</span>实时监控</a>
+        <a class="toolbar-link" href="/summary.html"><span aria-hidden="true">⌁</span>账户总结</a>
+        <a class="toolbar-link" href="/signals.html"><span aria-hidden="true">⌁</span>信号复盘</a>
+        <a class="toolbar-link" href="/messages.html"><span aria-hidden="true">◫</span>消息情报</a>
+        <a class="toolbar-link active" href="/factors.html" aria-current="page"><span aria-hidden="true">ƒ</span>因子库</a>
+        <a class="toolbar-link" href="/logs.html"><span aria-hidden="true">≡</span>运行日志</a>
+        <a class="toolbar-link" href="/review.html"><span aria-hidden="true">↻</span>迭代复盘</a>
+        <div class="nav-footer"><span class="environment-state"><i></i>模拟环境</span><button id="refreshButton" type="button">刷新因子</button></div>
+      </nav>
+    </header>
+    <main class="detail-page factor-page">
+      <section class="page-heading"><div><span class="eyebrow">CAUSAL FACTOR RESEARCH</span><h2>因子研究中心</h2><p>采样 → 成熟标签 → 样本外评估 → 隔离验证 → 发布方向组合。研究不依赖账户开仓。</p></div><span id="factorRuntimeState" class="live-state">等待状态</span></section>
+      <section class="summary-grid detail-summary factor-summary" aria-label="研究摘要">
+        <div class="metric"><span>特征目录</span><strong id="factorCount">—</strong></div>
+        <div class="metric"><span>观测行 / 时间批次</span><strong id="observationCount">—</strong></div>
+        <div class="metric"><span>成熟 / 待成熟标签</span><strong id="labelCount">—</strong></div>
+        <div class="metric"><span>实际参与因子</span><strong id="factorDecisionCount">—</strong></div>
+        <div class="metric"><span>发布版本</span><strong id="factorWeightVersion">—</strong></div>
+        <div class="metric"><span>评估时间</span><strong id="factorGeneratedAt" class="metric-time">—</strong></div>
+      </section>
+      <section class="panel detail-panel factor-settings-panel">
+        <div class="section-title"><h2>运行与发布</h2><span id="factorSaveNotice" role="status">修改后保存</span></div>
+        <div class="factor-settings-grid">
+          <label for="factorDecisionMode">因子应用流程<select id="factorDecisionMode"><option value="validated">自动验证流程</option><option value="manual">手动直接应用（分层选因子）</option></select></label>
+          <label class="factor-switch"><input id="factorLibraryEnabled" type="checkbox">启用研究采样</label>
+          <label class="factor-switch"><input id="factorAutoGovernanceEnabled" type="checkbox">自动治理方向组合</label>
+          <label class="factor-switch"><input id="factorMiningEnabled" type="checkbox">自动挖掘（最多每日一次）</label>
+          <label>普通方向因子组合最大融合权重<input id="factorDecisionInfluence" type="number" min="0" max="40" step="1">%</label>
+        </div>
+        <p id="factorModePolicy" class="factor-policy-note"></p>
+        <div id="manualLayerGuide" class="manual-layer-guide" hidden><strong>手动配置清单：每层至少1个，风险层必须包含波动率估计因子</strong><div id="manualLayerCards" class="factor-mining-grid"></div><p id="manualLayerMessage" role="status"></p></div>
+        <p class="factor-policy-note">Qlib收益模型仅研究，不冒充胜率。手动模式只跳过因子资格验证：方向组合、状态置信调整、波动风险调整各走一层；原账户概率、净EV和风险门槛继续生效。选齐不等于一定开仓。</p>
+        <div class="factor-toolbar"><button id="evaluateResearch" type="button">立即评估</button><button id="mineResearch" type="button">挖掘多因子表达式</button><span id="researchActionState" role="status"></span></div>
+        <section id="researchTaskPanel" class="research-task-panel" aria-label="研究任务状态" aria-live="polite"><strong id="researchTaskTitle">尚未启动任务</strong><p id="researchTaskIdentity"></p><p id="researchTaskProgress"></p><p id="researchTaskTiming"></p><p id="researchTaskResult"></p><p id="researchOtherTask"></p></section>
+        <p id="researchHealth" class="muted"></p>
+      </section>
+      <section class="panel detail-panel"><div class="section-title"><h2>模型与挖掘隔离区</h2><span>候选不会自动进入生产</span></div><div id="factorMiningDetails" class="factor-mining-grid"></div></section>
+      <section class="panel detail-panel">
+        <div class="section-title"><h2>因子证据</h2><span id="factorFilteredCount"></span></div>
+        <div class="factor-toolbar">
+          <input id="factorSearch" type="search" aria-label="搜索因子" placeholder="名称、公式或说明">
+          <select id="factorHorizon" aria-label="未来收益周期"><option value="5">5分钟</option><option value="15">15分钟</option><option value="60" selected>1小时</option><option value="240">4小时</option></select>
+          <select id="factorLayerFilter" aria-label="因子层筛选"><option value="">全部层</option><option value="direction">方向层</option><option value="risk">波动／风险层</option><option value="context">市场状态层</option></select>
+          <select id="factorEvidence" aria-label="证据筛选"><option value="">全部状态</option><option value="passed">验证通过</option><option value="active">实际参与</option><option value="collecting">尚无IC</option></select>
+          <button id="factorIcSort" type="button" aria-pressed="false">按 |IC| 排序</button>
+        </div>
+        <div class="factor-table-wrap"><table class="factor-table"><thead><tr><th>因子 / 角色</th><th>启用</th><th>参与本层判断</th><th>相对权重</th><th>IC / 95%区间</th><th>n_eff / q</th><th>7 / 30 / 90日IC</th><th>应用状态</th></tr></thead><tbody id="factorList"></tbody></table></div>
+      </section>
+    </main>
+    <aside id="factorSaveBar" class="factor-save-bar" aria-live="polite" hidden><div class="factor-save-context"><div><strong>有未保存的更改</strong><span id="factorSaveHint">修改后保存生效</span></div></div><div class="factor-save-actions"><button id="discardFactorConfig" type="button">放弃更改</button><button id="saveFactorConfig" type="button" class="factor-save-primary">保存更改</button></div></aside>
+    <script src="/factors.js" type="module"></script>
+  </body>
+</html>

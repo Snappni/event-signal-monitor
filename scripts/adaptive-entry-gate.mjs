@@ -43,10 +43,18 @@ function calibrationBucket(trades) {
   };
 }
 
-export function buildTradeCalibration(trades = []) {
-  const usable = Array.isArray(trades)
+function calibrationCohort(trade) {
+  return String(trade?.calibrationCohort || trade?.factorSnapshot?.calibrationCohort || "").trim() || null;
+}
+
+export function buildTradeCalibration(trades = [], options = {}) {
+  const closed = Array.isArray(trades)
     ? trades.filter((trade) => trade?.status === "closed" || trade?.closedAt)
     : [];
+  const requiredCohort = String(options?.cohort || "").trim() || null;
+  const usable = requiredCohort
+    ? closed.filter((trade) => calibrationCohort(trade) === requiredCohort)
+    : closed;
   const byMode = {};
   const byRegime = {};
   for (const trade of usable) {
@@ -59,7 +67,10 @@ export function buildTradeCalibration(trades = []) {
     ...calibrationBucket(usable),
     byMode: Object.fromEntries(Object.entries(byMode).map(([key, value]) => [key, calibrationBucket(value)])),
     byRegime: Object.fromEntries(Object.entries(byRegime).map(([key, value]) => [key, calibrationBucket(value)])),
-    source: "paper_trade_history"
+    source: "paper_trade_history",
+    cohort: requiredCohort,
+    closedSamples: closed.length,
+    excludedIncompatibleSamples: closed.length - usable.length
   };
 }
 
@@ -122,6 +133,13 @@ export function evaluateAdaptiveEntryGate(value = {}) {
 
   const calibration = value.calibration && typeof value.calibration === "object" ? value.calibration : {};
   const calibrationSamples = Math.max(0, safeNumber(calibration.samples));
+  const contextualSampleCounts = [
+    calibration.byMode?.[value.candidateMode]?.samples,
+    calibration.byRegime?.[String(value.regime || "unknown").toLowerCase()]?.samples
+  ].map((sample) => Math.max(0, safeNumber(sample))).filter((sample) => sample > 0);
+  const effectiveCalibrationSamples = contextualSampleCounts.length
+    ? Math.min(calibrationSamples || Number.POSITIVE_INFINITY, ...contextualSampleCounts)
+    : calibrationSamples;
   const empiricalWinRate = calibrationSamples > 0
     ? safeNumber(calibration.wins) / calibrationSamples
     : null;
@@ -156,7 +174,23 @@ export function evaluateAdaptiveEntryGate(value = {}) {
     upperBound
   );
   const expectancyPct = safeNumber(value.expectancyPct);
-  const passesGate = expectancyPct > 0 && winRate >= adaptiveWinRateThreshold;
+  const probabilityUncertainty = clamp(
+    1.28 * Math.sqrt(Math.max(winRate * (1 - winRate), 0.03) / (effectiveCalibrationSamples + 20)) +
+      0.04 / Math.sqrt(1 + effectiveCalibrationSamples / 20),
+    0.02,
+    0.1
+  );
+  const probabilityLowerBound = clamp(winRate - probabilityUncertainty, 0.05, 0.95);
+  const rewardPct = riskPct * rewardRiskRatio;
+  const lowerBoundExpectancyPct =
+    probabilityLowerBound * rewardPct -
+    (1 - probabilityLowerBound) * riskPct -
+    roundTripExecutionCostPct;
+  const lowerBoundExpectancyR = lowerBoundExpectancyPct / riskPct;
+  const passesGate =
+    expectancyPct > 0 &&
+    lowerBoundExpectancyR >= 0.05 &&
+    winRate >= adaptiveWinRateThreshold;
 
   return {
     riskProfile,
@@ -165,6 +199,10 @@ export function evaluateAdaptiveEntryGate(value = {}) {
     adaptiveWinRateThreshold,
     breakEvenWinRate,
     executionCostR,
+    probabilityUncertainty,
+    probabilityLowerBound,
+    lowerBoundExpectancyPct,
+    lowerBoundExpectancyR,
     uncertaintyMargin,
     bounds: { lower: lowerBound, upper: upperBound },
     components: {
@@ -179,6 +217,7 @@ export function evaluateAdaptiveEntryGate(value = {}) {
     },
     context: {
       calibrationSamples,
+      effectiveCalibrationSamples,
       empiricalWinRate,
       averagePredictedWinRate,
       regime: value.regime || "unknown",

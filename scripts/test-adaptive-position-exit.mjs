@@ -69,7 +69,8 @@ assert.equal(deteriorated.recommendsExit, false);
 assert.equal(deteriorated.recommendsDeRisk, true);
 assert.equal(deteriorated.deRiskFraction, 0.5);
 assert.ok(deteriorated.diagnostics.qualityRetention <= 0.55);
-assert.equal(deteriorated.version, 4);
+assert.equal(deteriorated.version, 5);
+assert.equal(deteriorated.rawExitScore, deteriorated.rawSignals.signalReversal * deteriorated.weights.signalReversal + deteriorated.rawSignals.netExpectancyDecay * deteriorated.weights.netExpectancyDecay + deteriorated.rawSignals.eventDecay * deteriorated.weights.eventDecay + deteriorated.rawSignals.timeDecay * deteriorated.weights.timeDecay + deteriorated.rawSignals.capitalEfficiency * deteriorated.weights.capitalEfficiency + deteriorated.rawSignals.profitProtection * deteriorated.weights.profitProtection);
 
 const legacy = evaluateAdaptivePositionExit({
   position: { ...position, openedAt: "2026-07-01T00:00:00.000Z", exitPolicyStartedAt: now },
@@ -99,7 +100,7 @@ const negativeRemainingEv = evaluateAdaptivePositionExit({
 });
 assert.equal(negativeRemainingEv.materialNegativeExpectancy, true);
 assert.equal(negativeRemainingEv.recommendsExit, true);
-assert.equal(negativeRemainingEv.version, 4);
+assert.equal(negativeRemainingEv.version, 5);
 assert.equal(negativeRemainingEv.diagnostics.normalizedRegime, "transition");
 const alignedBearShort = evaluateAdaptivePositionExit({
   position: { ...position, side: "short", regime: "hmm_bear" },

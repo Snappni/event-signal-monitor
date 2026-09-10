@@ -1,4 +1,5 @@
 import "./beijing-clock.js";
+import "./navigation.js";
 
 const state = {
   report: null,
@@ -17,7 +18,11 @@ const state = {
   messageAggregatorSubmitting: false,
   accountFormDirty: false,
   postTradeReviewSubmitting: false,
-  rawLogVisible: false
+  rawLogVisible: false,
+  logCursor: null,
+  loadInFlight: false,
+  logLoadInFlight: false,
+  closeAllPositionsSubmitting: false
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -269,6 +274,8 @@ async function postJson(url, body = {}) {
 }
 
 async function loadData() {
+  if (state.loadInFlight) return;
+  state.loadInFlight = true;
   const view = location.pathname === "/messages.html"
     ? "messages"
     : location.pathname === "/models.html"
@@ -278,18 +285,55 @@ async function loadData() {
         : location.pathname === "/logs.html"
           ? "logs"
           : "overview";
-  const data = await getJson(`/api/page-data?view=${view}`);
-  state.report = data.report || {};
-  state.status = data.status || {};
-  state.log = data.log?.text || "";
-  state.account = data.account || {};
-  state.messageAggregator = data.messageAggregator || {};
-  render();
-  if ($("#messages")) {
-    loadMessageTranslations(state.report).catch(() => {
-      // Translation failure must not interrupt monitoring or report rendering.
-    });
+  try {
+    const data = await getJson(`/api/page-data?view=${view}`);
+    state.report = data.report || {};
+    state.status = data.status || {};
+    if (data.log) mergeLogChunk(data.log);
+    state.account = data.account || {};
+    state.messageAggregator = data.messageAggregator || {};
+    render();
+    if ($("#messages")) {
+      loadMessageTranslations(state.report).catch(() => {
+        // Translation failure must not interrupt monitoring or report rendering.
+      });
+    }
+  } finally {
+    state.loadInFlight = false;
   }
+}
+
+function mergeLogChunk(log) {
+  const incoming = String(log?.text || "");
+  const cursor = Number(log?.cursor);
+  if (state.logCursor === null || log?.reset === true) {
+    state.log = incoming;
+  } else if (incoming) {
+    state.log = `${state.log}${incoming}`.slice(-80_000);
+  }
+  state.logCursor = Number.isFinite(cursor) && cursor >= 0 ? cursor : null;
+}
+
+async function refreshLog() {
+  if (state.loadInFlight || state.logLoadInFlight || document.hidden) return;
+  state.logLoadInFlight = true;
+  try {
+    const cursor = Number.isFinite(state.logCursor) ? `&cursor=${state.logCursor}` : "";
+    mergeLogChunk(await getJson(`/api/log?bytes=80000${cursor}`));
+    renderLog();
+  } finally {
+    state.logLoadInFlight = false;
+  }
+}
+
+async function refreshLogStatus() {
+  if (document.hidden) return;
+  const status = await getJson("/api/status");
+  state.status = status;
+  if (status.loopLastReportAt) {
+    state.report = { ...(state.report || {}), generatedAt: status.loopLastReportAt };
+  }
+  renderSummary();
 }
 
 async function loadMessageTranslations(report) {
@@ -339,6 +383,13 @@ function renderSummary() {
   setText("#subtitle", `${report.mode || "paper-alert-only"} | ${fmtTimestamp(report.generatedAt)}`);
   setText("#pageDataTime", fmtTimestamp(report.generatedAt));
   setText("#layerValue", "事件驱动 + 自适应轮询");
+  const session = report.marketSession || {};
+  const sessionPolicy = session.policy || {};
+  const sessionLabel = sessionPolicy.label || "时段未知";
+  setText(
+    "#sessionValue",
+    `${sessionLabel}${session.overlap ? " · 交会" : ""}${sessionPolicy.strategy ? ` · ${sessionPolicy.strategy}` : ""}`
+  );
   setText("#actionableValue", uiCounts.actionable ?? actionable.length);
   setText("#watchValue", uiCounts.watch ?? watchlist.length);
   setText("#messageValue", Number.isFinite(messageTotal) ? messageTotal : messages.length);
@@ -349,18 +400,25 @@ function renderSummary() {
       : `当前展示 ${displayedMessages} 条（上限 ${messageLimit}）`
   );
   setText("#modelValue", uiCounts.models ?? models.length);
-  const loopStatus = state.status?.loopRunning
-    ? `${state.status?.priceConnected ? "行情流已连接" : "决策服务已运行"} · ${text.running}`
-    : `事件驱动服务 ${text.stopped}`;
+  const decisionStalled = state.status?.decisionStalled === true;
+  const loopStatus = decisionStalled
+    ? `决策循环已停滞 · 阶段 ${state.status?.decisionStage || "未知"}`
+    : state.status?.loopRunning
+      ? `${state.status?.orderFlowConnected ? "订单流已连接" : state.status?.priceConnected ? "行情流已连接" : "决策服务已运行"} · ${text.running}`
+      : `事件驱动服务 ${text.stopped}`;
   setText("#loopValue", loopStatus);
   const healthStatus = $("#healthStatus");
   if (healthStatus) {
     healthStatus.classList.toggle("stopped", !state.status?.loopRunning);
-    healthStatus.lastChild.textContent = state.status?.loopRunning
-      ? state.status?.priceConnected
-        ? "行情流监控中"
-        : "决策服务运行中"
-      : "监控服务未运行";
+    healthStatus.lastChild.textContent = decisionStalled
+      ? "决策循环已停滞"
+      : state.status?.loopRunning
+        ? state.status?.orderFlowConnected
+          ? "订单流监控中"
+          : state.status?.priceConnected
+            ? "行情流监控中"
+            : "决策服务运行中"
+        : "监控服务未运行";
   }
   setText("#reportTime", fmtTimestamp(report.generatedAt));
   setText("#sourceCounts", `内置 RSS ${sourceCounts.rss || 0} | 热榜 ${sourceCounts.trend || 0} | GDELT ${sourceCounts.gdelt || 0} | Polymarket ${sourceCounts.polymarket || 0} | 交易所公告 ${(sourceCounts.binanceAnnouncements || 0) + (sourceCounts.okxAnnouncements || 0)} | 合并重复 ${sourceCounts.suppressedDuplicates || 0} | 市场计算 ${sourceCounts.marketAnalyses || 0}`);
@@ -512,8 +570,10 @@ const reviewFactorLabels = {
   higherTimeframeTrend: "1小时趋势",
   momentum: "动量",
   rsi: "RSI反转",
+  volume: "成交量确认",
   funding: "资金费率",
   openInterest: "未平仓量",
+  orderFlow: "订单流",
   geometricBrownianMotion: "GBM方向",
   hiddenMarkovModel: "HMM状态",
   volatilityRegime: "波动状态",
@@ -547,7 +607,7 @@ function renderPostTradeReview(account, currency) {
   const everyInput = $("#reviewEveryTrades");
   const autoInput = $("#reviewAutoApply");
   if (everyInput) setInputValueIfUnfocused(everyInput, interval);
-  if (autoInput && document.activeElement !== autoInput) autoInput.checked = config.autoApplyValidatedWeights === true;
+  if (autoInput && document.activeElement !== autoInput) autoInput.checked = config.autoApplyValidatedExitWeights === true;
 
   const status = $("#postTradeReviewStatus");
   if (status) {
@@ -555,10 +615,10 @@ function renderPostTradeReview(account, currency) {
     if (config.enabled === false) {
       status.textContent = "复盘已停用";
     } else if (latest?.status === "promoted") {
-      status.textContent = `权重版本 v${reviewState.weightVersion || 1} 已晋升`;
+      status.textContent = `退出权重 v${reviewState.exitWeightVersion || 1} 已晋升`;
       status.classList.add("ready");
-    } else if (latest?.promotionEligible) {
-      status.textContent = "候选权重已通过验证";
+    } else if (latest?.exitPromotionEligible) {
+      status.textContent = "退出候选已通过验证";
       status.classList.add("ready");
     } else if (latest) {
       status.textContent = latest.status === "insufficient_data" ? "样本不足，仅生成诊断" : "候选权重影子观察中";
@@ -570,11 +630,11 @@ function renderPostTradeReview(account, currency) {
 
   const applyButton = $("#applyReviewCandidateButton");
   const rollbackButton = $("#rollbackReviewWeightsButton");
-  if (applyButton) applyButton.disabled = state.postTradeReviewSubmitting || !latest?.promotionEligible || latest?.applied;
+  if (applyButton) applyButton.disabled = state.postTradeReviewSubmitting || !latest?.exitPromotionEligible || latest?.applied;
   if (rollbackButton) {
     rollbackButton.disabled =
       state.postTradeReviewSubmitting ||
-      (!reviewState.previousDirectionWeights && !reviewState.previousExitWeights);
+      !reviewState.previousExitWeights;
   }
 
   const target = $("#postTradeReview");
@@ -611,9 +671,9 @@ function renderPostTradeReview(account, currency) {
       return `
         <div class="review-factor-row">
           <div class="review-factor-name"><strong>${escapeHtml(reviewFactorLabels[item.factor] || item.factor)}</strong><span>${fmtNumber(item.activeSamples || 0, 0)}/${fmtNumber(item.samples || 0, 0)} 笔有效</span></div>
-          <div><span class="row-meta">当前权重</span>${fmtPct(item.currentWeight || 0, 2)}</div>
-          <div><span class="row-meta">候选权重</span>${item.candidateWeight == null ? "-" : fmtPct(item.candidateWeight, 2)}</div>
-          <div class="review-factor-delta ${deltaClass}"><span class="row-meta">建议变化</span>${item.candidateWeight == null ? "-" : fmtPct(delta, 2)}</div>
+          <div><span class="row-meta">固定冠军</span>${fmtPct(item.currentWeight || 0, 2)}</div>
+          <div><span class="row-meta">证据候选</span>${item.candidateWeight == null ? "-" : fmtPct(item.candidateWeight, 2)}</div>
+          <div class="review-factor-delta ${deltaClass}"><span class="row-meta">只读差异</span>${item.candidateWeight == null ? "-" : fmtPct(delta, 2)}</div>
           <div><span class="row-meta">反事实关联</span>${fmtNumber(item.directionAssociation || 0, 3)}</div>
         </div>
       `;
@@ -690,7 +750,7 @@ function renderPostTradeReview(account, currency) {
         <div class="review-card"><span>候选权重准确率</span><strong>${fmtPct(validation.challenger?.accuracy || 0, 1)}</strong></div>
       </div>
     ` : `<p class="review-note">目前只有 ${fmtNumber(latest.eligibleTrades || 0, 0)} 笔可归因交易；至少需要 ${fmtNumber(config.minimumProposalTrades || 20, 0)} 笔才生成候选权重。</p>`}
-    <div class="review-subtitle">因子归因与候选权重</div>
+    <div class="review-subtitle">固定方向冠军与只读证据候选</div>
     <div>${factorRows || `<div class="empty">暂无因子统计</div>`}</div>
     <div class="review-subtitle">退出因子迭代（含动态盈利保护）</div>
     ${exitValidation ? `
@@ -706,7 +766,7 @@ function renderPostTradeReview(account, currency) {
     <div>${qualityRows || `<div class="empty">暂无质量因子统计</div>`}</div>
     <div class="review-subtitle">最近交易完整链路摘要</div>
     <div>${tradeRows || `<div class="empty">暂无具备开仓快照的交易</div>`}</div>
-    <p class="review-note">这里衡量的是因子与结果的预测关联，不是因果证明。候选权重每轮变化受限，并且必须先在后段时间样本上胜过当前权重；无证据表明权重变化一定提高未来盈利。</p>
+    <p class="review-note">这里衡量的是因子与结果的预测关联，不是因果证明。方向候选不写入决策，因子库独占方向治理；退出候选必须先在后段时间样本上胜过当前权重。无证据表明权重变化一定提高未来盈利。</p>
   `;
 }
 
@@ -732,6 +792,11 @@ function renderAccountPositions(account, currency) {
   );
   $("#openPositionCount").textContent = positions.length;
   $("#closedPositionCount").textContent = lifetimeClosedPositions;
+  const closeAllButton = $("#closeAllPositionsButton");
+  if (closeAllButton) {
+    closeAllButton.disabled = !positions.length || state.closeAllPositionsSubmitting;
+    closeAllButton.textContent = state.closeAllPositionsSubmitting ? "平仓处理中…" : "一键平仓";
+  }
   document.querySelectorAll("[data-position-view]").forEach((button) => {
     button.classList.toggle("active", button.dataset.positionView === state.positionView);
   });
@@ -866,7 +931,10 @@ function positionChartOption(position) {
         type: "line",
         data: observations,
         showSymbol: false,
-        smooth: 0.18,
+        // Price observations arrive from an event-driven stream with real gaps.
+        // Spline smoothing invents intermediate extrema and makes sparse data
+        // look like a synthetic heartbeat; preserve the observed path instead.
+        smooth: false,
         lineStyle: { width: 2 },
         markLine: {
           silent: true,
@@ -1024,6 +1092,7 @@ function positionRow(position, currency) {
 function closedPositionRow(position, currency) {
   const sideLabel = String(position.side || "").toUpperCase();
   const pnlType = position.realizedPnl > 0 ? "ok" : position.realizedPnl < 0 ? "danger" : "";
+  const closeReason = position.closeReason === "MANUAL_CLOSE_ALL" ? "手动一键平仓" : position.closeReason;
   const resultType = position.closeReason === "TP" ? "ok" : position.closeReason === "SL" ? "danger" : "warn";
   const titles = asArray(position.relatedEvents)
     .slice(0, 2)
@@ -1041,7 +1110,7 @@ function closedPositionRow(position, currency) {
             ${badge(`${fmtNumber(position.leverage, 0)}x`, "leverage")}
             ${badge(`胜率 ${fmtPct(position.winRate, 1)}`, "probability")}
             ${badge(`盈亏比 ${fmtNumber(riskReward, 2)}`, "ratio")}
-            ${badge(position.closeReason || text.closed, resultType)}
+            ${badge(closeReason || text.closed, resultType)}
           </div>
           <div class="row-meta">${escapeHtml(fmtTimestamp(position.openedAt))} \u2192 ${escapeHtml(fmtTimestamp(position.closedAt))}</div>
         </div>
@@ -1050,7 +1119,7 @@ function closedPositionRow(position, currency) {
       <div class="position-quick-grid">
         ${calcCell(text.entry, fmtPrice(position.entry))}
         ${calcCell(text.exitPrice, fmtPrice(position.exitPrice))}
-        ${calcCell(text.closeReason, position.closeReason || "-")}
+        ${calcCell(text.closeReason, closeReason || "-")}
         ${calcCell(text.winRate, fmtPct(position.winRate, 1))}
         ${calcCell("EV", fmtPct(position.expectancyPct, 2))}
         ${calcCell(text.impact, fmtNumber(position.eventImpactScore, 0))}
@@ -1875,6 +1944,7 @@ function localizeHmmRegime(regime) {
 function renderLog() {
   const target = $("#logView");
   if (!target) return;
+  const followTail = target.scrollTop + target.clientHeight >= target.scrollHeight - 24;
   const lines = String(state.log || "").split("\n");
   const mojibakePattern = /(鍛婅|锛氫|妯℃嫙|浜嬩欢淇|鐩戞帶|寮曟搸|鏃犺瘉鎹)/;
   const corruptedLines = lines.filter((line) => mojibakePattern.test(line)).length;
@@ -1883,6 +1953,7 @@ function renderLog() {
     .join("\n")
     .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z/g, (value) => fmtTimestamp(value));
   target.textContent = state.rawLogVisible ? state.log || text.noLog : cleanLog || text.noLog;
+  if (followTail) target.scrollTop = target.scrollHeight;
   setText(
     "#logNotice",
     corruptedLines
@@ -1973,7 +2044,7 @@ function bindEvents() {
       state.account = await postJson("/api/post-trade-review/config", {
         enabled: true,
         reviewEveryTrades: Number($("#reviewEveryTrades").value),
-        autoApplyValidatedWeights: $("#reviewAutoApply").checked
+        autoApplyValidatedExitWeights: $("#reviewAutoApply").checked
       });
       render();
     } catch (error) {
@@ -2040,6 +2111,30 @@ function bindEvents() {
       showError(error);
     }
   });
+  $("#closeAllPositionsButton")?.addEventListener("click", async () => {
+    const openCount = Object.keys(getAccountBundle().account.positions || {}).length;
+    if (!openCount || state.closeAllPositionsSubmitting) return;
+    if (!window.confirm(`确认按当前模拟价格平掉全部 ${openCount} 个纸面仓位？该操作不会暂停后续纸面开仓。`)) return;
+    state.closeAllPositionsSubmitting = true;
+    renderAccount();
+    try {
+      const result = await postJson("/api/account/close-all");
+      state.account = result;
+      state.positionView = "closed";
+      render();
+      const closedCount = Number(result.closeResult?.closedCount || 0);
+      const failedCount = Number(result.closeResult?.failedCount || 0);
+      $("#accountSummary")?.insertAdjacentHTML(
+        "afterbegin",
+        `<div class="notice">已手动平仓 ${closedCount} 个纸面仓位${failedCount ? `，${failedCount} 个失败并保持未平仓` : ""}。</div>`
+      );
+    } catch (error) {
+      showError(error);
+    } finally {
+      state.closeAllPositionsSubmitting = false;
+      renderAccount();
+    }
+  });
   $("#summaryButton")?.addEventListener("click", async () => {
     window.location.href = "/summary.html";
   });
@@ -2086,9 +2181,22 @@ window.addEventListener("resize", () => {
   }
 });
 loadData().catch(showError);
-const refreshIntervalMs = location.pathname === "/messages.html"
-  ? 30_000
-  : ["/", "/index.html"].includes(location.pathname)
-    ? 2_000
-    : 10_000;
-setInterval(() => loadData().catch(showError), refreshIntervalMs);
+const pagePath = location.pathname;
+if (pagePath === "/logs.html") {
+  setInterval(() => refreshLog().catch(showError), 1_000);
+  setInterval(() => refreshLogStatus().catch(showError), 5_000);
+} else {
+  const refreshIntervalMs = pagePath === "/messages.html"
+    ? 15_000
+    : ["/", "/index.html"].includes(pagePath)
+      ? 1_000
+      : 3_000;
+  setInterval(() => {
+    if (!document.hidden) loadData().catch(showError);
+  }, refreshIntervalMs);
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  const refresh = pagePath === "/logs.html" ? refreshLog : loadData;
+  refresh().catch(showError);
+});

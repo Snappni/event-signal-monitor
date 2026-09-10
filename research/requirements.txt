@@ -1,0 +1,9 @@
+pyqlib==0.9.7
+alphalens-reloaded==0.4.5
+arch==8.0.0
+statsmodels>=0.14,<0.16
+numpy>=1.26,<2
+pandas>=2.2,<3
+scikit-learn>=1.5,<1.8
+pysr==2.2.1
+filelock>=3.16,<4

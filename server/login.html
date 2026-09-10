@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>事件信号观察 · 安全登录</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #080c11;
+        --surface: #10161e;
+        --surface-2: #171f2a;
+        --line: #263342;
+        --text: #edf2f7;
+        --muted: #8d9caf;
+        --accent: #44d3a5;
+        --accent-2: #5ea7ff;
+        --danger: #ff7a86;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body {
+        min-height: 100vh;
+        margin: 0;
+        overflow-x: hidden;
+        background:
+          radial-gradient(circle at 18% 16%, rgba(68, 211, 165, 0.12), transparent 34rem),
+          radial-gradient(circle at 86% 84%, rgba(94, 167, 255, 0.12), transparent 30rem),
+          var(--bg);
+        color: var(--text);
+      }
+      body::before {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        content: "";
+        opacity: 0.22;
+        background-image:
+          linear-gradient(rgba(38, 51, 66, 0.45) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(38, 51, 66, 0.45) 1px, transparent 1px);
+        background-size: 48px 48px;
+        mask-image: linear-gradient(to bottom, black, transparent 80%);
+      }
+      .shell {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        min-height: 100vh;
+        place-items: center;
+        padding: 32px 20px;
+      }
+      .login-frame {
+        display: grid;
+        width: min(980px, 100%);
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: rgba(12, 18, 25, 0.94);
+        box-shadow: 0 30px 90px rgba(0, 0, 0, 0.48);
+        grid-template-columns: minmax(0, 1.08fr) minmax(360px, 0.92fr);
+      }
+      .signal-side {
+        position: relative;
+        min-height: 580px;
+        padding: 42px;
+        overflow: hidden;
+        border-right: 1px solid var(--line);
+        background: linear-gradient(145deg, rgba(19, 42, 34, 0.86), rgba(12, 18, 25, 0.96) 58%);
+      }
+      .signal-side::after {
+        position: absolute;
+        right: -90px;
+        bottom: -100px;
+        width: 340px;
+        height: 340px;
+        border: 1px solid rgba(68, 211, 165, 0.16);
+        border-radius: 50%;
+        content: "";
+        box-shadow: 0 0 0 46px rgba(68, 211, 165, 0.035), 0 0 0 92px rgba(68, 211, 165, 0.025);
+      }
+      .brand { display: flex; align-items: center; gap: 13px; }
+      .brand-mark {
+        display: grid;
+        width: 42px;
+        height: 42px;
+        place-items: center;
+        border: 1px solid #2b856c;
+        border-radius: 9px;
+        background: #10261f;
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 850;
+      }
+      .eyebrow { color: #6f8195; font-size: 11px; font-weight: 800; letter-spacing: 0.12em; }
+      .brand strong { display: block; margin-top: 3px; font-size: 16px; }
+      .hero-copy { max-width: 470px; margin-top: 96px; }
+      h1 { margin: 0; font-size: clamp(34px, 5vw, 54px); line-height: 1.04; letter-spacing: -0.045em; }
+      .hero-copy p { max-width: 420px; margin: 22px 0 0; color: var(--muted); font-size: 15px; line-height: 1.75; }
+      .pulse-line { width: 100%; height: 76px; margin: 38px 0 22px; }
+      .pulse-line path { fill: none; stroke: url(#pulseGradient); stroke-linecap: round; stroke-width: 2.4; }
+      .metric-row { display: flex; position: relative; z-index: 1; gap: 10px; flex-wrap: wrap; }
+      .metric {
+        min-width: 118px;
+        padding: 11px 13px;
+        border: 1px solid rgba(82, 101, 122, 0.6);
+        border-radius: 9px;
+        background: rgba(8, 12, 17, 0.5);
+      }
+      .metric span { display: block; color: #728398; font-size: 10px; letter-spacing: 0.08em; }
+      .metric strong { display: block; margin-top: 5px; color: #dce8f4; font-size: 13px; }
+      .form-side { display: flex; min-height: 580px; align-items: center; padding: 46px; }
+      .form-wrap { width: 100%; }
+      .secure-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        padding: 6px 9px;
+        border: 1px solid #285f50;
+        border-radius: 999px;
+        background: #10261f;
+        color: #7be8c4;
+        font-size: 11px;
+        font-weight: 750;
+      }
+      .secure-badge::before { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); content: ""; box-shadow: 0 0 12px var(--accent); }
+      h2 { margin: 22px 0 7px; font-size: 27px; letter-spacing: -0.03em; }
+      .form-intro { margin: 0 0 28px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+      .field { display: block; margin-top: 17px; }
+      .field-label { display: flex; justify-content: space-between; margin-bottom: 8px; color: #cbd6e2; font-size: 12px; font-weight: 720; }
+      .input-wrap { position: relative; }
+      input[type="text"], input[type="password"] {
+        width: 100%;
+        height: 48px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        outline: none;
+        background: #0c1219;
+        color: var(--text);
+        padding: 0 44px 0 14px;
+        font: inherit;
+        transition: border-color 150ms ease, box-shadow 150ms ease, background 150ms ease;
+      }
+      input:hover { border-color: #3d5065; }
+      input:focus { border-color: #2aa77f; background: #0e171d; box-shadow: 0 0 0 3px rgba(68, 211, 165, 0.12); }
+      .field-icon { position: absolute; top: 50%; right: 14px; color: #627489; font-size: 15px; transform: translateY(-50%); }
+      .remember-row { display: flex; align-items: flex-start; gap: 9px; margin: 18px 0 0; color: #c4d0dc; font-size: 12px; cursor: pointer; }
+      .remember-row input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--accent); }
+      .remember-row small { display: block; margin-top: 3px; color: #74859a; line-height: 1.45; }
+      .submit {
+        width: 100%;
+        height: 48px;
+        margin-top: 22px;
+        border: 1px solid #2aa77f;
+        border-radius: 9px;
+        background: #1d785f;
+        color: #f2fff9;
+        font: inherit;
+        font-weight: 780;
+        cursor: pointer;
+        transition: transform 120ms ease, background 150ms ease, border-color 150ms ease;
+      }
+      .submit:hover { border-color: #44d3a5; background: #228a6c; transform: translateY(-1px); }
+      .submit:disabled { cursor: wait; opacity: 0.7; transform: none; }
+      .message { min-height: 20px; margin: 13px 0 0; color: var(--danger); font-size: 12px; line-height: 1.5; }
+      .security-note { display: flex; gap: 8px; margin-top: 20px; color: #687b90; font-size: 11px; line-height: 1.55; }
+      .security-note span { color: #78a7d8; }
+      @media (max-width: 780px) {
+        .login-frame { grid-template-columns: 1fr; }
+        .signal-side { display: none; }
+        .form-side { min-height: auto; padding: 38px 26px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="login-frame" aria-labelledby="loginTitle">
+        <aside class="signal-side" aria-hidden="true">
+          <div class="brand">
+            <span class="brand-mark">ESM</span>
+            <div><span class="eyebrow">EVENT SIGNAL MONITOR</span><strong>事件信号观察</strong></div>
+          </div>
+          <div class="hero-copy">
+            <h1>让每一次判断<br />都有迹可循。</h1>
+            <p>统一观察事件、市场状态与多因子决策链路。受保护的控制台入口只向已验证会话开放。</p>
+            <svg class="pulse-line" viewBox="0 0 480 76" preserveAspectRatio="none">
+              <defs><linearGradient id="pulseGradient"><stop stop-color="#44d3a5"/><stop offset="1" stop-color="#5ea7ff"/></linearGradient></defs>
+              <path d="M2 50 C55 50 68 49 94 50 S139 51 166 50 L184 50 L196 21 L214 65 L230 42 L246 50 C286 50 302 49 332 50 S387 51 478 50" />
+            </svg>
+            <div class="metric-row">
+              <div class="metric"><span>ACCESS</span><strong>单用户认证</strong></div>
+              <div class="metric"><span>SESSION</span><strong>服务端校验</strong></div>
+              <div class="metric"><span>ROUTE</span><strong>全路径保护</strong></div>
+            </div>
+          </div>
+        </aside>
+        <div class="form-side">
+          <div class="form-wrap">
+            <span class="secure-badge">受保护入口</span>
+            <h2 id="loginTitle">登录控制台</h2>
+            <p class="form-intro">请输入管理员凭据。验证成功后才能访问页面及接口。</p>
+            <form id="loginForm" novalidate>
+              <label class="field">
+                <span class="field-label">用户名</span>
+                <span class="input-wrap">
+                  <input id="username" name="username" type="text" autocomplete="username" maxlength="128" required autofocus />
+                  <span class="field-icon" aria-hidden="true">◎</span>
+                </span>
+              </label>
+              <label class="field">
+                <span class="field-label"><span>密码</span><span id="capsNotice" hidden>大写锁定已开启</span></span>
+                <span class="input-wrap">
+                  <input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required />
+                  <span class="field-icon" aria-hidden="true">◆</span>
+                </span>
+              </label>
+              <label class="remember-row">
+                <input id="remember" name="remember" type="checkbox" />
+                <span>记住密码<small>只保持当前登录用户的受保护会话，不在网页中保存明文密码。</small></span>
+              </label>
+              <button id="submitButton" class="submit" type="submit">验证并进入</button>
+              <p id="message" class="message" role="alert" aria-live="polite"></p>
+            </form>
+            <p class="security-note"><span>●</span>连续失败会触发临时限制；会话退出或过期后必须重新验证。</p>
+          </div>
+        </div>
+      </section>
+    </main>
+    <script nonce="{{SCRIPT_NONCE}}">
+      const form = document.querySelector("#loginForm");
+      const username = document.querySelector("#username");
+      const password = document.querySelector("#password");
+      const remember = document.querySelector("#remember");
+      const submitButton = document.querySelector("#submitButton");
+      const message = document.querySelector("#message");
+      const capsNotice = document.querySelector("#capsNotice");
+
+      password.addEventListener("keyup", (event) => {
+        capsNotice.hidden = !event.getModifierState("CapsLock");
+      });
+      for (const input of [username, password]) input.addEventListener("input", () => { message.textContent = ""; });
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!form.reportValidity()) return;
+        submitButton.disabled = true;
+        submitButton.textContent = "正在验证…";
+        message.textContent = "";
+        try {
+          const next = new URLSearchParams(window.location.search).get("next") || "/";
+          const response = await fetch("/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username: username.value, password: password.value, remember: remember.checked, next })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            message.textContent = response.status === 429
+              ? `尝试次数过多，请在 ${Math.ceil((result.retryAfter || 60) / 60)} 分钟后重试。`
+              : "用户名或密码不正确。";
+            password.select();
+            return;
+          }
+          password.value = "";
+          window.location.replace(result.next || "/");
+        } catch {
+          message.textContent = "当前无法连接登录服务，请稍后重试。";
+        } finally {
+          submitButton.disabled = false;
+          submitButton.textContent = "验证并进入";
+        }
+      });
+    </script>
+  </body>
+</html>

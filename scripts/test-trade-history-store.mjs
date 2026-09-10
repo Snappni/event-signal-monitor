@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   appendTradeHistoryRecords,
+  compactArchivedTrade,
   deleteTradeHistoryRecords,
   loadTradeHistoryRecords,
   queryTradeHistory,
@@ -13,8 +14,12 @@ import {
 const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "trade-history-store-"));
 const trade = (id, closedAt, realizedPnl) => ({
   id,
+  signalId: `signal-${id}`,
+  candidateId: `candidate-${id}`,
+  candidateReasonCode: "accepted",
   sessionId: "session-test",
   status: "closed",
+  calibrationCohort: "layered-multi-factor-v1",
   symbol: "BTCUSDT",
   side: "long",
   openedAt: new Date(Date.parse(closedAt) - 3_600_000).toISOString(),
@@ -29,7 +34,23 @@ const trade = (id, closedAt, realizedPnl) => ({
   realizedPnl,
   realizedReturnPct: realizedPnl / 100,
   winRate: 0.6,
+  rawEntryScore: 1.2,
+  featureMissingMask: { missing_feature: true },
+  maxFavorableExcursionPct: 0.04,
+  maxAdverseExcursionPct: -0.01,
+  decisionCalculation: {
+    direction: {
+      combinedDirection: 0.7,
+      eventDirection: 0.4,
+      eventWeight: 0.3,
+      mathDirection: 0.8,
+      mathWeight: 0.7
+    },
+    oversized: "x".repeat(100_000)
+  },
   factorSnapshot: { direction: { contributions: { trend: 0.2 } } },
+  exitFactorSnapshot: { rawExitScore: 1.35 },
+  relatedEvents: [{ event_id: "evt-1", occurred_at: "2026-06-30T20:00:00Z", fetched_at: "2026-06-30T20:01:00Z", normalized_hash: "abc", source: "fixture", language: "en", cluster_id: "cluster-1" }],
   holdingObservations: Array.from({ length: 10_000 }, (_, index) => ({ index })),
   calculation: { oversized: "x".repeat(100_000) }
 });
@@ -57,6 +78,19 @@ try {
   assert.equal(firstPage.records[1].exitCounterfactual.status, "evaluated");
   assert.equal(Object.hasOwn(firstPage.records[0], "holdingObservations"), false);
   assert.equal(Object.hasOwn(firstPage.records[0], "calculation"), false);
+  assert.equal(firstPage.records[0].holdingObservationCount, 10_000);
+  assert.equal(firstPage.records[0].decisionCalculation.direction.combinedDirection, 0.7);
+  assert.equal(firstPage.records[0].calibrationCohort, "layered-multi-factor-v1");
+  assert.equal(firstPage.records[0].candidateId, "candidate-trade-c");
+  assert.equal(firstPage.records[0].rawEntryScore, 1.2);
+  assert.equal(firstPage.records[0].rawExitScore, 1.35);
+  assert.equal(firstPage.records[0].featureMissingMask.missing_feature, true);
+  assert.equal(firstPage.records[0].relatedEvents[0].cluster_id, "cluster-1");
+  assert.equal(Object.hasOwn(firstPage.records[0].decisionCalculation, "oversized"), false);
+
+  const compact = compactArchivedTrade(rows[0]);
+  assert.ok(JSON.stringify(compact).length < 10_000, "paper account history row must stay compact");
+  assert.equal(Object.hasOwn(compact, "holdingObservations"), false);
 
   const secondPage = queryTradeHistory(runtimeDir, { page: 2, pageSize: 2 });
   assert.deepEqual(secondPage.records.map((item) => item.id), ["trade-a"]);

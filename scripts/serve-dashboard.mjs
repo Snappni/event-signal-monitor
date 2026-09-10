@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
@@ -21,11 +21,24 @@ import {
 } from "./post-trade-review.mjs";
 import {
   appendTradeHistoryRecords,
+  compactArchivedTrade,
   deleteTradeHistoryRecords,
   loadTradeHistoryRecords,
   queryTradeHistory,
   tradeHistoryStats
 } from "./trade-history-store.mjs";
+import { closePaperPosition } from "./paper-position-settlement.mjs";
+import {
+  createFactorLibraryStatus,
+  normalizeFactorLibraryConfig,
+  normalizeFactorLibraryStatus,
+  publicFactorLibrary,
+  updateFactorLibraryConfig,
+  startFactorResearch,
+  readFactorResearch,
+  manualFactorReadiness
+} from "./factor-library.mjs";
+import { createDashboardAuth } from "./dashboard-auth.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -42,11 +55,25 @@ const WHALE_STATUS_PATH = path.join(RUNTIME_DIR, "whale-alert-status.json");
 const MESSAGE_AGGREGATOR_CONFIG_PATH = path.join(RUNTIME_DIR, "message-aggregator-config.json");
 const MESSAGE_AGGREGATOR_STATUS_PATH = path.join(RUNTIME_DIR, "message-aggregator-status.json");
 const DEMO_POSITION_PREVIEW_PATH = path.join(RUNTIME_DIR, "demo-position-preview.json");
+const FACTOR_LIBRARY_CONFIG_PATH = path.join(RUNTIME_DIR, "factor-library-config.json");
+const FACTOR_LIBRARY_STATUS_PATH = path.join(RUNTIME_DIR, "factor-library-status.json");
+const MONITOR_SUPERVISOR_PID_PATH = path.join(RUNTIME_DIR, "fast-loop.pid");
 const MONITOR_SUPERVISOR_PATH = path.join(__dirname, "supervise-event-signal-service.mjs");
 const ENV_PATH = path.join(ROOT_DIR, ".env");
 const PORT = Number(process.env.SIGNAL_DASHBOARD_PORT || 8788);
 const SERVICE_STALE_SECONDS = Math.max(3, Number(process.env.SIGNAL_SERVICE_STALE_SECONDS || 5));
+const DEFAULT_DECISION_CYCLE_TIMEOUT_MS = 120_000;
+const DECISION_STALL_GRACE_MS = 5_000;
 const AUTO_START_MONITOR_SERVICE = process.env.SIGNAL_DASHBOARD_AUTO_START_SERVICE !== "false";
+const LOCAL_DASHBOARD_AUTO_STOP = process.env.LOCAL_DASHBOARD_AUTO_STOP === "1";
+const LOCAL_DASHBOARD_LEASE_TIMEOUT_MS = Math.max(
+  5_000,
+  Number(process.env.LOCAL_DASHBOARD_LEASE_TIMEOUT_MS || 10_000)
+);
+const LOCAL_DASHBOARD_SHUTDOWN_GRACE_MS = Math.max(
+  3_000,
+  Number(process.env.LOCAL_DASHBOARD_SHUTDOWN_GRACE_MS || 6_000)
+);
 const SERVICE_ENSURE_INTERVAL_MS = Math.max(
   1_000,
   Number(process.env.SIGNAL_SERVICE_ENSURE_INTERVAL_MS || 5_000)
@@ -70,18 +97,46 @@ const translationCache = new Map(
   )
 );
 const translationRequests = new Map();
+const localDashboardClients = new Map();
+let localDashboardClientSeen = false;
+let localDashboardLastActiveAt = Date.now();
+let localDashboardShuttingDown = false;
 
 const CONTENT_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
   ".txt": "text/plain; charset=utf-8"
 };
+const dashboardAuth = createDashboardAuth({
+  env: process.env,
+  loginHtmlPath: path.join(ROOT_DIR, "server", "login.html"),
+  sessionFilePath: path.join(RUNTIME_DIR, "dashboard-auth-sessions.json"),
+  logger: console
+});
 
 function readJson(filePath, fallback = null) {
   try {
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+const reportCache = new Map();
+
+function readCachedReport(filePath, fallback = null) {
+  try {
+    const stat = fs.statSync(filePath);
+    const cached = reportCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.bytes === stat.size) {
+      return cached.value;
+    }
+    const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    reportCache.set(filePath, { mtimeMs: stat.mtimeMs, bytes: stat.size, value });
+    return value;
   } catch {
     return fallback;
   }
@@ -509,6 +564,7 @@ function createPaperAccount(config, now = new Date().toISOString()) {
     availableEquity: normalized.initialCapital,
     positions: {},
     tradeHistory: [],
+    tradeHistorySchemaVersion: 2,
     lifetimeClosedTrades: 0,
     lifetimeWinningTrades: 0,
     postTradeReviewConfig: normalizePostTradeReviewConfig(),
@@ -572,6 +628,10 @@ function readAccountBundle() {
         position.riskProfile === "aggressive" ? "aggressive" : config.riskProfile;
     }
     account.tradeHistory = Array.isArray(account.tradeHistory) ? account.tradeHistory : [];
+    if (safeNumber(account.tradeHistorySchemaVersion) !== 2) {
+      account.tradeHistory = account.tradeHistory.map((trade) => compactArchivedTrade(trade));
+      account.tradeHistorySchemaVersion = 2;
+    }
     account.lifetimeClosedTrades = Math.max(
       account.tradeHistory.length,
       Math.round(safeNumber(account.lifetimeClosedTrades, account.tradeHistory.length))
@@ -597,15 +657,90 @@ function readAccountBundle() {
   return { config, account };
 }
 
-async function readRequestJson(request) {
+async function readRequestJson(request, maxBytes = 1_000_000) {
   const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
+  let bytes = 0;
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > maxBytes) throw new Error("Request body is too large.");
+    chunks.push(chunk);
+  }
   if (!chunks.length) return {};
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function localDashboardLifecycleStatus() {
+  const now = Date.now();
+  for (const [clientId, lastSeenAt] of localDashboardClients) {
+    if (now - lastSeenAt > LOCAL_DASHBOARD_LEASE_TIMEOUT_MS) localDashboardClients.delete(clientId);
+  }
+  return {
+    enabled: LOCAL_DASHBOARD_AUTO_STOP,
+    activeClients: localDashboardClients.size,
+    clientSeen: localDashboardClientSeen,
+    leaseTimeoutMs: LOCAL_DASHBOARD_LEASE_TIMEOUT_MS,
+    shutdownGraceMs: LOCAL_DASHBOARD_SHUTDOWN_GRACE_MS,
+    shuttingDown: localDashboardShuttingDown
+  };
+}
+
+function stopMonitorSupervisor() {
+  let supervisorPid = null;
+  try {
+    supervisorPid = Number(fs.readFileSync(MONITOR_SUPERVISOR_PID_PATH, "utf8").trim());
+  } catch {
+    // The monitor was not started.
+  }
+  if (Number.isInteger(supervisorPid) && supervisorPid > 0 && isProcessRunning(supervisorPid)) {
+    if (process.platform === "win32") {
+      spawnSync("taskkill.exe", ["/PID", String(supervisorPid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+        timeout: 10_000
+      });
+    } else {
+      process.kill(supervisorPid, "SIGTERM");
+    }
+  }
+  try {
+    fs.rmSync(MONITOR_SUPERVISOR_PID_PATH, { force: true });
+  } catch {
+    // A concurrent supervisor shutdown may already have removed it.
+  }
+  const serviceStatus = readJson(path.join(RUNTIME_DIR, "service-status.json"), {});
+  if (!isProcessRunning(Number(serviceStatus?.pid))) {
+    try {
+      fs.rmSync(path.join(RUNTIME_DIR, "service.lock"), { force: true });
+    } catch {
+      // The service may already have cleaned up its lock.
+    }
+  }
+}
+
+function requestLocalDashboardShutdown(reason) {
+  if (!LOCAL_DASHBOARD_AUTO_STOP || localDashboardShuttingDown) return;
+  localDashboardShuttingDown = true;
+  console.log(`Local dashboard auto-stop: ${reason}`);
+  stopMonitorSupervisor();
+  server.close(() => {
+    process.exitCode = 0;
+  });
+  setTimeout(() => process.exit(0), 5_000).unref();
+}
+
+function checkLocalDashboardLeases() {
+  if (!LOCAL_DASHBOARD_AUTO_STOP || !localDashboardClientSeen || localDashboardShuttingDown) return;
+  const status = localDashboardLifecycleStatus();
+  if (
+    status.activeClients === 0 &&
+    Date.now() - localDashboardLastActiveAt >= LOCAL_DASHBOARD_SHUTDOWN_GRACE_MS
+  ) {
+    requestLocalDashboardShutdown("all browser pages closed");
+  }
 }
 
 function isProcessRunning(pid) {
@@ -680,18 +815,37 @@ function reportPath(layer) {
   return path.join(RUNTIME_DIR, "latest-report.json");
 }
 
-function readTail(filePath, maxBytes = 80_000) {
+function readLogChunk(filePath, cursor = null, maxBytes = 80_000) {
+  let fd = null;
   try {
-    const stat = fs.statSync(filePath);
-    const start = Math.max(0, stat.size - maxBytes);
+    fd = fs.openSync(filePath, "r");
+    const stat = fs.fstatSync(fd);
+    const parsedCursor = Number(cursor);
+    const hasCursor = cursor !== null && cursor !== "" && Number.isInteger(parsedCursor) && parsedCursor >= 0;
+    let start = hasCursor ? parsedCursor : Math.max(0, stat.size - maxBytes);
+    let reset = !hasCursor;
+    if (start > stat.size || stat.size - start > maxBytes) {
+      start = Math.max(0, stat.size - maxBytes);
+      reset = true;
+    }
     const length = stat.size - start;
-    const fd = fs.openSync(filePath, "r");
-    const buffer = Buffer.alloc(length);
-    fs.readSync(fd, buffer, 0, length, start);
-    fs.closeSync(fd);
-    return buffer.toString("utf8");
+    let buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, start);
+    buffer = buffer.subarray(0, bytesRead);
+    let text = buffer.toString("utf8");
+    if (reset && start > 0) {
+      const firstLineEnd = text.indexOf("\n");
+      if (firstLineEnd >= 0) text = text.slice(firstLineEnd + 1);
+    }
+    return { text, cursor: stat.size, reset };
   } catch {
-    return "";
+    return { text: "", cursor: 0, reset: true };
+  } finally {
+    try {
+      if (fd !== null) fs.closeSync(fd);
+    } catch {
+      // A failed close must not break the log viewer.
+    }
   }
 }
 
@@ -712,26 +866,79 @@ function loopStatus(latestReportOverride = null) {
   const serviceHeartbeatMs = Date.parse(service?.heartbeatAt || "");
   const serviceAgeMs = Number.isFinite(serviceHeartbeatMs) ? Math.max(0, Date.now() - serviceHeartbeatMs) : null;
   const serviceFresh = serviceAgeMs !== null && serviceAgeMs <= SERVICE_STALE_SECONDS * 1_000;
-  const latestReport = latestReportOverride || readJson(path.join(RUNTIME_DIR, "latest-report.json"), null);
+  const latestReport = latestReportOverride || readCachedReport(path.join(RUNTIME_DIR, "latest-report.json"), null);
   const reportGeneratedAt = latestReport?.generatedAt || null;
   const reportTimestamp = Date.parse(reportGeneratedAt || "");
   const reportAgeMs = Number.isFinite(reportTimestamp) ? Math.max(0, Date.now() - reportTimestamp) : null;
+  const processRunning = pidRunning || serviceFresh;
+  const decisionTimeoutMs = Math.max(
+    1_000,
+    service?.decisionCycleTimeoutMs == null
+      ? DEFAULT_DECISION_CYCLE_TIMEOUT_MS
+      : safeNumber(service.decisionCycleTimeoutMs, DEFAULT_DECISION_CYCLE_TIMEOUT_MS)
+  );
+  const decisionStartedMs = Date.parse(service?.lastDecisionStartedAt || "");
+  const decisionCompletedMs = Date.parse(service?.lastDecisionCompletedAt || "");
+  const decisionStageMs = Date.parse(service?.decisionStageAt || "");
+  const decisionInFlight = Number.isFinite(decisionStartedMs) &&
+    (!Number.isFinite(decisionCompletedMs) || decisionStartedMs > decisionCompletedMs);
+  const decisionAgeMs = decisionInFlight ? Math.max(0, Date.now() - decisionStartedMs) : null;
+  const decisionStageAgeMs = Number.isFinite(decisionStageMs)
+    ? Math.max(0, Date.now() - decisionStageMs)
+    : null;
+  const decisionStalled = processRunning && (
+    service?.decisionHealth === "timed_out" ||
+    (decisionAgeMs !== null && decisionAgeMs > decisionTimeoutMs + DECISION_STALL_GRACE_MS)
+  );
+  const decisionHealthy = processRunning && !decisionStalled;
   return {
     generatedAt: new Date().toISOString(),
     loopMode: service?.mode || "event-driven-hybrid",
     loopPid: fastPid || null,
     servicePid: service?.pid || null,
-    loopRunning: pidRunning || serviceFresh,
-    loopBackend: serviceFresh ? "service-heartbeat" : pidRunning ? "process-pid" : "none",
+    processRunning,
+    loopRunning: decisionHealthy,
+    loopBackend: decisionStalled
+      ? "decision-stalled"
+      : serviceFresh
+        ? "service-heartbeat"
+        : pidRunning
+          ? "process-pid"
+          : "none",
     loopIntervalSeconds: null,
     decisionBackend: service?.decisionBackend || "adaptive-sequential-rest",
     priceBackend: service?.priceBackend || "binance-bookTicker-websocket",
+    orderFlowBackend: service?.orderFlowBackend || "binance-aggTrade-depth5-websocket",
     priceConnected: service?.priceConnected === true,
+    orderFlowConnected: service?.orderFlowConnected === true,
+    orderFlowDepthConnected: service?.orderFlowDepthConnected === true,
+    orderFlowTradeConnected: service?.orderFlowTradeConnected === true,
     subscribedSymbols: Array.isArray(service?.subscribedSymbols) ? service.subscribedSymbols : [],
+    orderFlowSymbols: Array.isArray(service?.orderFlowSymbols) ? service.orderFlowSymbols : [],
     lastPriceEventAt: service?.lastPriceEventAt || null,
+    lastOrderFlowEventAt: service?.lastOrderFlowEventAt || null,
     lastProtectionAt: service?.lastProtectionAt || null,
     nextDecisionAt: service?.nextDecisionAt || null,
     decisionCycles: safeNumber(service?.decisionCycles),
+    decisionTimeouts: safeNumber(service?.decisionTimeouts),
+    decisionHealth: service?.decisionHealth || (decisionHealthy ? "healthy" : "unavailable"),
+    decisionHealthy,
+    decisionStalled,
+    decisionInFlight,
+    decisionStage: service?.decisionStage || null,
+    decisionStageAt: service?.decisionStageAt || null,
+    decisionStageAgeSeconds: decisionStageAgeMs === null ? null : Math.round(decisionStageAgeMs / 1_000),
+    factorHistoryWorkerPid: service?.factorHistoryWorkerPid == null
+      ? null
+      : safeNumber(service.factorHistoryWorkerPid, null),
+    factorHistoryWorkerRunning: service?.factorHistoryWorkerRunning === true,
+    decisionCycleTimeoutSeconds: Math.round(decisionTimeoutMs / 1_000),
+    lastDecisionStartedAt: service?.lastDecisionStartedAt || null,
+    lastDecisionCompletedAt: service?.lastDecisionCompletedAt || null,
+    lastDecisionTimedOutAt: service?.lastDecisionTimedOutAt || null,
+    lastDecisionDurationMs: service?.lastDecisionDurationMs == null
+      ? null
+      : safeNumber(service.lastDecisionDurationMs, null),
     protectionCycles: safeNumber(service?.protectionCycles),
     protectionActions: safeNumber(service?.protectionActions),
     consecutiveDecisionFailures: safeNumber(service?.consecutiveDecisionFailures),
@@ -740,6 +947,7 @@ function loopStatus(latestReportOverride = null) {
     loopLastReportAt: reportGeneratedAt,
     loopReportAgeSeconds: reportAgeMs === null ? null : Math.round(reportAgeMs / 1000),
     loopStaleAfterSeconds: SERVICE_STALE_SECONDS,
+    decisionStaleAfterSeconds: Math.round((decisionTimeoutMs + DECISION_STALL_GRACE_MS) / 1_000),
     runtimeDir: RUNTIME_DIR
   };
 }
@@ -747,7 +955,7 @@ function loopStatus(latestReportOverride = null) {
 let supervisorLaunchPending = false;
 
 function ensureMonitorSupervisor() {
-  if (!AUTO_START_MONITOR_SERVICE || supervisorLaunchPending || loopStatus().loopRunning) return;
+  if (!AUTO_START_MONITOR_SERVICE || supervisorLaunchPending || loopStatus().processRunning) return;
   supervisorLaunchPending = true;
   const supervisor = spawn(process.execPath, [MONITOR_SUPERVISOR_PATH], {
     cwd: ROOT_DIR,
@@ -779,6 +987,7 @@ function reportHeader(report) {
     generatedAt: report?.generatedAt || null,
     mode: report?.mode || "paper-alert-only",
     layer: report?.layer || "event-driven-hybrid",
+    marketSession: report?.marketSession || null,
     binanceTradingRules: report?.binanceTradingRules || null,
     sourceCounts: report?.sourceCounts || {},
     messageFeedStats: {
@@ -895,7 +1104,7 @@ function compactAccountForDashboard(account) {
 }
 
 function pageData(view) {
-  const report = readJson(reportPath("latest"), null);
+  const report = readCachedReport(reportPath("latest"), null);
   if (!report) return null;
   const header = reportHeader(report);
   if (view === "signals") {
@@ -933,7 +1142,7 @@ function pageData(view) {
     return {
       report: header,
       status: loopStatus(report),
-      log: { text: readTail(path.join(RUNTIME_DIR, "fast-loop.log"), 80_000) }
+      log: readLogChunk(path.join(RUNTIME_DIR, "fast-loop.log"), null, 80_000)
     };
   }
   const { config, account } = readAccountBundle();
@@ -991,6 +1200,8 @@ function publicPostTradeReview(account, archive = tradeHistoryStats(RUNTIME_DIR)
     review: {
       version: review.version,
       sessionId: review.sessionId,
+      directionMode: review.directionMode,
+      exitMode: review.exitMode,
       completedReviews: safeNumber(review.completedReviews),
       reviewedTradeCount: safeNumber(review.reviewedTradeCount),
       weightVersion: safeNumber(review.weightVersion),
@@ -1031,10 +1242,81 @@ function runDashboardArchivedReview(account, now = new Date().toISOString()) {
   };
 }
 
-function sendStatic(response, requestPath) {
+function closeAllPaperPositions(account, now = new Date().toISOString()) {
+  const closed = [];
+  const failed = [];
+  for (const [positionId, position] of Object.entries(account.positions || {})) {
+    const referencePrice = safeNumber(position.currentPrice, safeNumber(position.entry));
+    if (!(referencePrice > 0)) {
+      failed.push({ id: positionId, symbol: position.symbol || positionId, reason: "INVALID_PRICE" });
+      continue;
+    }
+    const item = closePaperPosition(account, positionId, referencePrice, "MANUAL_CLOSE_ALL", now);
+    if (item) closed.push(item);
+    else failed.push({ id: positionId, symbol: position.symbol || positionId, reason: "SETTLEMENT_FAILED" });
+  }
+  if (!closed.length) return { closed, failed };
+
+  const remaining = Object.values(account.positions || {});
+  account.unrealizedPnl = remaining.reduce((sum, position) => sum + safeNumber(position.unrealizedPnl), 0);
+  account.marginUsed = remaining.reduce((sum, position) => sum + safeNumber(position.marginRequired), 0);
+  account.equity = safeNumber(account.startingCapital) + safeNumber(account.realizedPnl) + account.unrealizedPnl;
+  account.availableEquity = Math.max(0, account.equity - account.marginUsed);
+  account.updatedAt = now;
+  const equityPoint = {
+    time: now,
+    equity: account.equity,
+    returnPct: account.startingCapital > 0 ? account.equity / account.startingCapital - 1 : 0,
+    realizedPnl: safeNumber(account.realizedPnl),
+    unrealizedPnl: account.unrealizedPnl
+  };
+  account.equityCurve = [...(account.equityCurve || []), equityPoint].slice(-5_000);
+  const closedTrades = Math.max(safeNumber(account.lifetimeClosedTrades), (account.tradeHistory || []).length);
+  const wins = Math.min(closedTrades, safeNumber(account.lifetimeWinningTrades));
+  account.summary = {
+    ...(account.summary || {}),
+    endTime: now,
+    latestEquity: account.equity,
+    finalReturnPct: equityPoint.returnPct,
+    closedTrades,
+    wins,
+    losses: closedTrades - wins,
+    winRate: closedTrades ? wins / closedTrades : 0,
+    openPositions: remaining.length,
+    realizedPnl: safeNumber(account.realizedPnl),
+    unrealizedPnl: account.unrealizedPnl,
+    tradingFees: safeNumber(account.tradingFees),
+    slippageCost: safeNumber(account.slippageCost),
+    fundingPnl: safeNumber(account.fundingPnl),
+    marginUsed: account.marginUsed,
+    availableEquity: account.availableEquity
+  };
+  account.lastRun = {
+    generatedAt: now,
+    openedPositions: [],
+    closedPositions: closed,
+    manualCloseAll: true
+  };
+  const { result: reviewResult } = runDashboardArchivedReview(account, now);
+  account.lastRun.postTradeReview = reviewResult.review;
+  return { closed, failed };
+}
+
+function sendStatic(response, requestPath, method = "GET") {
+  if (!["GET", "HEAD"].includes(method)) {
+    response.writeHead(405, { Allow: "GET, HEAD" });
+    response.end("Method not allowed");
+    return;
+  }
   const relativePath = requestPath === "/" ? "index.html" : requestPath.replace(/^\/+/, "");
   const filePath = path.resolve(PUBLIC_DIR, relativePath);
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  const publicRelative = path.relative(PUBLIC_DIR, filePath);
+  if (
+    !relativePath ||
+    publicRelative.startsWith("..") ||
+    path.isAbsolute(publicRelative) ||
+    publicRelative.split(path.sep).some((segment) => segment.startsWith("."))
+  ) {
     response.writeHead(403);
     response.end("Forbidden");
     return;
@@ -1045,20 +1327,108 @@ function sendStatic(response, requestPath) {
       response.end("Not found");
       return;
     }
+    let responseData = data;
+    if (LOCAL_DASHBOARD_AUTO_STOP && path.extname(filePath) === ".html") {
+      responseData = Buffer.from(
+        data.toString("utf8").replace(
+          "</body>",
+          '  <script src="/local-dashboard-lifecycle.js" type="module"></script>\n  </body>'
+        ),
+        "utf8"
+      );
+    }
     response.writeHead(200, {
       "Content-Type": CONTENT_TYPES[path.extname(filePath)] || "application/octet-stream",
       "Cache-Control": "no-store"
     });
-    response.end(data);
+    response.end(method === "HEAD" ? undefined : responseData);
   });
 }
 
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+  dashboardAuth.applySecurityHeaders(request, response);
+  if (await dashboardAuth.handlePublic(request, response, url)) return;
+  if (!dashboardAuth.authorize(request, response, url)) return;
+  if (url.pathname === "/api/local-dashboard/heartbeat" && request.method === "POST") {
+    try {
+      const body = await readRequestJson(request);
+      const clientId = String(body.clientId || "").slice(0, 128);
+      if (!clientId) throw new Error("clientId is required");
+      if (LOCAL_DASHBOARD_AUTO_STOP) {
+        localDashboardClients.set(clientId, Date.now());
+        localDashboardClientSeen = true;
+        localDashboardLastActiveAt = Date.now();
+      }
+      sendJson(response, localDashboardLifecycleStatus());
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+    return;
+  }
+  if (url.pathname === "/api/local-dashboard/release" && request.method === "POST") {
+    try {
+      const body = await readRequestJson(request);
+      const clientId = String(body.clientId || "").slice(0, 128);
+      if (clientId) localDashboardClients.delete(clientId);
+      localDashboardLastActiveAt = Date.now();
+      sendJson(response, localDashboardLifecycleStatus());
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+    return;
+  }
+  if (url.pathname === "/api/factors" && request.method === "GET") {
+    const status = normalizeFactorLibraryStatus(
+      readJson(FACTOR_LIBRARY_STATUS_PATH, createFactorLibraryStatus())
+    );
+    const config = normalizeFactorLibraryConfig(
+      readJson(FACTOR_LIBRARY_CONFIG_PATH, {}),
+      status.minedFactors
+    );
+    sendJson(response, publicFactorLibrary(config, status));
+    return;
+  }
+  if (url.pathname === "/api/factors/research" && request.method === "GET") {
+    const { worker, userTask, lastRequest, error } = readFactorResearch();
+    sendJson(response, { worker, userTask, lastRequest, error });
+    return;
+  }
+  if (url.pathname === "/api/factors/research" && request.method === "POST") {
+    try {
+      const { action } = await readRequestJson(request);
+      if (!["evaluate", "mine"].includes(action)) throw new Error("unknown_research_action");
+      const config = normalizeFactorLibraryConfig(readJson(FACTOR_LIBRARY_CONFIG_PATH, {}));
+      sendJson(response, startFactorResearch(config, action, { requestedBy: 'user' }));
+    } catch (error) { sendJson(response, { error: error.message }, 400); }
+    return;
+  }
+  if (url.pathname === "/api/factors/config" && request.method === "POST") {
+    try {
+      const patch = await readRequestJson(request);
+      const status = normalizeFactorLibraryStatus(
+        readJson(FACTOR_LIBRARY_STATUS_PATH, createFactorLibraryStatus())
+      );
+      const current = normalizeFactorLibraryConfig(
+        readJson(FACTOR_LIBRARY_CONFIG_PATH, {}),
+        status.minedFactors
+      );
+      const config = updateFactorLibraryConfig(current, patch, status.minedFactors);
+      if (config.enabled && config.decisionMode === 'manual' && !manualFactorReadiness(config).ready) {
+        sendJson(response, { error: '手动模式需方向、市场状态各至少1个因子，风险层至少1个波动率估计因子；均需启用、参与判断且权重大于0，融合权重也须大于0。', readiness: manualFactorReadiness(config) }, 400);
+        return;
+      }
+      writeJson(FACTOR_LIBRARY_CONFIG_PATH, config);
+      sendJson(response, publicFactorLibrary(config, status));
+    } catch (error) {
+      sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+    return;
+  }
   if (url.pathname === "/api/report") {
     const layer = url.searchParams.get("layer") || "latest";
     const filePath = reportPath(layer);
-    const report = readJson(filePath, null);
+    const report = readCachedReport(filePath, null);
     if (!report) {
       sendJson(response, { error: "report_not_found", filePath }, 404);
       return;
@@ -1436,23 +1806,56 @@ const server = http.createServer(async (request, response) => {
     }
     return;
   }
+  if (url.pathname === "/api/account/close-all" && request.method === "POST") {
+    try {
+      const result = await withAccountLock(() => {
+        const { config, account } = readAccountBundle();
+        if (!Object.keys(account.positions || {}).length) {
+          const error = new Error("当前没有可平仓的模拟仓位。");
+          error.code = "NO_OPEN_POSITIONS";
+          throw error;
+        }
+        const settlement = closeAllPaperPositions(account);
+        writeJson(ACCOUNT_STATE_PATH, account);
+        return {
+          config,
+          account,
+          closeResult: {
+            closedCount: settlement.closed.length,
+            failedCount: settlement.failed.length,
+            failed: settlement.failed
+          }
+        };
+      });
+      sendJson(response, result);
+    } catch (error) {
+      sendJson(
+        response,
+        { error: error instanceof Error ? error.message : String(error), errorCode: error?.code || "CLOSE_ALL_FAILED" },
+        error?.code === "NO_OPEN_POSITIONS" ? 409 : 500
+      );
+    }
+    return;
+  }
   if (url.pathname === "/api/account/summary") {
     const { config, account } = readAccountBundle();
     sendJson(response, { config, summary: account.summary || null, account: compactAccountForSummary(account) });
     return;
   }
   if (url.pathname === "/api/log") {
-    const maxBytes = Math.min(Number(url.searchParams.get("bytes") || 80_000), 500_000);
-    sendJson(response, {
-      text: readTail(path.join(RUNTIME_DIR, "fast-loop.log"), maxBytes)
-    });
+    const requestedBytes = Number(url.searchParams.get("bytes") || 80_000);
+    const maxBytes = Math.max(1_024, Math.min(Number.isFinite(requestedBytes) ? requestedBytes : 80_000, 500_000));
+    sendJson(
+      response,
+      readLogChunk(path.join(RUNTIME_DIR, "fast-loop.log"), url.searchParams.get("cursor"), maxBytes)
+    );
     return;
   }
   if (url.pathname === "/api/status") {
-    sendJson(response, loopStatus());
+    sendJson(response, { ...loopStatus(), localDashboardAutoStop: localDashboardLifecycleStatus() });
     return;
   }
-  sendStatic(response, url.pathname);
+  sendStatic(response, url.pathname, request.method);
 });
 
 server.listen(PORT, "127.0.0.1", () => {
@@ -1462,4 +1865,10 @@ server.listen(PORT, "127.0.0.1", () => {
 
 const serviceEnsureTimer = setInterval(ensureMonitorSupervisor, SERVICE_ENSURE_INTERVAL_MS);
 serviceEnsureTimer.unref();
-server.once("close", () => clearInterval(serviceEnsureTimer));
+const localDashboardLeaseTimer = setInterval(checkLocalDashboardLeases, 1_000);
+localDashboardLeaseTimer.unref();
+server.once("close", () => {
+  clearInterval(serviceEnsureTimer);
+  clearInterval(localDashboardLeaseTimer);
+  dashboardAuth.close();
+});

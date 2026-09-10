@@ -137,6 +137,18 @@ export function evaluateAdaptivePositionExit({ position, market, candidate, now,
     capitalEfficiency: 0,
     profitProtection: clamp(safeNumber(position?.dynamicProtection?.profitProtection), 0, 1)
   };
+  const rawSignals = {
+    signalReversal: candidateSide && candidateSide !== currentSide ? Math.abs(safeNumber(candidate?.rawCombinedDirection, candidate?.combinedDirection)) : 0,
+    netExpectancyDecay: -remainingExpectancyPct / expectancyScale,
+    eventDecay: relatedEvents.length ? 1 - freshestEventWeight : 0,
+    timeDecay: ageMs / (maxHoldingHours * 3_600_000),
+    capitalEfficiency: 0,
+    profitProtection: safeNumber(position?.dynamicProtection?.profitProtection)
+  };
+  const rawExitScore = EXIT_FACTOR_KEYS.reduce(
+    (score, key) => score + rawSignals[key] * currentWeights[key],
+    0
+  );
   const exitScore = EXIT_FACTOR_KEYS.reduce(
     (score, key) => score + signals[key] * currentWeights[key],
     0
@@ -166,12 +178,14 @@ export function evaluateAdaptivePositionExit({ position, market, candidate, now,
       : 0.25
     : 0;
   return {
-    version: 4,
+    version: 5,
     evaluatedAt: nowIso,
     policyStartedAt,
     signals,
+    rawSignals,
     weights: currentWeights,
     exitScore,
+    rawExitScore,
     threshold,
     recommendsExit,
     recommendsDeRisk,

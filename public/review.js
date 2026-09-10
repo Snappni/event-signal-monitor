@@ -1,4 +1,5 @@
 import "./beijing-clock.js";
+import "./navigation.js";
 
 const $ = (selector) => document.querySelector(selector);
 let loading = false;
@@ -11,7 +12,7 @@ let historyPage = 1;
 let historyData = null;
 const selectedHistoryIds = new Set();
 
-const labels = { eventImpact: "事件影响", trend: "15分钟趋势", higherTimeframeTrend: "1小时趋势", momentum: "动量", rsi: "RSI反转", funding: "资金费率", openInterest: "未平仓量", geometricBrownianMotion: "GBM方向", hiddenMarkovModel: "HMM状态", signalReversal: "信号反转", netExpectancyDecay: "净EV失效", eventDecay: "事件衰减", timeDecay: "自适应时间衰减", capitalEfficiency: "资金效率", profitProtection: "盈利保护" };
+const labels = { eventImpact: "事件影响", trend: "15分钟趋势", higherTimeframeTrend: "1小时趋势", momentum: "动量", rsi: "RSI反转", volume: "成交量确认", funding: "资金费率", openInterest: "未平仓量", orderFlow: "订单流", geometricBrownianMotion: "GBM方向", hiddenMarkovModel: "HMM状态", signalReversal: "信号反转", netExpectancyDecay: "净EV失效", eventDecay: "事件衰减", timeDecay: "自适应时间衰减", capitalEfficiency: "资金效率", profitProtection: "盈利保护" };
 const list = (value) => Array.isArray(value) ? value : [];
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const pct = (value, digits = 2) => `${(number(value) * 100).toFixed(digits)}%`;
@@ -66,8 +67,9 @@ async function request(url, options) {
 
 function promotionBlockerText(latest, config) {
   if (!latest) return "尚未触发复盘。";
-  if (latest.applied) return "候选权重已应用到模拟账户。";
-  if (latest.promotionEligible) return "候选权重已通过后段样本验证，可以应用。";
+  if (latest.applied) return "退出候选权重已应用到模拟账户；方向权重保持只读。";
+  if (latest.exitPromotionEligible) return "退出候选已通过后段样本验证，可以应用；方向候选仍只作为证据。";
+  if (latest.directionEvidenceValidated) return "方向候选已通过证据验证，但不会写入决策；因子库继续独占方向治理。退出候选尚未通过。";
   const validation = latest.validation || {};
   const messages = {
     minimum_proposal_trades: `可归因样本未达到生成候选所需的 ${number(config.minimumProposalTrades) || 20} 笔`,
@@ -89,7 +91,7 @@ function promotionBlockerText(latest, config) {
     }
   }
   const blockers = blockerCodes.map((code) => messages[code] || code);
-  return blockers.length ? `本轮不迭代：${blockers.join("；")}。` : "本轮候选未满足晋升条件，继续影子观察。";
+  return blockers.length ? `方向证据尚未通过：${blockers.join("；")}。方向权重保持固定；退出层继续独立验证。` : "方向只读、退出可晋升；本轮继续影子观察。";
 }
 
 function render(data, { syncForm = !formDirty, statusText = null } = {}) {
@@ -107,23 +109,23 @@ function render(data, { syncForm = !formDirty, statusText = null } = {}) {
 
   if (syncForm) {
     $("#reviewEveryTrades").value = interval;
-    $("#reviewAutoApply").checked = config.autoApplyValidatedWeights === true;
+    $("#reviewAutoApply").checked = config.autoApplyValidatedExitWeights === true;
   }
-  $("#reviewStatus").textContent = statusText || activeStatusNotice() || (latest?.promotionEligible ? "候选已通过验证" : latest ? "影子观察中" : `再完成 ${remaining} 笔触发`);
-  $("#reviewStatus").className = `review-status ${latest?.promotionEligible ? "ready" : latest ? "warn" : ""}`;
+  $("#reviewStatus").textContent = statusText || activeStatusNotice() || (latest?.exitPromotionEligible ? "退出候选已通过验证" : latest ? "影子观察中" : `再完成 ${remaining} 笔触发`);
+  $("#reviewStatus").className = `review-status ${latest?.exitPromotionEligible ? "ready" : latest ? "warn" : ""}`;
   $("#reviewDecision").textContent = promotionBlockerText(latest, config);
   $("#reviewForm button[type='submit']").disabled = loading;
   $("#refreshReview").disabled = loading;
-  $("#applyCandidate").disabled = loading || !latest?.promotionEligible || latest?.applied;
+  $("#applyCandidate").disabled = loading || !latest?.exitPromotionEligible || latest?.applied;
   $("#rollbackWeights").disabled =
-    loading || (!reviewState.previousDirectionWeights && !reviewState.previousExitWeights);
-  $("#reviewOverview").innerHTML = [card("累计已平仓", `${closed} 笔`), card("已处理样本", `${reviewed} 笔`), card("方向 / 退出权重", `v${number(reviewState.weightVersion) || 1} / v${number(reviewState.exitWeightVersion) || 1}`), card("最新状态", latest?.status || "暂无复盘")].join("");
+    loading || !reviewState.previousExitWeights;
+  $("#reviewOverview").innerHTML = [card("累计已平仓", `${closed} 笔`), card("已处理样本", `${reviewed} 笔`), card("方向治理", "固定冠军 / 因子库独占"), card("退出权重", `v${number(reviewState.exitWeightVersion) || 1}`), card("最新状态", latest?.status || "暂无复盘")].join("");
   const database = data.historyDatabase || {};
   $("#historyDatabaseButton").textContent = `历史数据库（${number(database.totalRecords)}）`;
 
   const validation = latest?.validation;
   $("#validationMetrics").innerHTML = validation ? [card("训练样本", validation.trainingSamples), card("验证样本", validation.validationSamples), card("原权重准确率", pct(validation.champion?.accuracy, 1)), card("候选准确率", pct(validation.challenger?.accuracy, 1)), card("准确率变化", pct(validation.accuracyDelta, 1)), card("边际变化", number(validation.meanSignedMarginDelta).toFixed(4))].join("") : '<div class="empty">样本不足，尚未形成训练 / 验证结果。</div>';
-  $("#factorRows").innerHTML = list(latest?.factorStatistics).map((item) => `<div class="review-factor-row"><div class="review-factor-name"><strong>${esc(labels[item.factor] || item.factor)}</strong><span>${number(item.activeSamples)}/${number(item.samples)} 笔有效</span></div><div><span class="row-meta">当前</span>${pct(item.currentWeight)}</div><div><span class="row-meta">候选</span>${item.candidateWeight == null ? "-" : pct(item.candidateWeight)}</div><div><span class="row-meta">建议变化</span>${item.candidateWeight == null ? "-" : pct(item.normalizedChangePct)}</div><div><span class="row-meta">方向关联</span>${number(item.directionAssociation).toFixed(3)}</div></div>`).join("") || '<div class="empty">暂无可归因因子统计。</div>';
+  $("#factorRows").innerHTML = list(latest?.factorStatistics).map((item) => `<div class="review-factor-row"><div class="review-factor-name"><strong>${esc(labels[item.factor] || item.factor)}</strong><span>${number(item.activeSamples)}/${number(item.samples)} 笔有效</span></div><div><span class="row-meta">固定冠军</span>${pct(item.currentWeight)}</div><div><span class="row-meta">证据候选</span>${item.candidateWeight == null ? "-" : pct(item.candidateWeight)}</div><div><span class="row-meta">只读差异</span>${item.candidateWeight == null ? "-" : pct(item.normalizedChangePct)}</div><div><span class="row-meta">方向关联</span>${number(item.directionAssociation).toFixed(3)}</div></div>`).join("") || '<div class="empty">暂无可归因因子统计。</div>';
   const exitValidation = latest?.exitValidation;
   $("#exitValidationMetrics").innerHTML = exitValidation ? [card("训练样本", exitValidation.trainingSamples), card("验证样本", exitValidation.validationSamples), card("原权重准确率", pct(exitValidation.champion?.accuracy, 1)), card("候选准确率", pct(exitValidation.challenger?.accuracy, 1)), card("边际变化", number(exitValidation.meanSignedMarginDelta).toFixed(4))].join("") : card("延迟反事实样本", `${number(latest?.exitEligibleTrades)} 笔`);
   $("#exitFactorRows").innerHTML = list(latest?.exitFactorStatistics).map((item) => `<div class="review-factor-row"><div class="review-factor-name"><strong>${esc(labels[item.factor] || item.factor)}</strong><span>${number(item.activeSamples)}/${number(item.samples)} 笔有效</span></div><div><span class="row-meta">当前</span>${pct(item.currentWeight)}</div><div><span class="row-meta">候选</span>${item.candidateWeight == null ? "-" : pct(item.candidateWeight)}</div><div><span class="row-meta">建议变化</span>${item.candidateWeight == null ? "-" : pct(item.normalizedChangePct)}</div><div><span class="row-meta">反事实关联</span>${number(item.counterfactualCorrelation).toFixed(3)}</div></div>`).join("") || '<div class="empty">新退出规则尚无完成延迟反事实评估的样本。</div>';
@@ -232,11 +234,11 @@ $("#reviewEveryTrades").addEventListener("input", () => { formDirty = true; });
 $("#reviewAutoApply").addEventListener("change", () => { formDirty = true; });
 $("#reviewForm").addEventListener("submit", (event) => {
   event.preventDefault();
-  const payload = { enabled: true, reviewEveryTrades: number($("#reviewEveryTrades").value), autoApplyValidatedWeights: $("#reviewAutoApply").checked };
-  mutate("/api/post-trade-review/config", payload, `设置已保存：每 ${payload.reviewEveryTrades} 笔复盘，自动应用${payload.autoApplyValidatedWeights ? "已开启" : "已关闭"}`, true);
+  const payload = { enabled: true, reviewEveryTrades: number($("#reviewEveryTrades").value), autoApplyValidatedExitWeights: $("#reviewAutoApply").checked };
+  mutate("/api/post-trade-review/config", payload, `设置已保存：每 ${payload.reviewEveryTrades} 笔复盘，退出自动应用${payload.autoApplyValidatedExitWeights ? "已开启" : "已关闭"}`, true);
 });
-$("#applyCandidate").addEventListener("click", () => mutate("/api/post-trade-review/apply", null, "已应用通过验证的候选权重"));
-$("#rollbackWeights").addEventListener("click", () => mutate("/api/post-trade-review/rollback", null, "已回滚到上一版权重"));
+$("#applyCandidate").addEventListener("click", () => mutate("/api/post-trade-review/apply", null, "已应用通过验证的退出候选权重"));
+$("#rollbackWeights").addEventListener("click", () => mutate("/api/post-trade-review/rollback", null, "已回滚到上一版退出权重"));
 $("#refreshReview").addEventListener("click", loadReview);
 $("#historyDatabaseButton").addEventListener("click", () => {
   historyOpen = !historyOpen;

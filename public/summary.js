@@ -1,4 +1,5 @@
 import "./beijing-clock.js";
+import "./navigation.js";
 
 const $ = (selector) => document.querySelector(selector);
 const summaryCharts = new Map();

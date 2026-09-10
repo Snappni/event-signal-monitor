@@ -1,15 +1,17 @@
 import { alignToStep } from "./binance-trading-rules.mjs";
 
 export const DYNAMIC_PROTECTION_POLICY = Object.freeze({
-  minimumActivationR: 0.4,
+  minimumActivationR: 0.55,
   maximumActivationR: 0.75,
   activationToBreakEvenR: 0.4,
-  firstProtectedStopR: -0.75,
-  minimumBreakEvenR: 0.8,
+  firstProtectedStopR: -0.35,
+  minimumBreakEvenR: 0.9,
   maximumBreakEvenR: 1.1,
-  trendGivebackR: 0.75,
-  rangeGivebackR: 0.5,
-  transitionGivebackR: 0.3,
+  minimumLockedProfitR: 0.35,
+  lockProfitR: 1.5,
+  trendGivebackR: 0.45,
+  rangeGivebackR: 0.55,
+  transitionGivebackR: 0.6,
   takeProfitPartialFraction: 0.5,
   maximumExtensionR: 0.75
 });
@@ -151,9 +153,20 @@ export function evaluateDynamicPositionProtection({
       proposedStopR = DYNAMIC_PROTECTION_POLICY.firstProtectedStopR +
         progress * (costBreakEvenR - DYNAMIC_PROTECTION_POLICY.firstProtectedStopR);
       stage = "tightening";
+    } else if (mfeR < DYNAMIC_PROTECTION_POLICY.lockProfitR) {
+      const progress = clamp(
+        (mfeR - breakEvenR) /
+          Math.max(0.01, DYNAMIC_PROTECTION_POLICY.lockProfitR - breakEvenR),
+        0,
+        1
+      );
+      proposedStopR = costBreakEvenR +
+        progress * (DYNAMIC_PROTECTION_POLICY.minimumLockedProfitR - costBreakEvenR);
+      stage = "break_even";
     } else {
-      proposedStopR = Math.max(costBreakEvenR, mfeR - givebackR);
-      stage = "trailing";
+      proposedStopR = DYNAMIC_PROTECTION_POLICY.minimumLockedProfitR +
+        (mfeR - DYNAMIC_PROTECTION_POLICY.lockProfitR) * givebackR;
+      stage = "profit_lock";
     }
   }
   const nextStopR = Math.max(currentStopR, proposedStopR);

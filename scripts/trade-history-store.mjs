@@ -10,6 +10,12 @@ function safeNumber(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function finiteOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function storeDir(runtimeDir) {
   return path.join(runtimeDir, "trade-history");
 }
@@ -62,12 +68,19 @@ function writeShard(filePath, rows) {
 }
 
 export function compactArchivedTrade(trade) {
+  const direction = trade?.decisionCalculation?.direction;
   return {
     id: trade?.id || null,
     sessionId: trade?.sessionId || null,
+    signalId: trade?.signalId || null,
+    candidateId: trade?.candidateId || trade?.signalId || null,
+    candidateReasonCode: trade?.candidateReasonCode || null,
     status: "closed",
+    calibrationCohort: trade?.calibrationCohort || trade?.factorSnapshot?.calibrationCohort || null,
+    costModelVersion: safeNumber(trade?.costModelVersion, 1),
     symbol: trade?.symbol || null,
     side: trade?.side || null,
+    accountMarketType: trade?.accountMarketType || null,
     candidateMode: trade?.candidateMode || null,
     riskProfile: trade?.riskProfile || null,
     openedAt: trade?.openedAt || null,
@@ -81,35 +94,74 @@ export function compactArchivedTrade(trade) {
     originalStopLoss: safeNumber(trade?.originalStopLoss, safeNumber(trade?.stopLoss)),
     quantity: safeNumber(trade?.quantity),
     leverage: safeNumber(trade?.leverage),
+    modelSuggestedLeverage: safeNumber(trade?.modelSuggestedLeverage),
+    leverageCapped: trade?.leverageCapped === true,
     notional: safeNumber(trade?.notional),
     marginRequired: safeNumber(trade?.marginRequired),
+    initialNotional: safeNumber(trade?.initialNotional, safeNumber(trade?.notional)),
+    initialMarginRequired: safeNumber(trade?.initialMarginRequired, safeNumber(trade?.marginRequired)),
+    initialQuantity: safeNumber(trade?.initialQuantity, safeNumber(trade?.quantity)),
+    maxLossAmount: safeNumber(trade?.maxLossAmount),
+    initialMaxLossAmount: safeNumber(trade?.initialMaxLossAmount, safeNumber(trade?.maxLossAmount)),
     grossTradingPnl: safeNumber(trade?.grossTradingPnl),
     realizedPnl: safeNumber(trade?.realizedPnl),
     realizedReturnPct: safeNumber(trade?.realizedReturnPct),
     entryFee: safeNumber(trade?.entryFee),
     exitFee: safeNumber(trade?.exitFee),
+    feeRate: safeNumber(trade?.feeRate),
     entrySlippageCost: safeNumber(trade?.entrySlippageCost),
     exitSlippageCost: safeNumber(trade?.exitSlippageCost),
+    slippageRate: safeNumber(trade?.slippageRate),
     fundingPnl: safeNumber(trade?.fundingPnl),
+    fundingIntervalHours: safeNumber(trade?.fundingIntervalHours),
     winRate: safeNumber(trade?.winRate),
     adaptiveWinRateThreshold: safeNumber(trade?.adaptiveWinRateThreshold),
     breakEvenWinRate: safeNumber(trade?.breakEvenWinRate),
     expectancyPct: safeNumber(trade?.expectancyPct),
     expectancyR: safeNumber(trade?.expectancyR),
     eventImpactScore: safeNumber(trade?.eventImpactScore),
+    rawEntryScore: finiteOrNull(trade?.rawEntryScore),
+    rawExitScore: finiteOrNull(trade?.exitFactorSnapshot?.rawExitScore ?? trade?.rawExitScore),
+    featureMissingMask: trade?.featureMissingMask || trade?.factorSnapshot?.featureMissingMask || null,
     combinedDirection: safeNumber(trade?.combinedDirection),
     mathSignal: safeNumber(trade?.mathSignal),
     eventDirection: safeNumber(trade?.eventDirection),
     regime: trade?.regime || null,
+    maxFavorableExcursionPct: safeNumber(trade?.maxFavorableExcursionPct),
+    maxAdverseExcursionPct: safeNumber(trade?.maxAdverseExcursionPct),
+    holdingObservationCount: Array.isArray(trade?.holdingObservations)
+      ? trade.holdingObservations.length
+      : safeNumber(trade?.holdingObservationCount),
+    decisionCalculation: direction
+      ? {
+          direction: {
+            combinedDirection: safeNumber(direction.combinedDirection),
+            rawCombinedDirection: finiteOrNull(direction.rawCombinedDirection),
+            eventDirection: safeNumber(direction.eventDirection),
+            eventWeight: safeNumber(direction.eventWeight),
+            mathDirection: safeNumber(direction.mathDirection),
+            mathWeight: safeNumber(direction.mathWeight)
+          },
+          winRate: trade?.decisionCalculation?.winRate || null,
+          expectancy: trade?.decisionCalculation?.expectancy || null,
+          gate: trade?.decisionCalculation?.gate || null
+        }
+      : null,
     factorSnapshot: trade?.factorSnapshot || null,
     exitFactorSnapshot: trade?.exitFactorSnapshot || null,
     exitCounterfactual: trade?.exitCounterfactual || null,
     relatedEvents: Array.isArray(trade?.relatedEvents)
       ? trade.relatedEvents.slice(0, 5).map((event) => ({
-          id: event?.id || null,
+          id: event?.id || event?.event_id || null,
+          event_id: event?.event_id || event?.id || null,
           source: event?.source || null,
           title: event?.title || null,
-          occurredAt: event?.occurredAt || null,
+          occurredAt: event?.occurredAt || event?.occurred_at || null,
+          occurred_at: event?.occurred_at || event?.occurredAt || null,
+          fetched_at: event?.fetched_at || event?.fetchedAt || event?.receivedAt || null,
+          normalized_hash: event?.normalized_hash || null,
+          language: event?.language || null,
+          cluster_id: event?.cluster_id || event?.clusterId || event?.storyId || null,
           impactScore: safeNumber(event?.impactScore)
         }))
       : []

@@ -22,7 +22,6 @@
         <a class="toolbar-link" href="/summary.html"><span aria-hidden="true">⌁</span>账户总结</a>
         <a class="toolbar-link" href="/signals.html"><span aria-hidden="true">⌁</span>信号复盘</a>
         <a class="toolbar-link" href="/messages.html"><span aria-hidden="true">◫</span>消息情报</a>
-        <a class="toolbar-link" href="/models.html"><span aria-hidden="true">∿</span>模型计算</a>
         <a class="toolbar-link" href="/logs.html"><span aria-hidden="true">≡</span>运行日志</a>
         <a class="toolbar-link" href="/review.html"><span aria-hidden="true">↻</span>迭代复盘</a>
         <div class="nav-footer">
@@ -41,6 +40,10 @@
         <div class="metric">
           <span>分析模式</span>
           <strong id="layerValue">-</strong>
+        </div>
+        <div class="metric">
+          <span>当前交易时段</span>
+          <strong id="sessionValue">-</strong>
         </div>
         <div class="metric">
           <span>开仓候选</span>
@@ -117,20 +120,23 @@
         </div>
         <div class="position-toolbar">
           <strong>模拟持仓记录</strong>
-          <div class="segmented position-tabs" role="tablist" aria-label="持仓状态">
-            <button class="active" data-position-view="open" type="button">
-              未平仓 <span id="openPositionCount">0</span>
-            </button>
-            <button data-position-view="closed" type="button">
-              已平仓 <span id="closedPositionCount">0</span>
-            </button>
+          <div class="position-toolbar-actions">
+            <button id="closeAllPositionsButton" class="danger-action" type="button" disabled>一键平仓</button>
+            <div class="segmented position-tabs" role="tablist" aria-label="持仓状态">
+              <button class="active" data-position-view="open" type="button">
+                未平仓 <span id="openPositionCount">0</span>
+              </button>
+              <button data-position-view="closed" type="button">
+                已平仓 <span id="closedPositionCount">0</span>
+              </button>
+            </div>
           </div>
         </div>
         <div id="accountPositions" class="position-list"></div>
         <div class="account-page-links">
           <a href="/summary.html">查看账户阶段总结与图表</a>
           <a href="/signals.html">查看开仓信号与复盘</a>
-          <a href="/review.html">查看交易链路与模型迭代</a>
+          <a href="/review.html">查看交易链路与单写入治理</a>
         </div>
       </section>
     </main>

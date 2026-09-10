@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import {
+  applyLatestReviewCandidate,
   buildPostTradeReview,
   createPostTradeReviewState,
   DEFAULT_DIRECTION_MODEL_WEIGHTS,
   maybeRunPostTradeReview,
   normalizeDirectionWeights,
-  normalizePostTradeReviewConfig
+  normalizePostTradeReviewConfig,
+  normalizePostTradeReviewState,
+  rollbackPostTradeReviewWeights
 } from "./post-trade-review.mjs";
 
 function syntheticTrade(index, won = index % 3 !== 0) {
@@ -15,8 +18,10 @@ function syntheticTrade(index, won = index % 3 !== 0) {
     higherTimeframeTrend: label * 0.7,
     momentum: -label,
     rsi: 0,
+    volume: label * 0.4,
     funding: label * 0.15,
     openInterest: label * 0.25,
+    orderFlow: label * 0.7,
     geometricBrownianMotion: label * 0.5,
     hiddenMarkovModel: label * 0.8
   };
@@ -62,6 +67,10 @@ function syntheticTrade(index, won = index % 3 !== 0) {
 const bounded = normalizePostTradeReviewConfig({ reviewEveryTrades: 1, maxWeightChangePct: 1 });
 assert.equal(bounded.reviewEveryTrades, 5);
 assert.equal(bounded.maxWeightChangePct, 0.1);
+const migratedAutoApply = normalizePostTradeReviewConfig({ autoApplyValidatedWeights: true });
+assert.equal(migratedAutoApply.autoApplyValidatedWeights, false);
+assert.equal(migratedAutoApply.autoApplyValidatedExitWeights, true);
+assert.equal(migratedAutoApply.directionMode, "fixed_champion_read_only");
 
 const normalizedWeights = normalizeDirectionWeights({ trend: 10 }, DEFAULT_DIRECTION_MODEL_WEIGHTS);
 const normalizedTotal = Object.values(normalizedWeights).reduce((sum, value) => sum + value, 0);
@@ -89,6 +98,7 @@ const review = buildPostTradeReview(
   { reviewEveryTrades: 10, minimumProposalTrades: 20 }
 );
 assert.equal(review.status, "shadow_candidate");
+assert.equal(review.directionPromotionEligible, false, "direction review must never become an apply path");
 assert.ok(review.candidateDirectionWeights);
 assert.ok(review.candidateExitWeights);
 assert.equal(review.exitValidation.chronologicalSplit, true);
@@ -98,6 +108,38 @@ assert.ok(review.candidateDirectionWeights.trend > review.currentDirectionWeight
 assert.ok(review.candidateDirectionWeights.momentum < review.currentDirectionWeights.momentum);
 assert.equal(review.validation.chronologicalSplit, true);
 assert.ok(review.promotionBlockers.includes("minimum_promotion_trades"));
+
+const migratedState = normalizePostTradeReviewState({
+  ...createPostTradeReviewState(DEFAULT_DIRECTION_MODEL_WEIGHTS, "session-migrate"),
+  previousDirectionWeights: { ...DEFAULT_DIRECTION_MODEL_WEIGHTS, trend: 0.4 }
+}, DEFAULT_DIRECTION_MODEL_WEIGHTS, "session-migrate");
+assert.equal(migratedState.previousDirectionWeights, null, "legacy direction rollback must be retired");
+
+const applyAccount = {
+  sessionId: "session-apply-exit-only",
+  postTradeReview: createPostTradeReviewState(DEFAULT_DIRECTION_MODEL_WEIGHTS, "session-apply-exit-only")
+};
+const directionBeforeApply = { ...applyAccount.postTradeReview.currentDirectionWeights };
+const exitBeforeApply = { ...applyAccount.postTradeReview.currentExitWeights };
+applyAccount.postTradeReview.latestReview = {
+  promotionEligible: true,
+  directionEvidenceValidated: true,
+  directionPromotionEligible: true,
+  candidateDirectionWeights: { ...DEFAULT_DIRECTION_MODEL_WEIGHTS, trend: 0.5 },
+  exitPromotionEligible: true,
+  candidateExitWeights: {
+    ...exitBeforeApply,
+    signalReversal: 0.7,
+    netExpectancyDecay: 0.1
+  }
+};
+applyLatestReviewCandidate(applyAccount, DEFAULT_DIRECTION_MODEL_WEIGHTS, "2026-01-01T00:00:00.000Z");
+assert.deepEqual(applyAccount.postTradeReview.currentDirectionWeights, directionBeforeApply);
+assert.notDeepEqual(applyAccount.postTradeReview.currentExitWeights, exitBeforeApply);
+assert.equal(applyAccount.postTradeReview.previousDirectionWeights, null);
+rollbackPostTradeReviewWeights(applyAccount, DEFAULT_DIRECTION_MODEL_WEIGHTS, "2026-01-01T00:01:00.000Z");
+assert.deepEqual(applyAccount.postTradeReview.currentDirectionWeights, directionBeforeApply);
+assert.deepEqual(applyAccount.postTradeReview.currentExitWeights, exitBeforeApply);
 
 const rotationExitDecision = {
   ...syntheticTrade(100, true),

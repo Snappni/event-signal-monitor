@@ -4,33 +4,40 @@ import {
   EXIT_FACTOR_KEYS,
   normalizeExitWeights
 } from "./adaptive-position-exit.mjs";
+import { DIRECTION_REVIEW_MODE, EXIT_REVIEW_MODE } from "./decision-governance.mjs";
 
 export const DIRECTION_FACTOR_KEYS = Object.freeze([
   "trend",
   "higherTimeframeTrend",
   "momentum",
   "rsi",
+  "volume",
   "funding",
   "openInterest",
+  "orderFlow",
   "geometricBrownianMotion",
   "hiddenMarkovModel"
 ]);
 
 export const DEFAULT_DIRECTION_MODEL_WEIGHTS = Object.freeze({
-  trend: 0.24,
-  higherTimeframeTrend: 0.14,
-  momentum: 0.12,
-  rsi: 0.05,
+  trend: 0.21,
+  higherTimeframeTrend: 0.12,
+  momentum: 0.1,
+  rsi: 0.04,
+  volume: 0.04,
   funding: 0.05,
   openInterest: 0.05,
-  geometricBrownianMotion: 0.15,
-  hiddenMarkovModel: 0.2
+  orderFlow: 0.08,
+  geometricBrownianMotion: 0.13,
+  hiddenMarkovModel: 0.18
 });
 
 export const DEFAULT_POST_TRADE_REVIEW_CONFIG = Object.freeze({
   enabled: true,
   reviewEveryTrades: 20,
-  autoApplyValidatedWeights: false,
+  directionMode: DIRECTION_REVIEW_MODE,
+  exitMode: EXIT_REVIEW_MODE,
+  autoApplyValidatedExitWeights: false,
   minimumProposalTrades: 20,
   minimumPromotionTrades: 60,
   maxWeightChangePct: 0.05
@@ -78,10 +85,14 @@ export function normalizePostTradeReviewConfig(value = {}) {
   const raw = value && typeof value === "object" ? value : {};
   return {
     enabled: raw.enabled !== false,
+    directionMode: DIRECTION_REVIEW_MODE,
+    exitMode: EXIT_REVIEW_MODE,
     reviewEveryTrades: Math.round(
       clamp(safeNumber(raw.reviewEveryTrades, DEFAULT_POST_TRADE_REVIEW_CONFIG.reviewEveryTrades), 5, 500)
     ),
-    autoApplyValidatedWeights: raw.autoApplyValidatedWeights === true,
+    autoApplyValidatedExitWeights:
+      raw.autoApplyValidatedExitWeights === true || raw.autoApplyValidatedWeights === true,
+    autoApplyValidatedWeights: false,
     minimumProposalTrades: Math.round(
       clamp(
         safeNumber(raw.minimumProposalTrades, DEFAULT_POST_TRADE_REVIEW_CONFIG.minimumProposalTrades),
@@ -119,8 +130,10 @@ export function normalizeDirectionWeights(value, fallback) {
 export function createPostTradeReviewState(defaultDirectionWeights, sessionId = null) {
   const weights = normalizeDirectionWeights(defaultDirectionWeights, defaultDirectionWeights);
   return {
-    version: 1,
+    version: 2,
     sessionId,
+    directionMode: DIRECTION_REVIEW_MODE,
+    exitMode: EXIT_REVIEW_MODE,
     reviewedTradeCount: 0,
     completedReviews: 0,
     currentDirectionWeights: weights,
@@ -144,16 +157,29 @@ export function normalizePostTradeReviewState(value, defaultDirectionWeights, se
   state.reviewedTradeCount = Math.max(0, Math.round(safeNumber(value.reviewedTradeCount)));
   state.completedReviews = Math.max(0, Math.round(safeNumber(value.completedReviews)));
   state.currentDirectionWeights = normalizeDirectionWeights(value.currentDirectionWeights, defaultDirectionWeights);
-  state.previousDirectionWeights = value.previousDirectionWeights
-    ? normalizeDirectionWeights(value.previousDirectionWeights, defaultDirectionWeights)
-    : null;
+  state.previousDirectionWeights = null;
   state.currentExitWeights = normalizeExitWeights(value.currentExitWeights, DEFAULT_EXIT_MODEL_WEIGHTS);
   state.previousExitWeights = value.previousExitWeights
     ? normalizeExitWeights(value.previousExitWeights, DEFAULT_EXIT_MODEL_WEIGHTS)
     : null;
   state.weightVersion = Math.max(1, Math.round(safeNumber(value.weightVersion, 1)));
   state.exitWeightVersion = Math.max(1, Math.round(safeNumber(value.exitWeightVersion, 1)));
-  state.latestReview = value.latestReview && typeof value.latestReview === "object" ? value.latestReview : null;
+  state.latestReview = value.latestReview && typeof value.latestReview === "object"
+    ? {
+        ...value.latestReview,
+        directionReviewMode: DIRECTION_REVIEW_MODE,
+        directionEvidenceValidated:
+          value.latestReview.directionEvidenceValidated === true || value.latestReview.directionPromotionEligible === true,
+        directionPromotionEligible: false,
+        promotionEligible: value.latestReview.exitPromotionEligible === true,
+        applied: value.latestReview.exitPromotionEligible === true && value.latestReview.applied === true,
+        status: value.latestReview.exitPromotionEligible === true
+          ? value.latestReview.status
+          : value.latestReview.candidateDirectionWeights || value.latestReview.candidateExitWeights
+            ? "shadow_candidate"
+            : "insufficient_data"
+      }
+    : null;
   state.reviewHistory = Array.isArray(value.reviewHistory) ? value.reviewHistory.slice(-20) : [];
   state.lastPromotionAt = value.lastPromotionAt || null;
   state.lastRollbackAt = value.lastRollbackAt || null;
@@ -185,8 +211,15 @@ function eligibleTrade(trade) {
 
 function scoreDirection(trade, weights) {
   const signals = trade.factorSnapshot.directionSignals || {};
-  return DIRECTION_FACTOR_KEYS.reduce(
-    (score, key) => score + safeNumber(signals[key]) * safeNumber(weights[key]),
+  const activeKeys = DIRECTION_FACTOR_KEYS.filter((key) =>
+    Object.hasOwn(signals, key) &&
+    Number.isFinite(Number(signals[key])) &&
+    !(key === "orderFlow" && trade.factorSnapshot?.marketInputs?.orderFlowAvailable === false)
+  );
+  const activeWeight = activeKeys.reduce((sum, key) => sum + safeNumber(weights[key]), 0);
+  if (activeWeight <= 0) return 0;
+  return activeKeys.reduce(
+    (score, key) => score + safeNumber(signals[key]) * safeNumber(weights[key]) / activeWeight,
     0
   );
 }
@@ -474,12 +507,15 @@ export function buildPostTradeReview(trades, currentDirectionWeights, configValu
     batchTradeCount: safeNumber(options.batchTradeCount, allClosedTrades.length),
     currentDirectionWeights: weights,
     candidateDirectionWeights: null,
+    directionReviewMode: DIRECTION_REVIEW_MODE,
+    directionEvidenceValidated: false,
     directionPromotionEligible: false,
     factorStatistics: factorStatistics(eligibleTrades, weights),
     qualityFactorStatistics: qualityFactorStatistics(eligibleTrades),
     validation: null,
     currentExitWeights: exitWeights,
     candidateExitWeights: null,
+    exitReviewMode: EXIT_REVIEW_MODE,
     exitEligibleTrades: eligibleExitTrades.length,
     exitFactorStatistics: exitFactorStatistics(eligibleExitTrades, exitWeights),
     exitValidation: null,
@@ -512,7 +548,7 @@ export function buildPostTradeReview(trades, currentDirectionWeights, configValu
       const challenger = validationMetrics(validationTrades, proposal.candidate);
       const accuracyDelta = challenger.accuracy - champion.accuracy;
       const marginDelta = challenger.meanSignedMargin - champion.meanSignedMargin;
-      review.directionPromotionEligible =
+      review.directionEvidenceValidated =
         eligibleTrades.length >= config.minimumPromotionTrades &&
         validationTrades.length >= 10 &&
         accuracyDelta >= 0.03 &&
@@ -576,7 +612,8 @@ export function buildPostTradeReview(trades, currentDirectionWeights, configValu
       if (marginDelta <= 0) review.exitPromotionBlockers.push("exit_mean_signed_margin_delta");
     }
   }
-  review.promotionEligible = review.directionPromotionEligible || review.exitPromotionEligible;
+  review.promotionEligible = review.exitPromotionEligible;
+  review.evidenceReady = review.directionEvidenceValidated || review.exitPromotionEligible;
   review.status = review.promotionEligible
     ? "validated_candidate"
     : review.candidateDirectionWeights || review.candidateExitWeights
@@ -617,17 +654,10 @@ export function maybeRunPostTradeReview(
   });
   state.reviewedTradeCount = totalClosedTrades;
   state.completedReviews += 1;
-  if (config.autoApplyValidatedWeights && review.promotionEligible) {
-    if (review.directionPromotionEligible) {
-      state.previousDirectionWeights = state.currentDirectionWeights;
-      state.currentDirectionWeights = normalizeDirectionWeights(review.candidateDirectionWeights, state.currentDirectionWeights);
-      state.weightVersion += 1;
-    }
-    if (review.exitPromotionEligible) {
-      state.previousExitWeights = state.currentExitWeights;
-      state.currentExitWeights = normalizeExitWeights(review.candidateExitWeights, state.currentExitWeights);
-      state.exitWeightVersion += 1;
-    }
+  if (config.autoApplyValidatedExitWeights && review.exitPromotionEligible) {
+    state.previousExitWeights = state.currentExitWeights;
+    state.currentExitWeights = normalizeExitWeights(review.candidateExitWeights, state.currentExitWeights);
+    state.exitWeightVersion += 1;
     state.lastPromotionAt = now;
     review.status = "promoted";
     review.applied = true;
@@ -640,19 +670,12 @@ export function maybeRunPostTradeReview(
 export function applyLatestReviewCandidate(account, defaultDirectionWeights, now = new Date().toISOString()) {
   const state = normalizePostTradeReviewState(account.postTradeReview, defaultDirectionWeights, account.sessionId);
   const review = state.latestReview;
-  if (!review?.promotionEligible) {
-    throw new Error("当前没有通过样本外验证、可晋升的候选权重");
+  if (!review?.exitPromotionEligible || !review.candidateExitWeights) {
+    throw new Error("当前没有通过样本外验证、可应用的退出候选权重；方向候选仅供证据观察");
   }
-  if (review.directionPromotionEligible || (review.directionPromotionEligible == null && review.candidateDirectionWeights)) {
-    state.previousDirectionWeights = state.currentDirectionWeights;
-    state.currentDirectionWeights = normalizeDirectionWeights(review.candidateDirectionWeights, state.currentDirectionWeights);
-    state.weightVersion += 1;
-  }
-  if (review.exitPromotionEligible) {
-    state.previousExitWeights = state.currentExitWeights;
-    state.currentExitWeights = normalizeExitWeights(review.candidateExitWeights, state.currentExitWeights);
-    state.exitWeightVersion += 1;
-  }
+  state.previousExitWeights = state.currentExitWeights;
+  state.currentExitWeights = normalizeExitWeights(review.candidateExitWeights, state.currentExitWeights);
+  state.exitWeightVersion += 1;
   state.lastPromotionAt = now;
   review.status = "promoted";
   review.applied = true;
@@ -662,19 +685,11 @@ export function applyLatestReviewCandidate(account, defaultDirectionWeights, now
 
 export function rollbackPostTradeReviewWeights(account, defaultDirectionWeights, now = new Date().toISOString()) {
   const state = normalizePostTradeReviewState(account.postTradeReview, defaultDirectionWeights, account.sessionId);
-  if (!state.previousDirectionWeights && !state.previousExitWeights) throw new Error("当前没有可回滚的上一版权重");
-  if (state.previousDirectionWeights) {
-    const current = state.currentDirectionWeights;
-    state.currentDirectionWeights = state.previousDirectionWeights;
-    state.previousDirectionWeights = current;
-    state.weightVersion += 1;
-  }
-  if (state.previousExitWeights) {
-    const current = state.currentExitWeights;
-    state.currentExitWeights = state.previousExitWeights;
-    state.previousExitWeights = current;
-    state.exitWeightVersion += 1;
-  }
+  if (!state.previousExitWeights) throw new Error("当前没有可回滚的上一版退出权重");
+  const current = state.currentExitWeights;
+  state.currentExitWeights = state.previousExitWeights;
+  state.previousExitWeights = current;
+  state.exitWeightVersion += 1;
   state.lastRollbackAt = now;
   account.postTradeReview = state;
   return account;
