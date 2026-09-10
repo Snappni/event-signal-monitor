@@ -39,7 +39,14 @@ def snapshot(runtime, group=None):
     mem = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
     health = json.loads((Path(runtime)/'service-status.json').read_text())
     def age(key):
-        return time.time() - datetime.fromisoformat(health[key].replace('Z', '+00:00')).timestamp()
+        value = health.get(key)
+        if not isinstance(value, str): return None
+        try:
+            stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if stamp.tzinfo is None: return None
+            return time.time() - stamp.timestamp()
+        except (ValueError, OverflowError, OSError):
+            return None
     rss = 0
     if group:
         for p in Path('/proc').glob('[0-9]*/stat'):
@@ -61,8 +68,8 @@ def pressure_reason(s, running=False):
     if s['availableMiB'] < (256 if running else 512): return 'host_memory_low'
     if s['memoryPsi'] >= 1: return 'host_memory_pressure'
     if s['ioPsi'] >= 10: return 'host_io_pressure'
-    if not 0 <= s['heartbeatAge'] <= 15: return 'trading_heartbeat_stale'
-    if not 0 <= s['decisionAge'] <= 60 or s['decisionFailures']: return 'trading_decision_unhealthy'
+    if s['heartbeatAge'] is None or not 0 <= s['heartbeatAge'] <= 15: return 'trading_heartbeat_stale'
+    if s['decisionAge'] is None or not 0 <= s['decisionAge'] <= 60 or s['decisionFailures']: return 'trading_decision_unhealthy'
     if s['rssMiB'] >= 450: return 'research_memory_budget'
     return None
 

@@ -45,6 +45,47 @@ class ResourceTests(unittest.TestCase):
                 'PYTHON_JULIAPKG_PROJECT': tmp}):
             self.assertFalse(rb.mining_ready())
 
+    def test_startup_health_defers_without_starting_worker(self):
+        now = '2026-09-10T00:00:00+00:00'
+        health = {'heartbeatAt': now, 'lastDecisionCompletedAt': None,
+                  'consecutiveDecisionFailures': 0}
+        read = Path.read_text
+        def read_fixture(p, *args, **kwargs):
+            if p.name == 'meminfo': return 'MemAvailable: 921600 kB\n'
+            if p.name in ('memory', 'io'): return 'some avg10=0.00 total=0\n'
+            if p.name == 'service-status.json': return json.dumps(health)
+            return read(p, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(Path, 'read_text', read_fixture), \
+                patch.object(rb.time, 'time', return_value=rb.datetime.fromisoformat(now).timestamp()), \
+                patch.dict(os.environ, {'FACTOR_RESEARCH_PROFILE':'server-low', 'FACTOR_RESEARCH_TASK_ID':'startup'}), \
+                patch.object(rb.sys, 'platform', 'linux'), \
+                patch.object(rb, 'verify_cgroup', return_value={'verified':True}), \
+                patch.object(rb, 'parent_alive', return_value=True), \
+                patch.object(rb.subprocess, 'Popen') as start:
+            root = Path(tmp)/'research'; root.mkdir()
+            report = root/'report.json'; report.write_text('{"old":true}')
+            for key, metric, reason in [('lastDecisionCompletedAt', 'decisionAge', 'trading_decision_unhealthy'),
+                                        ('heartbeatAt', 'heartbeatAge', 'trading_heartbeat_stale')]:
+                health.update(heartbeatAt=now, lastDecisionCompletedAt=now)
+                for value in [None, '', 123, {}, 'invalid', '2026-09-10T00:00:00', 'missing']:
+                    with self.subTest(key=key, value=value):
+                        if value == 'missing': health.pop(key, None)
+                        else: health[key] = value
+                        sample = rb.snapshot(root.parent)
+                        self.assertIsNone(sample[metric])
+                        self.assertEqual(rb.pressure_reason(sample), reason)
+                        self.assertEqual(rb.supervise(root, 'update', 123), 75)
+                        result = json.loads((root/'resource-result.json').read_text())
+                        self.assertEqual(result['reason'], reason)
+                        self.assertIsNone(result['resources'][metric])
+                        self.assertEqual(json.loads(report.read_text()), {'old':True})
+                health[key] = '2026-09-10T00:00:01+00:00'
+                self.assertEqual(rb.pressure_reason(rb.snapshot(root.parent)), reason)
+            start.assert_not_called()
+            health.update(heartbeatAt=now, lastDecisionCompletedAt=now)
+            self.assertIsNone(rb.pressure_reason(rb.snapshot(root.parent)))
+
     def test_supervisor_preserves_report_and_cleans_tree(self):
         for scenario in ['isolation', 'parent', 'parent_running', 'parent_completed', 'preflight', 'probe_error', 'mine', 'running', 'failed', 'success']:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:

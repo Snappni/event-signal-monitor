@@ -324,7 +324,17 @@ export function createDashboardAuth({ env = process.env, loginHtmlPath, sessionF
       redirect(response, normalizeReturnTo(url.searchParams.get("next")));
       return;
     }
-    if (!loginTemplate) loginTemplate = fs.readFileSync(loginHtmlPath, "utf8");
+    if (!loginTemplate) {
+      try {
+        loginTemplate = fs.readFileSync(loginHtmlPath, "utf8");
+      } catch (error) {
+        logger.error?.(`Dashboard login template unavailable: ${error.code || "read_failed"}`);
+        applySecurityHeaders(request, response);
+        response.writeHead(503, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+        response.end(request.method === "HEAD" ? undefined : "Login temporarily unavailable.");
+        return;
+      }
+    }
     const nonce = base64Url(randomBytes(18));
     applySecurityHeaders(request, response, nonce);
     const html = loginTemplate.replaceAll("{{SCRIPT_NONCE}}", nonce);

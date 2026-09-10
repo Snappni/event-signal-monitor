@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
-import { hashDashboardPassword } from "./dashboard-auth.mjs";
+import { createDashboardAuth, hashDashboardPassword } from "./dashboard-auth.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "event-signal-dashboard-auth-test-"));
@@ -67,7 +67,60 @@ async function login(body) {
   });
 }
 
+async function testUnavailableLoginTemplate() {
+  const template = path.join(runtime, "login-template.html");
+  const env = { DASHBOARD_AUTH_ENABLED: "1", DASHBOARD_AUTH_PASSWORD_HASH: passwordHash };
+  const warnings = [];
+  const makeResponse = () => ({
+    headers: {}, status: null, body: null,
+    setHeader(key, value) { this.headers[key.toLowerCase()] = value; },
+    writeHead(status, headers) {
+      this.status = status;
+      for (const [key, value] of Object.entries(headers)) this.setHeader(key, value);
+    },
+    end(body) { this.body = body; }
+  });
+  const request = { method: "GET", headers: {}, socket: {} };
+  for (const code of ["ENOENT", "EACCES"]) {
+    const auth = createDashboardAuth({ env, loginHtmlPath: template, logger: { error: (line) => warnings.push(line) } });
+    const read = fs.readFileSync;
+    fs.readFileSync = (file, ...args) => {
+      if (file === template) throw Object.assign(new Error("fixture path must not leak"), { code });
+      return read(file, ...args);
+    };
+    try {
+      for (const method of ["GET", "HEAD"]) {
+        const response = makeResponse();
+        assert.equal(await auth.handlePublic({ ...request, method }, response, new URL("/login.html", baseUrl)), true);
+        assert.equal(response.status, 503);
+        assert.equal(response.headers["cache-control"], "no-store");
+        assert.equal(response.headers["x-frame-options"], "DENY");
+        assert.doesNotMatch(response.body || "", /fixture|ENOENT|EACCES|login-template/);
+        if (method === "HEAD") assert.equal(response.body, undefined);
+      }
+    } finally {
+      fs.readFileSync = read;
+    }
+    for (const [target, status] of [["/index.html", 303], ["/api/status", 401]]) {
+      const response = makeResponse();
+      assert.equal(auth.authorize(request, response, new URL(target, baseUrl)), false);
+      assert.equal(response.status, status);
+    }
+    fs.writeFileSync(template, '<script nonce="{{SCRIPT_NONCE}}"></script>');
+    const recovered = makeResponse();
+    assert.equal(await auth.handlePublic(request, recovered, new URL("/login.html", baseUrl)), true);
+    assert.equal(recovered.status, 200, "same auth instance retries after template repair");
+    assert.doesNotMatch(recovered.body, /\{\{SCRIPT_NONCE\}\}/);
+    fs.unlinkSync(template);
+  }
+  assert.equal(warnings.length, 4);
+  const disabled = createDashboardAuth({ env: {}, loginHtmlPath: template });
+  assert.equal(await disabled.handlePublic(request, makeResponse(), new URL("/login.html", baseUrl)), false);
+  assert.equal(disabled.authorize(request, makeResponse(), new URL("/index.html", baseUrl)), true);
+}
+
 try {
+  await testUnavailableLoginTemplate();
   child = startServer();
   const loginPage = await waitForLogin();
   const loginHtml = await loginPage.text();
@@ -178,6 +231,9 @@ try {
 
   console.log(JSON.stringify({
     passed: true,
+    missingTemplate: 503,
+    unreadableTemplate: 503,
+    templateRecoveryWithoutRestart: true,
     anonymousIndex: 303,
     anonymousApi: 401,
     injectionAttempt: 401,
